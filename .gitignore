@@ -8,10 +8,7 @@
 /kubeconfig
 *.kubeconfig
 
-# Rendered k3d config (may contain env-specific values)
-/config/.k3d-cluster.rendered.yaml
-
-# Secret material: cluster join token (multi-node), later-phase certs, etc.
+# Secret material: the k3s cluster-join token, later-phase certs, etc.
 /.secrets/
 *.pem
 *.key

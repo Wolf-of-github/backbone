@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Join a machine to the backbone cluster as a k3s WORKER (agent). Only meaningful
-# when the cluster was created with MULTI_NODE=true.
+# Join a machine to the backbone cluster as a k3s WORKER (agent).
 # depends_on: [scripts/cluster-up.sh, scripts/lib.sh]
 #
 # Two ways to run it:
@@ -31,7 +30,7 @@ if [ -n "$TARGET" ]; then
   load_env
   : "${K3S_VERSION:?set K3S_VERSION in .env}"
   JOIN_ENV="$REPO_ROOT/.secrets/cluster-join.env"
-  [ -f "$JOIN_ENV" ] || die "missing $JOIN_ENV - run 'make cluster' with MULTI_NODE=true on the server first"
+  [ -f "$JOIN_ENV" ] || die "missing $JOIN_ENV - run 'make cluster' on the server first"
   # shellcheck disable=SC1090
   . "$JOIN_ENV"   # -> K3S_URL, K3S_TOKEN
   : "${NODE_EXTERNAL_IP:=}"
