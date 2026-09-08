@@ -32,8 +32,9 @@ node-join:
 
 base: _need-kubeconfig
 	kubectl apply -f k8s/base/namespaces.yaml
+	@for i in $$(seq 1 30); do kubectl get storageclass local-path >/dev/null 2>&1 && break; echo "waiting for local-path StorageClass..."; sleep 2; done
 	kubectl patch storageclass local-path \
-	  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' || true
+	  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
 secrets: _need-kubeconfig
 	./scripts/create-secrets.sh

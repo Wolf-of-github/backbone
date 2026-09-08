@@ -73,6 +73,17 @@ ok "join credentials cached at .secrets/cluster-join.env (gitignored)"
 export KUBECONFIG="$DST"
 log "waiting for server node Ready (timeout 120s)"
 kubectl wait --for=condition=Ready node --all --timeout=120s
+
+# k3s creates the local-path StorageClass via a deployment a few seconds after
+# the node is Ready. Wait for it so `make base` can patch it as default.
+log "waiting for the local-path StorageClass"
+for _ in $(seq 1 30); do
+  kubectl get storageclass local-path >/dev/null 2>&1 && break
+  sleep 2
+done
+kubectl get storageclass local-path >/dev/null 2>&1 \
+  || die "local-path StorageClass never appeared - is the local-path-provisioner pod running? (kubectl -n kube-system get pods)"
+
 kubectl get nodes -o wide -L backbone.dev/role >&2
 
 ok "cluster ready (k3s server: ${CLUSTER_NAME})"
