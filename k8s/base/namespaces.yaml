@@ -1,0 +1,42 @@
+# Core namespace split for the platform.
+# depends_on: [scripts/install-k3s.sh]
+#
+#   platform - gateway / infra (registry now; Kong, cert-manager later)
+#   data     - datastores (MongoDB, Redis later)
+#   app      - application services (auth, jobs-api, worker later)
+#
+# observability and ci are created in Phase 5; left commented here on purpose.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform
+  labels:
+    backbone.dev/tier: platform
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+  labels:
+    backbone.dev/tier: data
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+  labels:
+    backbone.dev/tier: app
+# ---
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: observability
+#   labels:
+#     backbone.dev/tier: observability
+# ---
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: ci
+#   labels:
+#     backbone.dev/tier: ci

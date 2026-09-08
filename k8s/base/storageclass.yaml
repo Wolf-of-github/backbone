@@ -1,0 +1,19 @@
+# Make k3s's built-in local-path provisioner the default StorageClass so PVCs
+# bind without an explicit storageClassName.
+# depends_on: [scripts/install-k3s.sh]
+#
+# k3s ships a `local-path` StorageClass already. We cannot edit it in place with
+# `kubectl apply` (immutable fields), so bootstrap does:
+#   kubectl patch storageclass local-path -p \
+#     '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+# This file documents the desired end state and is applied with
+# `kubectl apply --dry-run=server` in verify only (as a spec check).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: local-path
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: rancher.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer

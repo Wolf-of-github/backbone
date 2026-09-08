@@ -1,0 +1,16 @@
+# Persistent storage backing the private registry's image blobs.
+# depends_on: [k8s/base/storageclass.yaml]
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-data
+  namespace: platform
+  labels:
+    app: registry
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName omitted on purpose -> uses the default (local-path).
+  resources:
+    requests:
+      storage: 20Gi
