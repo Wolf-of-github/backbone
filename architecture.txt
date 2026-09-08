@@ -184,9 +184,11 @@
       - service.yaml: ClusterIP :5000 (plus optional NodePort) named "registry", selector matches deployment.
       - Verify: `kubectl -n platform rollout status deploy/registry`; port-forward + `curl -k https://localhost:5000/v2/` -> 401 then 200 with creds.
 
-    - Step 6 - Node trust + bootstrap (config/registries.yaml -> scripts/bootstrap-registry.sh)
-      - registries.yaml: mirrors + configs block for REGISTRY_HOST:PORT with auth (user/pass from .env at render time,
-        file written to /etc/rancher/k3s/registries.yaml, 0600) and tls.ca_file pointing at the registry CA;
+    - Step 6 - Node trust + bootstrap (config/registries.yaml.example -> scripts/bootstrap-registry.sh)
+      - registries.yaml.example: committed TEMPLATE (mirrors + configs block for REGISTRY_HOST:PORT). It holds
+        credentials once rendered, so the real config/registries.yaml is gitignored - same pattern as ./kubeconfig.
+        bootstrap-registry.sh renders it from .env -> config/registries.yaml, installs to
+        /etc/rancher/k3s/registries.yaml (0600) on every node, tls.ca_file points at the registry CA;
         note: k3s restart required after writing.
       - bootstrap-registry.sh: `set -euo pipefail`; ensure namespaces + storageclass applied;
         run registry-secret.sh; `kubectl apply -f k8s/platform/registry/{pvc,deployment,service}.yaml`;
@@ -222,9 +224,13 @@
 
     - Definition of done (Phase 0)
       - Every file in "Files (Phase 0 - Substrate)" exists with real content (no STUB markers).
-      - `make phase0` on a bare machine ends with "PHASE 0 OK".
-      - No secret material, kubeconfig, or .env committed; scripts pass shellcheck; manifests pass `kubectl apply --dry-run=server`.
+        (registries.yaml is committed as registries.yaml.example; the rendered file is gitignored.)
+      - `make phase0` on a bare Linux machine ends with "PHASE 0 OK" and `make` exits 0.
+      - No secret material, kubeconfig, .env, or rendered registries.yaml committed; scripts pass shellcheck;
+        manifests pass `kubectl apply --dry-run=server`.
       - README lets a new person reproduce it unaided.
+      - Runtime note: pods run under k3s's bundled containerd - no Docker/Docker Desktop. Only `make verify`'s
+        push test needs `docker` or `nerdctl` on the host to build+push one throwaway image.
 
 - Build Order (dependency-ordered; each layer stands on a working one below it)
   - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
