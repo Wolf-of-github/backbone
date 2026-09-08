@@ -1,47 +1,54 @@
 # backbone
 
-A from-scratch, fully self-hosted platform substrate on **k3s**. This repo is
-built phase by phase; see [architecture.txt](architecture.txt) for the full
-design, build order, and file manifest.
+A from-scratch, fully self-hosted platform substrate. It runs **anywhere Docker
+runs** - the Kubernetes layer is **k3s inside Docker via [k3d](https://k3d.io)**,
+the same "one binary, one command" model as Minikube. Linux, macOS, and
+Windows+WSL2 are all identical.
+
+See [architecture.txt](architecture.txt) for the full design, build order, and
+per-phase file manifest.
 
 ## Phase 0 - Substrate
 
 Brings up the ground everything else stands on:
 
-- a pinned single-node **k3s** cluster (agents optional)
+- a **k3d** cluster (k3s nodes as Docker containers), Traefik disabled (Kong later)
 - **local-path** as the default StorageClass (PVCs bind with no annotation)
 - the `platform` / `data` / `app` **namespaces**
-- a private, TLS + basic-auth **container registry** that every node trusts
-- a **secrets convention** (plain k3s Secrets now, Sealed Secrets later)
+- k3d's **built-in container registry** (local, auto-trusted by every node)
+- a **secrets convention** (none needed yet; stable entrypoint for later phases)
 
 ### Prerequisites
 
-- A Linux host you can `sudo` on (the k3s server). macOS/dev: run Phase 0 in a Linux VM.
-- `curl`, `kubectl`, `openssl`, `htpasswd` (apache2-utils / httpd-tools), and
-  `docker` or `nerdctl` on the machine that runs `make verify`.
-- The registry host/IP in `.env` must resolve from every node.
+- **Docker** (Docker Desktop, Rancher Desktop, Colima, or plain `dockerd`) - running.
+- **k3d** - `brew install k3d`, or
+  `curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash`,
+  or `choco install k3d` on Windows.
+- **kubectl**.
+- That's it - no Linux VM, no `sudo`, no k3s install on the host.
 
-### Bring up from a bare machine
+### Bring up
 
 ```bash
 git clone <this-repo> backbone && cd backbone
-cp .env.example .env
-$EDITOR .env            # set DOMAIN, REGISTRY_*, K3S_VERSION, K3S_SERVER_IP
+cp .env.example .env          # defaults work for local use; edit ports if 8080/5000 are taken
 
-make phase0             # cluster -> base -> secrets -> registry -> verify
+make phase0                   # cluster -> base -> secrets -> verify
 ```
 
-Or step by step:
+Step by step:
 
 ```bash
-make cluster    # ./scripts/install-k3s.sh  -> writes ./kubeconfig
-make base       # namespaces + default StorageClass
-make secrets    # ./scripts/create-secrets.sh (registry-auth, registry-tls)
-make registry   # ./scripts/bootstrap-registry.sh (+ /etc/rancher/k3s/registries.yaml on nodes)
-make verify     # ./scripts/verify-phase0.sh  -> prints "PHASE 0 OK"
+make cluster   # ./scripts/cluster-up.sh   -> k3d cluster + registry, writes ./kubeconfig
+make base      # namespaces + default StorageClass
+make secrets   # ./scripts/create-secrets.sh (no-op in Phase 0)
+make verify    # ./scripts/verify-phase0.sh -> prints "PHASE 0 OK"
+
+make down      # ./scripts/cluster-down.sh  -> delete the cluster when done
 ```
 
-`export KUBECONFIG=$PWD/kubeconfig` (or use the repo default) for ad-hoc `kubectl`.
+Use the repo-local kubeconfig for ad-hoc `kubectl`:
+`export KUBECONFIG=$PWD/kubeconfig`.
 
 ### What "done" looks like
 
@@ -51,30 +58,39 @@ make verify     # ./scripts/verify-phase0.sh  -> prints "PHASE 0 OK"
 2. exactly one default StorageClass, and it is `local-path`
 3. namespaces `platform`, `data`, `app` exist
 4. a throwaway 1Gi PVC binds and mounts
-5. a test image pushes to and pulls from the private registry (auth + TLS + node trust)
+5. a test image pushes to the k3d registry at `localhost:5000` **and** pulls
+   back inside the cluster as `backbone-registry:5000/...`
+
+Success = the final `PHASE 0 OK` line and `make` exiting `0`.
+
+### Registry: two names, one registry
+
+| From | Use |
+|------|-----|
+| your machine (`docker push`) | `localhost:5000/<img>:<tag>` |
+| image refs in k8s manifests / CI | `backbone-registry:5000/<img>:<tag>` |
+
+k3d injects the `backbone-registry` hostname into every node, so both resolve to
+the same registry container.
 
 ### Files
 
 | Path | Purpose |
 |------|---------|
-| `.env.example` | host config template -> copy to `.env` (gitignored) |
-| `config/k3s-config.yaml` | k3s server config (Traefik/ServiceLB disabled, TLS SANs) |
-| `config/registries.yaml.example` | template for `/etc/rancher/k3s/registries.yaml` |
+| `.env.example` | config template -> copy to `.env` (gitignored) |
+| `config/k3d-cluster.yaml` | k3d cluster definition (image, ports, registry, `--disable=traefik`) |
 | `k8s/base/namespaces.yaml` | `platform` / `data` / `app` |
 | `k8s/base/storageclass.yaml` | desired default StorageClass (applied via `kubectl patch`) |
-| `k8s/platform/registry/` | registry PVC + Deployment + Service |
-| `scripts/install-k3s.sh` | install k3s, write `./kubeconfig` |
-| `scripts/registry-secret.sh` | htpasswd + self-signed TLS -> `registry-auth`, `registry-tls` |
-| `scripts/create-secrets.sh` | single entrypoint for all Phase 0 secrets |
-| `scripts/bootstrap-registry.sh` | registry manifests + per-node trust |
+| `scripts/cluster-up.sh` | create/reuse the k3d cluster, write `./kubeconfig` |
+| `scripts/cluster-down.sh` | delete the k3d cluster |
+| `scripts/create-secrets.sh` | stable secrets entrypoint (no-op in Phase 0) |
 | `scripts/verify-phase0.sh` | the acceptance gate |
 | `docs/secrets.md` | namespace map, naming, Sealed Secrets upgrade path |
 
 ### Security notes
 
-- `.env`, `./kubeconfig`, `config/registries.yaml`, and all cert/htpasswd material
+- `.env`, `./kubeconfig`, the rendered k3d config, and any future cert material
   are gitignored. Nothing sensitive is committed.
-- Scripts run `set -euo pipefail`, pass secrets as argument arrays (no shell
-  string interpolation), and never echo secret values.
-- The registry cert is self-signed and trusted per-node via `registries.yaml`.
-  Phase 5 replaces it with a real Let's Encrypt chain behind Kong.
+- Scripts run `set -euo pipefail` and never echo secret values.
+- The k3d registry is unauthenticated **by design** - it is local to your
+  machine. Phase 5 introduces the real, authenticated registry behind Kong + TLS.

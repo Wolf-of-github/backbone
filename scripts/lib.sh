@@ -6,7 +6,7 @@
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export REPO_ROOT
 
-# KUBECONFIG defaults to the repo-local one written by install-k3s.sh.
+# KUBECONFIG defaults to the repo-local one written by scripts/cluster-up.sh.
 export KUBECONFIG="${KUBECONFIG:-$REPO_ROOT/kubeconfig}"
 
 log()  { printf '  %s\n' "$*" >&2; }
@@ -33,6 +33,3 @@ require_vars() {
 }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
-
-# Idempotent apply of a manifest produced on stdin.
-kapply() { kubectl apply -f - ; }

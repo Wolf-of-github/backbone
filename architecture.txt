@@ -114,123 +114,121 @@
 
 - Plan
   - Phase 0 - Substrate: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Runtime decision: MACHINE-AGNOSTIC via k3d (k3s-in-Docker), same model as Minikube.
+      - Cluster = k3s nodes running as Docker containers, created by `k3d cluster create`.
+        Works identically on Linux / macOS / Windows+WSL2. No Linux VM, no `sudo`, no host k3s install.
+      - Prereqs on the developer machine: a running Docker daemon, `k3d`, `kubectl` (+ `docker` CLI for
+        the verify push test). Docker Desktop / Rancher Desktop / Colima / plain dockerd all fine.
+      - Registry = k3d's BUILT-IN registry (a `registry:2` container k3d creates and auto-trusts on every
+        node). No htpasswd, no TLS, no /etc/rancher/k3s/registries.yaml - k3d wires it up. It is
+        unauthenticated by design (local to the machine); Phase 5 introduces the real registry behind Kong+TLS.
+      - Two names, one registry: host `docker push` -> `localhost:<REGISTRY_PORT>`;
+        image refs inside k8s -> `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>` (default 5000). k3d injects the
+        hostname into every node so both resolve to the same container. Host and internal ports may differ
+        so a host-port collision never forces a manifest rewrite.
+      - This REPLACES the earlier "install k3s on a Linux host + build an authenticated registry" plan;
+        install-k3s.sh, k3s-config.yaml, registry-secret.sh, bootstrap-registry.sh, registries.yaml, and
+        k8s/platform/registry/* are all DROPPED. See "Files (Phase 0 - Substrate)" for the current list.
+
     - Guiding rules
       - Bottom-up by depends_on: never create a file before the files it depends on are in place.
-      - Two passes per file: (1) instantiate - create the file with a header comment stating purpose + depends_on;
-        (2) implement - write the real content and remove the "STUB" marker.
-      - Nothing is "done" until `make verify` (verify-phase0.sh) passes on a clean machine.
-      - Commit after each numbered step; keep steps independently reviewable.
-      - Security from commit #1: no secrets in git, .gitignore first, no shell string interpolation in scripts,
-        `set -euo pipefail` in every script, kubeconfig + .env + ./kubeconfig always ignored.
+      - Two passes per file: (1) instantiate with a header comment (purpose + depends_on, body `# STUB`);
+        (2) implement - real content, remove the STUB marker.
+      - Nothing is "done" until `make verify` (verify-phase0.sh) prints "PHASE 0 OK" and `make` exits 0,
+        from a freshly created cluster.
+      - Security from commit #1: `.gitignore` first; `.env`, `./kubeconfig`, rendered k3d config, and any
+        future cert material always ignored; `set -euo pipefail` in every script; never echo secret values.
 
-    - Step 0 - Repo skeleton (instantiate only, no logic yet)
-      - Create the directory tree:
-        /scripts /config /k8s/base /k8s/platform/registry /docs
-      - Instantiate empty-but-headered files (purpose + depends_on comment, body = `# STUB`):
+    - Step 0 - Repo skeleton (instantiate only)
+      - Directory tree: /scripts /config /k8s/base /docs
+      - Instantiate headered stubs:
         /.gitignore, /README.md, /.env.example, /Makefile,
-        /scripts/install-k3s.sh, /config/k3s-config.yaml, /config/kubeconfig.example,
-        /k8s/base/storageclass.yaml, /k8s/base/namespaces.yaml,
-        /scripts/registry-secret.sh, /k8s/platform/registry/pvc.yaml,
-        /k8s/platform/registry/deployment.yaml, /k8s/platform/registry/service.yaml,
-        /scripts/bootstrap-registry.sh, /config/registries.yaml,
-        /scripts/create-secrets.sh, /docs/secrets.md, /scripts/verify-phase0.sh
+        /scripts/lib.sh, /scripts/cluster-up.sh, /scripts/cluster-down.sh,
+        /scripts/create-secrets.sh, /scripts/verify-phase0.sh,
+        /config/k3d-cluster.yaml, /k8s/base/namespaces.yaml, /k8s/base/storageclass.yaml,
+        /docs/secrets.md
       - `chmod +x` all /scripts/*.sh.
-      - Outcome: `git status` shows the full Phase 0 surface; nothing works yet.
 
     - Step 1 - Ground rules files (no cluster needed)
-      - .gitignore: ignore /.env, /kubeconfig, *.kubeconfig, /config/kubeconfig (real one),
-        htpasswd, *.tmp, build output, .DS_Store.
-      - .env.example: DOMAIN, REGISTRY_HOST, REGISTRY_PORT, REGISTRY_USER, REGISTRY_PASS,
-        K3S_VERSION, K3S_SERVER_IP, K3S_NODE_IPS (comma list), K3S_TOKEN (blank, filled at install).
-      - docs/secrets.md: namespace map (platform/data/app), naming (<component>-<purpose>, e.g. registry-auth),
-        "kubectl create secret by hand now, Sealed Secrets later", never commit rule.
-      - README.md: one-paragraph what-this-is + "bring up Phase 0 from a bare machine" ordered list
-        pointing at `make cluster && make registry && make namespaces && make secrets && make verify`.
-      - Verify: `grep` that .env / kubeconfig are actually ignored; shellcheck passes on the (still-stub) scripts.
+      - .gitignore: /.env, /kubeconfig, *.kubeconfig, /config/.k3d-cluster.rendered.yaml,
+        /.secrets/, cert material, build output, .DS_Store.
+      - .env.example: DOMAIN, CLUSTER_NAME, K3S_VERSION (rancher/k3s tag), K3D_AGENTS,
+        HTTP_PORT/HTTPS_PORT (k3d loadbalancer -> host), REGISTRY_NAME, REGISTRY_PORT (host),
+        REGISTRY_INTERNAL_PORT (in-cluster, default 5000). Local defaults must "just work".
+      - docs/secrets.md: namespace map (platform/data/app), <component>-<purpose> naming,
+        "Phase 0 creates NO secrets (k3d registry is local + auto-trusted)", Sealed Secrets upgrade path.
+      - README.md: prereqs (Docker + k3d + kubectl), `cp .env.example .env`, `make phase0`, done criteria,
+        the two-registry-names table.
+      - Verify: `grep` that .env / kubeconfig are ignored; `bash -n` on all scripts.
 
-    - Step 2 - k3s bring-up (config/k3s-config.yaml -> scripts/install-k3s.sh)
-      - k3s-config.yaml: disable=traefik, disable=servicelb, write-kubeconfig-mode=0600,
-        tls-san list (domain + server IP), cluster-cidr/service-cidr defaults, node-name.
-      - install-k3s.sh: `set -euo pipefail`; source .env; download pinned K3S_VERSION installer;
-        install server with --config=config/k3s-config.yaml; copy /etc/rancher/k3s/k3s.yaml -> ./kubeconfig,
-        rewrite server URL to K3S_SERVER_IP; if K3S_NODE_IPS set, print the agent join command (token from server);
-        `kubectl --kubeconfig ./kubeconfig wait --for=condition=Ready node --all --timeout=120s`.
-      - config/kubeconfig.example: redacted shape of ./kubeconfig (server, cluster, user stanzas) as a reference.
-      - Verify (manual, one-time on the box): node Ready, `kubectl get sc` shows local-path present.
+    - Step 2 - Cluster definition + bring-up (config/k3d-cluster.yaml -> scripts/cluster-up.sh)
+      - lib.sh: REPO_ROOT, KUBECONFIG default = ./kubeconfig, load_env, require_vars, need, log/ok/die.
+      - k3d-cluster.yaml: k3d.io/v1alpha5 Simple config with <angle-bracket> placeholders -
+        name, image rancher/k3s:<K3S_VERSION>, servers 1 + agents <K3D_AGENTS>,
+        ports <HTTP_PORT>:80 / <HTTPS_PORT>:443 on the loadbalancer,
+        registries.create {name, host 0.0.0.0, hostPort <REGISTRY_PORT>},
+        options.k3s.extraArgs --disable=traefik (KEEP servicelb - k3d's loadbalancer needs klipper),
+        kubeconfig.updateDefaultKubeconfig false (script writes ./kubeconfig).
+      - cluster-up.sh: `set -euo pipefail`; source lib; load_env; require Docker daemon reachable;
+        require `k3d` (else die with install one-liners); render placeholders from .env ->
+        config/.k3d-cluster.rendered.yaml (gitignored); if the cluster exists -> `k3d cluster start` and
+        reuse, else `k3d cluster create --config <rendered>`; `k3d kubeconfig get <name>` -> ./kubeconfig (0600);
+        `kubectl wait --for=condition=Ready node --all --timeout=120s`; print both registry names.
+      - cluster-down.sh: `k3d cluster delete <name>`; rm ./kubeconfig + rendered config.
+      - Verify: node Ready; `kubectl get sc` shows local-path; `docker ps` shows k3d-<name>-server-0 +
+        <REGISTRY_NAME> containers.
 
     - Step 3 - Cluster base objects (k8s/base/*.yaml)
-      - storageclass.yaml: patch/redeclare `local-path` with
-        annotation storageclass.kubernetes.io/is-default-class: "true"; reclaimPolicy Delete, WaitForFirstConsumer.
-      - namespaces.yaml: Namespace objects platform, data, app (observability, ci as commented optional).
-      - Apply order in Makefile: namespaces before storageclass is fine (independent); both after install-k3s.
+      - storageclass.yaml: desired end state for the default `local-path` SC (is-default-class annotation,
+        reclaimPolicy Delete, WaitForFirstConsumer). Applied in practice via `kubectl patch` in `make base`
+        (the shipped SC has immutable fields); this file is the spec + dry-run target.
+      - namespaces.yaml: Namespace objects platform, data, app (observability, ci commented for Phase 5).
       - Verify: `kubectl get ns` shows the three; `kubectl get sc` shows local-path marked (default).
 
-    - Step 4 - Secrets convention (scripts/create-secrets.sh + registry secret)
-      - registry-secret.sh: `set -euo pipefail`; source .env; generate htpasswd
-        (`htpasswd -Bbn "$REGISTRY_USER" "$REGISTRY_PASS"` - arg array, no interpolation into a shell string);
-        self-signed TLS cert+key for REGISTRY_HOST via openssl with -subj and -addext SAN;
-        `kubectl create secret generic registry-auth --from-file=htpasswd -n platform --dry-run=client -o yaml | kubectl apply -f -` (idempotent);
-        `kubectl create secret tls registry-tls --cert=... --key=... -n platform` idempotently.
-      - create-secrets.sh: reads .env, loops a declared list of {name, ns, literals/files} and applies each
-        with the dry-run|apply idempotent pattern; calls registry-secret.sh for the registry pair;
-        refuses to run if .env missing; never echoes secret values.
-      - Verify: `kubectl -n platform get secret registry-auth registry-tls`; re-run script -> no diff, exit 0.
+    - Step 4 - Secrets convention (scripts/create-secrets.sh)
+      - Phase 0 creates NONE. create-secrets.sh is the stable entrypoint: `set -euo pipefail`, load_env,
+        assert namespaces exist, print "no secrets to create", exit 0. Later `<phase>-secrets.sh` plug in
+        here using the idempotent `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`
+        pattern (documented inline).
+      - Verify: `make secrets` exits 0 on a cluster with the namespaces; fails clearly without them.
 
-    - Step 5 - Registry manifests (k8s/platform/registry/*.yaml)
-      - pvc.yaml: 20Gi PVC, storageClassName omitted (uses default), ns platform.
-      - deployment.yaml: registry:2 pinned digest; env REGISTRY_AUTH=htpasswd, REALM, PATH to /auth/htpasswd,
-        REGISTRY_HTTP_TLS_CERTIFICATE/KEY to /certs; mount registry-auth at /auth, registry-tls at /certs,
-        PVC at /var/lib/registry; readiness/liveness httpGet /v2/ on 5000 scheme HTTPS; runAsNonRoot, drop caps.
-      - service.yaml: ClusterIP :5000 (plus optional NodePort) named "registry", selector matches deployment.
-      - Verify: `kubectl -n platform rollout status deploy/registry`; port-forward + `curl -k https://localhost:5000/v2/` -> 401 then 200 with creds.
+    - Step 5 - Makefile wiring
+      - Targets (.PHONY; `KUBECONFIG ?= ./kubeconfig` exported at top):
+        `make cluster`  -> scripts/cluster-up.sh
+        `make base`     -> kubectl apply namespaces.yaml + kubectl patch local-path default annotation
+        `make secrets`  -> scripts/create-secrets.sh
+        `make verify`   -> scripts/verify-phase0.sh
+        `make phase0`   -> cluster base secrets verify
+        `make down`     -> scripts/cluster-down.sh
+        `make lint`     -> shellcheck scripts/*.sh + `kubectl apply --dry-run=server -f k8s/base/`
+      - Every target except `cluster`/`down` fails fast if ./kubeconfig is missing.
 
-    - Step 6 - Node trust + bootstrap (config/registries.yaml.example -> scripts/bootstrap-registry.sh)
-      - registries.yaml.example: committed TEMPLATE (mirrors + configs block for REGISTRY_HOST:PORT). It holds
-        credentials once rendered, so the real config/registries.yaml is gitignored - same pattern as ./kubeconfig.
-        bootstrap-registry.sh renders it from .env -> config/registries.yaml, installs to
-        /etc/rancher/k3s/registries.yaml (0600) on every node, tls.ca_file points at the registry CA;
-        note: k3s restart required after writing.
-      - bootstrap-registry.sh: `set -euo pipefail`; ensure namespaces + storageclass applied;
-        run registry-secret.sh; `kubectl apply -f k8s/platform/registry/{pvc,deployment,service}.yaml`;
-        `kubectl -n platform rollout status deploy/registry --timeout=120s`;
-        render config/registries.yaml from .env, install it, restart k3s, wait node Ready;
-        print the push URL (`$REGISTRY_HOST:$REGISTRY_PORT`).
-      - Verify: from a node, `docker/nerdctl login` succeeds; `crictl pull` of a tagged test image works.
-
-    - Step 7 - Makefile wiring
-      - Targets:
-        `make cluster`   -> scripts/install-k3s.sh
-        `make base`      -> kubectl apply -f k8s/base/namespaces.yaml -f k8s/base/storageclass.yaml
-        `make secrets`   -> scripts/create-secrets.sh
-        `make registry`  -> scripts/bootstrap-registry.sh
-        `make verify`    -> scripts/verify-phase0.sh
-        `make phase0`    -> cluster base secrets registry verify  (full path, in order)
-      - All targets .PHONY; KUBECONFIG ?= ./kubeconfig exported at top; fail if ./kubeconfig absent (except cluster).
-
-    - Step 8 - Verification script (scripts/verify-phase0.sh) - the 100% gate
-      - `set -euo pipefail`; export KUBECONFIG=./kubeconfig.
-      - Assert: node(s) Ready; `kubectl get sc` has exactly one default and it is local-path;
-        namespaces platform/data/app exist;
-        create a 1Gi test PVC in data, wait Bound, delete it;
-        build a tiny scratch image, tag `$REGISTRY_HOST:$REGISTRY_PORT/verify:$(date +%s)`, push, then
-        `crictl pull` / re-pull from a fresh tag to prove auth+TLS+node trust;
-        clean up test image + PVC.
+    - Step 6 - Verification script (scripts/verify-phase0.sh) - the 100% gate
+      - `set -euo pipefail`; source lib; load_env; KUBECONFIG=./kubeconfig.
+      - [1] `kubectl wait` node(s) Ready.
+      - [2] exactly one default StorageClass and it is `local-path`.
+      - [3] namespaces platform/data/app exist AND each has its `default` ServiceAccount
+            (poll up to ~30s - the token controller creates it a beat after the namespace).
+      - [4] apply a 1Gi PVC + a busybox pod in `data` (local-path is WaitForFirstConsumer, so a consumer
+            is required to force binding), `kubectl wait` pvc Bound, then clean up.
+      - [5] `docker build` a tiny image, `docker push localhost:<REGISTRY_PORT>/verify:<ts>`, then run a pod
+            with image `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify:<ts>` and `kubectl wait` it Succeeded -
+            proves push from host + pull in-cluster by the in-cluster name.
       - Exit non-zero with a clear message on the first failed assertion; print "PHASE 0 OK" on success.
 
-    - Step 9 - Dry run on a clean machine
-      - Fresh VM: clone repo, `cp .env.example .env`, fill values, `make phase0`.
-      - Fix anything that only worked because of local state; update README with real timings/gotchas.
-      - Tag `phase-0-complete` once `make verify` is green from scratch twice in a row.
+    - Step 7 - Clean-machine dry run
+      - `make down` (if any), then from scratch: `cp .env.example .env`, `make phase0`.
+      - Fix anything that only worked due to leftover state; note host-port collisions in .env.example
+        (e.g. macOS holds :5000 - default REGISTRY_PORT is 5001).
+      - Tag `phase-0-complete` once `make phase0` is green from a fresh cluster twice in a row.
 
     - Definition of done (Phase 0)
       - Every file in "Files (Phase 0 - Substrate)" exists with real content (no STUB markers).
-        (registries.yaml is committed as registries.yaml.example; the rendered file is gitignored.)
-      - `make phase0` on a bare Linux machine ends with "PHASE 0 OK" and `make` exits 0.
-      - No secret material, kubeconfig, .env, or rendered registries.yaml committed; scripts pass shellcheck;
-        manifests pass `kubectl apply --dry-run=server`.
+      - On any machine with Docker + k3d + kubectl: `make phase0` ends with "PHASE 0 OK" and `make` exits 0;
+        `make down` removes everything.
+      - No .env, ./kubeconfig, rendered k3d config, or secret material committed; scripts pass `bash -n`
+        (shellcheck where available); k8s/base manifests pass `kubectl apply --dry-run=server`.
       - README lets a new person reproduce it unaided.
-      - Runtime note: pods run under k3s's bundled containerd - no Docker/Docker Desktop. Only `make verify`'s
-        push test needs `docker` or `nerdctl` on the host to build+push one throwaway image.
 
 - Build Order (dependency-ordered; each layer stands on a working one below it)
   - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
@@ -264,74 +262,73 @@
 
 - Files (Phase 0 - Substrate)
   Format: file_name | file_path | description | depends_on[]
+  Runtime: k3d (k3s-in-Docker). Machine-agnostic; prereqs = Docker daemon + k3d + kubectl (+ docker CLI).
+  IMPLEMENTED and verified: `make phase0` -> "PHASE 0 OK" on macOS via Docker (green twice from a fresh cluster).
 
   - Repo root
     - .gitignore | /.gitignore
-      | Ignore local state, secrets, kubeconfigs, build output.
+      | Ignore .env, ./kubeconfig, rendered k3d config, cert material, build output.
       | depends_on: []
     - README.md | /README.md
-      | How to bring up Phase 0 from a bare machine; points at bootstrap script and order.
+      | Prereqs (Docker + k3d + kubectl), `cp .env.example .env`, `make phase0`, done criteria, two-registry-names table.
       | depends_on: []
     - .env.example | /.env.example
-      | Template of host-level vars (domain, registry host/port, k3s version, node IPs). Copied to .env, never committed.
+      | Template: DOMAIN, CLUSTER_NAME, K3S_VERSION (rancher/k3s tag), K3D_AGENTS, HTTP_PORT/HTTPS_PORT,
+        REGISTRY_NAME, REGISTRY_PORT (host), REGISTRY_INTERNAL_PORT (in-cluster, 5000). Copied to .env, never committed.
       | depends_on: []
     - Makefile | /Makefile
-      | Task entrypoints: `make cluster`, `make registry`, `make namespaces`, `make secrets`, `make verify`.
-      | depends_on: [scripts/install-k3s.sh, scripts/bootstrap-registry.sh, k8s/base/namespaces.yaml, scripts/create-secrets.sh, scripts/verify-phase0.sh]
+      | Task entrypoints: `make cluster|base|secrets|verify|phase0|down|lint`.
+      | depends_on: [scripts/cluster-up.sh, scripts/cluster-down.sh, k8s/base/namespaces.yaml, scripts/create-secrets.sh, scripts/verify-phase0.sh]
 
-  - k3s cluster bring-up
-    - install-k3s.sh | /scripts/install-k3s.sh
-      | Installs k3s server (and joins workers if node IPs set), writes kubeconfig to ./kubeconfig, waits for node Ready.
-      | depends_on: [.env.example]
-    - k3s-config.yaml | /config/k3s-config.yaml
-      | k3s server config: disable bundled traefik/servicelb (Kong is the gateway), set cluster CIDR, TLS SANs.
+  - Shared
+    - lib.sh | /scripts/lib.sh
+      | Sourced by every script: REPO_ROOT, KUBECONFIG default (./kubeconfig), load_env, require_vars, need, log/ok/die.
       | depends_on: []
-    - kubeconfig.example | /config/kubeconfig.example
-      | Placeholder showing expected kubeconfig shape/location; real ./kubeconfig is gitignored.
-      | depends_on: [install-k3s.sh]
 
-  - Storage / prerequisites
+  - Cluster bring-up (k3d)
+    - k3d-cluster.yaml | /config/k3d-cluster.yaml
+      | k3d.io/v1alpha5 Simple config with <placeholders>: image rancher/k3s:<K3S_VERSION>, 1 server + <K3D_AGENTS> agents,
+        loadbalancer ports <HTTP_PORT>:80 / <HTTPS_PORT>:443, built-in registries.create block,
+        k3s extraArgs --disable=traefik (servicelb kept for k3d's loadbalancer).
+      | depends_on: []
+    - cluster-up.sh | /scripts/cluster-up.sh
+      | Requires Docker + k3d; renders k3d-cluster.yaml from .env -> config/.k3d-cluster.rendered.yaml (gitignored);
+        creates (or starts+reuses) the k3d cluster; writes ./kubeconfig via `k3d kubeconfig get`; waits node Ready;
+        prints both registry names. Idempotent.
+      | depends_on: [.env.example, config/k3d-cluster.yaml, scripts/lib.sh]
+    - cluster-down.sh | /scripts/cluster-down.sh
+      | `k3d cluster delete <name>`; removes ./kubeconfig and the rendered k3d config. Local only.
+      | depends_on: [scripts/cluster-up.sh]
+
+  - Cluster base objects
     - storageclass.yaml | /k8s/base/storageclass.yaml
-      | Marks local-path as default StorageClass so PVCs bind without annotation.
-      | depends_on: [install-k3s.sh]
-
-  - Namespaces
+      | Desired end state for the default `local-path` StorageClass (is-default-class annotation, Delete, WaitForFirstConsumer).
+        Applied via `kubectl patch` in `make base` (shipped SC has immutable fields); this file is spec + dry-run target.
+      | depends_on: [scripts/cluster-up.sh]
     - namespaces.yaml | /k8s/base/namespaces.yaml
-      | Creates namespaces: platform, data, app (and optionally observability, ci).
-      | depends_on: [install-k3s.sh]
-
-  - Container registry
-    - bootstrap-registry.sh | /scripts/bootstrap-registry.sh
-      | Deploys standalone registry:2 into platform ns, applies manifest, waits ready, prints push URL.
-      | depends_on: [namespaces.yaml, storageclass.yaml, registry-secret.sh]
-    - registry-deployment.yaml | /k8s/platform/registry/deployment.yaml
-      | registry:2 Deployment with basic-auth (htpasswd) and TLS, mounts PVC and htpasswd secret.
-      | depends_on: [namespaces.yaml, storageclass.yaml]
-    - registry-pvc.yaml | /k8s/platform/registry/pvc.yaml
-      | PersistentVolumeClaim backing registry image storage.
-      | depends_on: [storageclass.yaml]
-    - registry-service.yaml | /k8s/platform/registry/service.yaml
-      | ClusterIP (or NodePort) exposing the registry to nodes/CI for push and pull.
-      | depends_on: [registry-deployment.yaml]
-    - registry-secret.sh | /scripts/registry-secret.sh
-      | Generates htpasswd + TLS cert, creates the registry-auth and registry-tls secrets in platform ns.
-      | depends_on: [namespaces.yaml]
-    - registries.yaml | /config/registries.yaml
-      | k3s /etc/rancher/k3s/registries.yaml so nodes trust and authenticate to the private registry.
-      | depends_on: [bootstrap-registry.sh]
+      | Namespaces platform, data, app (observability, ci commented for Phase 5).
+      | depends_on: [scripts/cluster-up.sh]
 
   - Secrets convention
     - create-secrets.sh | /scripts/create-secrets.sh
-      | Reads .env, runs `kubectl create secret` for each Phase 0 secret (registry, later DB/JWT) into the right ns; idempotent.
-      | depends_on: [namespaces.yaml, .env.example]
+      | Phase 0 creates NO secrets (k3d registry is local + auto-trusted). Stable entrypoint: asserts namespaces,
+        documents the idempotent `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` pattern for later phases.
+      | depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/lib.sh]
     - secrets.md | /docs/secrets.md
-      | Naming/namespace rules for secrets, what lives where, upgrade path to Sealed Secrets.
+      | Namespace map, <component>-<purpose> naming, "no Phase 0 secrets", Sealed Secrets upgrade path.
       | depends_on: []
 
   - Verification
     - verify-phase0.sh | /scripts/verify-phase0.sh
-      | Asserts node Ready, default StorageClass set, namespaces exist, a test PVC binds, and a test image push+pull to the registry succeeds.
-      | depends_on: [install-k3s.sh, storageclass.yaml, namespaces.yaml, bootstrap-registry.sh, registries.yaml]
+      | The 100% gate. Asserts: node(s) Ready; exactly one default SC = local-path; namespaces platform/data/app exist
+        AND have their default ServiceAccount; a 1Gi PVC (+ consumer pod) binds; `docker push localhost:<REGISTRY_PORT>/verify`
+        then an in-cluster pod pulls `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify`. Prints "PHASE 0 OK".
+      | depends_on: [scripts/cluster-up.sh, k8s/base/storageclass.yaml, k8s/base/namespaces.yaml, scripts/lib.sh]
+
+  - DROPPED from the earlier Linux-host plan (k3d makes them unnecessary):
+    scripts/install-k3s.sh, config/k3s-config.yaml, config/kubeconfig.example,
+    scripts/registry-secret.sh, scripts/bootstrap-registry.sh, config/registries.yaml(.example),
+    k8s/platform/registry/{deployment,pvc,service}.yaml
 
 - Files (Phase 1 - Data layer)
   Format: file_name | file_path | description | depends_on[]

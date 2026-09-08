@@ -1,0 +1,53 @@
+# k3d cluster definition - k3s running as Docker containers (machine-agnostic).
+# depends_on: []
+#
+# Used by:  k3d cluster create --config config/k3d-cluster.yaml
+# Docs:     https://k3d.io/stable/usage/configfile/
+#
+# Placeholders in <angle brackets> are substituted from .env by scripts/cluster-up.sh
+# before this file is handed to k3d (rendered copy: config/.k3d-cluster.rendered.yaml,
+# gitignored).
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: <CLUSTER_NAME>
+
+servers: 1
+agents: <K3D_AGENTS>
+
+image: rancher/k3s:<K3S_VERSION>
+
+# Publish Kong's future ports from the load balancer to the host so the platform
+# is reachable at http://localhost:<HTTP_PORT> without extra plumbing.
+ports:
+  - port: <HTTP_PORT>:80
+    nodeFilters:
+      - loadbalancer
+  - port: <HTTPS_PORT>:443
+    nodeFilters:
+      - loadbalancer
+
+# Wire the k3d-managed registry into the cluster so nodes trust it by name.
+# In-cluster it is always <REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>; on the host
+# it is localhost:<REGISTRY_PORT> (they can differ so host-port collisions don't
+# force a manifest rewrite).
+registries:
+  create:
+    name: <REGISTRY_NAME>
+    host: "0.0.0.0"
+    hostPort: "<REGISTRY_PORT>"
+
+options:
+  k3d:
+    wait: true
+    timeout: "120s"
+  k3s:
+    # Kong is the gateway - drop k3s's bundled Traefik. Keep ServiceLB (klipper):
+    # k3d's loadbalancer relies on it to expose ports 80/443 above.
+    extraArgs:
+      - arg: --disable=traefik
+        nodeFilters:
+          - server:*
+  kubeconfig:
+    updateDefaultKubeconfig: false   # cluster-up.sh writes a repo-local ./kubeconfig
+    switchCurrentContext: false

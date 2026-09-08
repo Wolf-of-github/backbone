@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Create every Phase 0 secret from .env. Idempotent. Never echoes secret values.
-# depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/registry-secret.sh]
+# depends_on: [k8s/base/namespaces.yaml, .env.example]
 #
-# Phase 0 owns only the registry pair (delegated to registry-secret.sh).
-# Later phases add their own <phase>-secrets.sh; this stays the single entry
-# point invoked by `make secrets`.
+# Phase 0 has NO secrets of its own: the k3d built-in registry needs no auth
+# (local, in-Docker) and k3d wires node trust automatically. This script is the
+# stable entrypoint that later phases (<phase>-secrets.sh) plug into.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,19 +14,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 load_env
 need kubectl
 
-# Namespaces must exist first.
 kubectl get ns platform data app >/dev/null 2>&1 \
   || die "namespaces missing - run 'make base' first"
 
-log "creating registry secrets"
-"$SCRIPT_DIR/registry-secret.sh"
-
-# --- extend here in later phases ------------------------------------------------
-# Example pattern (idempotent, no value echoed):
+# --- Phase 1+ add their secrets here, using the idempotent pattern: --------
 #   kubectl create secret generic mongodb-credentials \
 #     --namespace data \
 #     --from-literal=root-username="$MONGO_ROOT_USER" \
 #     --from-literal=root-password="$MONGO_ROOT_PASS" \
 #     --dry-run=client -o yaml | kubectl apply -f -
 
-ok "all Phase 0 secrets present"
+ok "Phase 0 has no secrets to create (k3d registry is unauthenticated + auto-trusted)"
