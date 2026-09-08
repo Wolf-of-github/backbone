@@ -1,0 +1,88 @@
+================================================================================
+ k3s cluster — quick command reference
+ (run all of these on a LINUX host; k3s does not run natively on macOS)
+================================================================================
+
+--------------------------------------------------------------------------------
+ 1. SPIN UP THE CLUSTER
+--------------------------------------------------------------------------------
+
+# Single-node control plane (most common starting point)
+./setup-k3s-cluster.sh server
+
+# Single node, pin a k3s version and disable Traefik
+K3S_VERSION=v1.30.2+k3s2 ./setup-k3s-cluster.sh server --disable traefik
+
+# Bootstrap an HA cluster (embedded etcd) on the first node
+K3S_TOKEN=my-shared-secret ./setup-k3s-cluster.sh server --cluster-init
+
+# Add another control-plane node to an existing cluster
+./setup-k3s-cluster.sh server --server https://<server-ip>:6443 --token <node-token>
+
+# Join a worker / agent node
+./setup-k3s-cluster.sh agent --server https://<server-ip>:6443 --token <node-token>
+
+# The server run prints the join token; you can also read it directly:
+sudo cat /var/lib/rancher/k3s/server/node-token
+
+
+--------------------------------------------------------------------------------
+ 2. TEAR DOWN
+--------------------------------------------------------------------------------
+
+./setup-k3s-cluster.sh uninstall          # auto-detects server vs agent
+
+
+--------------------------------------------------------------------------------
+ 3. CHECK THE SERVICE (systemd)
+--------------------------------------------------------------------------------
+
+systemctl status k3s                       # 'k3s-agent' on worker nodes
+journalctl -u k3s -f                       # live logs
+sudo systemctl restart k3s
+
+
+--------------------------------------------------------------------------------
+ 4. TALK TO THE CLUSTER
+--------------------------------------------------------------------------------
+
+# Option A: use k3s' bundled kubectl (no setup)
+sudo k3s kubectl get nodes -o wide
+
+# Option B: use a standalone kubectl with the generated kubeconfig
+export KUBECONFIG=$HOME/.kube/config-k3s-$(hostname -s)
+kubectl get nodes -o wide
+
+# From your Mac: copy the kubeconfig over and swap in the server's real IP
+scp user@<server-ip>:~/.kube/config-k3s-<node> ~/.kube/k3s
+sed -i '' 's/127.0.0.1/<server-ip>/' ~/.kube/k3s
+export KUBECONFIG=~/.kube/k3s
+kubectl get nodes
+
+
+--------------------------------------------------------------------------------
+ 5. SEE WHAT IS RUNNING
+--------------------------------------------------------------------------------
+
+kubectl get nodes -o wide
+kubectl get pods -A                        # all namespaces
+kubectl get all -n kube-system             # coredns, traefik, metrics-server, local-path
+kubectl get events -A --sort-by=.lastTimestamp
+kubectl describe pod <pod>
+kubectl logs <pod> -f
+
+# Container level (bypassing kubernetes)
+sudo k3s crictl ps
+sudo k3s crictl images
+
+
+--------------------------------------------------------------------------------
+ 6. QUICK SMOKE TEST
+--------------------------------------------------------------------------------
+
+kubectl create deployment hello --image=nginx --replicas=2
+kubectl expose deployment hello --port=80 --type=NodePort
+kubectl get pods -o wide
+kubectl get svc hello                      # note the 3xxxx NodePort
+curl http://<node-ip>:<nodeport>
+kubectl delete deployment,svc hello
