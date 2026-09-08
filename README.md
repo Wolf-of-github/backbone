@@ -1,89 +1,209 @@
 # backbone
 
-A from-scratch, self-hosted platform substrate on k3s. Linux only. Built for
-horizontal scale: one control-plane machine, then join as many workers as you
-need — even across networks / behind NAT, over Tailscale.
+A from-scratch, self-hosted platform substrate on k3s. **Linux only.** Built for
+horizontal scale: stand up one control-plane machine, then join as many worker
+machines as you want — including across networks / behind NAT, via Tailscale.
 
-See [architecture.txt](architecture.txt) for the full design.
+`architecture.txt` has the full design. This file is the operator's guide:
+every command, what it does, and what you should see.
 
 ---
 
-## Installation log
+## Phase 0 — Substrate
 
-Real, tested commands, recorded as each piece is actually installed.
+Gets you a running k3s cluster: a control plane, a default StorageClass so
+volumes work, the `platform` / `data` / `app` namespaces, and a way to add
+worker machines. Nothing application-level yet (databases, gateway, TLS come in
+later phases).
 
-### Phase 0 - Substrate
+### Prerequisites
 
-Verified: 2-node cluster —
-- `pavilion` — home VM, Ubuntu 26.04, control plane
-- `ip-172-31-19-225` — AWS EC2, Ubuntu 26.04, worker
-- joined over Tailscale (home VM has no public IP); `make verify` → `PHASE 0 OK`.
+| Machine | Needs |
+|---|---|
+| control-plane host | Linux with systemd, `curl`, `sudo`, `kubectl` |
+| each worker | Linux with systemd, `curl`, `sudo` — nothing else |
+| (optional) your laptop | `kubectl`, to drive the cluster remotely with the generated `./kubeconfig` |
 
-#### 1. Control plane (on the server)
+Minimum control-plane size: 1 vCPU / 1 GB RAM / 4 GB disk. 2 GB RAM recommended.
 
-Same-network setup — `K3S_SERVER_ADDR` = the server's LAN/VPC IP:
+---
+
+### 1. Configure
 
 ```bash
 cp .env.example .env
-sed -i "s/^K3S_SERVER_ADDR=.*/K3S_SERVER_ADDR=$(hostname -I | awk '{print $1}')/" .env
-make phase0                     # k3s server -> namespaces -> verify  => PHASE 0 OK
+```
 
+**Does:** creates your local config from the template. `.env` is gitignored.
+
+Then edit `.env`. The only required setting is **`K3S_SERVER_ADDR`** — the
+address workers will use to reach this machine's API server:
+
+| Your situation | Set `K3S_SERVER_ADDR` to | Also set |
+|---|---|---|
+| single node, or all nodes on one LAN / VPC | this machine's private IP | — |
+| nodes on different networks, this machine **has** a public IP | that public IP / DNS name | — |
+| nodes on different networks, this machine has **no** public IP (home box, NAT) | this machine's Tailscale IP (`tailscale ip -4`) | `TAILSCALE=true`, `WIREGUARD=false` |
+
+For the Tailscale case, `tailscale` must be installed and `sudo tailscale up`
+already run on this machine.
+
+---
+
+### 2. Bring up the control plane
+
+```bash
+make phase0
+```
+
+**Does, in order:**
+
+| Sub-step | What happens |
+|---|---|
+| `make cluster` | installs the k3s server (`curl https://get.k3s.io \| sh -`), writes `./kubeconfig`, caches a worker join token to `.secrets/cluster-join.env` |
+| `make base` | creates namespaces `platform` / `data` / `app`; marks `local-path` the default StorageClass |
+| `make secrets` | nothing yet — a stable hook for later phases |
+| `make verify` | runs the acceptance checks (below) |
+
+**Expect:** ~30–90 s, ending with:
+
+```
+[1/5] nodes Ready                 OK 1 node(s) Ready
+[2/5] default StorageClass        OK default StorageClass = local-path
+[3/5] namespaces                  OK namespaces platform, data, app present
+[4/5] PVC binds                   OK test PVC bound and mounted
+[5/5] every node can pull images  OK 1 node(s) pulled and ran a test image
+
+PHASE 0 OK
+```
+
+`PHASE 0 OK` **and** the command exiting `0` means success. Any check that fails
+prints `ERROR verify-phase0: ...` and stops.
+
+> **Known hiccup:** if `make cluster` fails with `no matching resources found`
+> (the node object hadn't registered when it checked), the cluster is actually
+> fine — just run `make base && make verify`.
+
+---
+
+### 3. Use the cluster
+
+```bash
 export KUBECONFIG=$PWD/kubeconfig
 kubectl get nodes
+kubectl get ns
 ```
 
-Cross-network setup (server behind NAT / no public IP) — use Tailscale:
+**Expect:** one node `Ready`; namespaces `platform`, `data`, `app`, plus the
+system ones. Add `export KUBECONFIG=...` to your shell profile, or copy
+`./kubeconfig` to another machine that has `kubectl`.
+
+---
+
+### 4. Add a worker machine
+
+You bring up the machine yourself (a VM, a cloud instance, a spare box). Then
+the control plane installs k3s on it and joins it — you don't log into the
+worker.
+
+**One-time: let the control plane SSH to the worker.**
+
+- Same network: normal SSH key auth to the worker.
+- Cloud instance with a `.pem` key: put the key on the control-plane host and add
+  to its `~/.ssh/config`:
+
+  ```
+  Host <worker-address>
+    User <login-user>
+    IdentityFile ~/.ssh/<key>.pem
+  ```
+
+  (or set `SSH_KEY=/path/to/key.pem` in `.env`).
+
+**If the cluster is Tailscale-based**, also install Tailscale on the worker
+first — on the worker: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`.
+
+**Then, from the control-plane host:**
 
 ```bash
-# tailscale already up on this box:
-tailscale ip -4                 # e.g. 100.64.195.64
-
-cp .env.example .env
-# in .env set:
-#   K3S_SERVER_ADDR=100.64.195.64      (this box's tailscale IP)
-#   TAILSCALE=true
-#   WIREGUARD=false                    (tailscale already encrypts)
-make phase0                     # => PHASE 0 OK
+make node-join TARGET=<login-user>@<worker-address>
 ```
 
-> If `make cluster` ever fails on `no matching resources found` (node object not
-> registered yet), just re-run `make base && make verify` — the cluster is fine.
+**Does:** SSHes to the worker, runs the k3s agent installer there with the
+cached join token, starts `k3s-agent`. Nothing is installed on the worker except
+the agent (it brings its own container runtime).
 
-#### 2. Add a worker
+**Expect:** the k3s install log from the worker, then `OK join dispatched`.
 
-The master does it — SSH from server to worker, install the agent there:
+**Confirm:**
 
 ```bash
-# one-time: let the server SSH to the worker.
-#   same network: normal key auth.
-#   AWS worker: put the .pem on the server and add to ~/.ssh/config:
-#     Host <worker-ip>
-#       User ubuntu
-#       IdentityFile ~/.ssh/aws.pem
-#   (or set SSH_KEY=/path/to/key.pem in .env)
-
-# worker also needs tailscale if the cluster is Tailscale-based:
-#   on the worker:  curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up
-
-# then, from the server:
-make node-join TARGET=ubuntu@<worker-tailscale-or-lan-ip>
-
-kubectl get nodes -o wide       # worker shows Ready in ~30s
-make verify                     # now reports "2 node(s) ..."  => PHASE 0 OK
+kubectl get nodes -o wide
+make verify
 ```
 
-Or run it on the worker itself (no SSH needed):
+**Expect:** the new node `Ready` within ~30 s; `make verify` now reports
+`2 node(s) ...` and ends `PHASE 0 OK`.
+
+*Alternatively*, run it on the worker itself (no SSH from the control plane):
 
 ```bash
-K3S_URL=https://<server-ip>:6443 \
-K3S_TOKEN=<from server: .secrets/cluster-join.env> \
-TAILSCALE=true WIREGUARD=false \
+K3S_URL=https://<server-address>:6443 \
+K3S_TOKEN=<value from the server's .secrets/cluster-join.env> \
+TAILSCALE=true WIREGUARD=false \        # only if the cluster is Tailscale-based
 ./scripts/node-join.sh
 ```
 
-#### Tear down
+---
+
+### Firewall (multi-node only)
+
+Open **between nodes** (e.g. one cloud security group referencing itself):
+
+| Port | For |
+|---|---|
+| `6443/tcp` | Kubernetes API — workers → control plane |
+| `10250/tcp` | kubelet — all nodes ↔ all nodes |
+| `51820/udp` | pod network (WireGuard) — `WIREGUARD=true` |
+| `8472/udp` | pod network (VXLAN) — `WIREGUARD=false` |
+
+Over Tailscale these ride the tunnel; no cloud firewall rules needed for them.
+
+---
+
+### Scaling
 
 ```bash
-make down                                    # uninstalls the k3s server on this host
-sudo /usr/local/bin/k3s-agent-uninstall.sh   # on each worker
+kubectl scale deploy/<name> --replicas=<n>   # more copies, spread across nodes
 ```
+
+Out of capacity? Add another worker (step 4) — existing services are untouched.
+
+---
+
+### Stop / tear down
+
+```bash
+sudo systemctl stop k3s          # control plane: stop without uninstalling
+sudo systemctl stop k3s-agent    # worker: same
+```
+
+```bash
+make down                                     # control plane: uninstall k3s
+sudo /usr/local/bin/k3s-agent-uninstall.sh    # run on each worker
+```
+
+**Expect:** `make down` removes the k3s server, `./kubeconfig`, and the cached
+join token. Workers must be uninstalled on each worker.
+
+---
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `make cluster`: `no matching resources found` | harmless race — run `make base && make verify` |
+| worker stuck `NotReady` | on the worker: `sudo journalctl -u k3s-agent -f` — usually a blocked port or unreachable server address |
+| `make node-join`: `Permission denied (publickey)` | control plane can't SSH the worker — fix `~/.ssh/config` or set `SSH_KEY` in `.env` |
+| need the join token again | on the control plane: `sudo cat /var/lib/rancher/k3s/server/node-token` |
+| server won't start | `sudo journalctl -u k3s -f`; confirm `K3S_SERVER_ADDR` resolves and `:6443` is free |
