@@ -71,6 +71,18 @@ printf 'K3S_URL=https://%s:6443\nK3S_TOKEN=%s\n' "${K3S_SERVER_ADDR}" "${TOK}" \
 ok "join credentials cached at .secrets/cluster-join.env (gitignored)"
 
 export KUBECONFIG="$DST"
+
+# The API server accepts connections a moment before the node object is
+# registered, so `kubectl wait node` can race with "no matching resources".
+# Wait for the object to appear first, then wait for it to go Ready.
+log "waiting for the node object to register"
+for _ in $(seq 1 60); do
+  [ -n "$(kubectl get nodes -o name 2>/dev/null)" ] && break
+  sleep 2
+done
+[ -n "$(kubectl get nodes -o name 2>/dev/null)" ] \
+  || die "node never registered - check: sudo journalctl -u k3s -f"
+
 log "waiting for server node Ready (timeout 120s)"
 kubectl wait --for=condition=Ready node --all --timeout=120s
 
