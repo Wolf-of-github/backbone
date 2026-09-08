@@ -1,0 +1,77 @@
+- Diagram
+  - auth
+    - Passport.js + JWT
+  - api-gateway
+    - Kong
+      - Single entry point for all services
+      - Load balancing (automatic)
+      - Request/response transformation (add defaults, extract JWT data)
+      - Rate limiting, authentication plugins
+      - Routing: / → frontend, /api/* → backend services
+  - frontend
+    - React app containerized with NGINX
+      - Multi-stage Docker build (Node.js build + NGINX serve)
+      - Served from NGINX container
+      - Deployed in k3s cluster
+      - Kong routes root path to frontend service
+  - database
+    - MongoDB (primary NoSQL)
+  - job-queue
+    - Redis + BullMQ
+      - Redis for storage
+      - BullMQ for queue management
+      - Features: Auto-retry, job status tracking, priority queues
+      - Workers pull jobs from queue for processing big tasks
+  - logging-monitoring
+    - PLG Stack (Prometheus + Loki + Grafana)
+      - Prometheus: Metrics collection (CPU, memory, request rates, errors)
+      - Loki: Centralized logging from all services
+      - Grafana: Unified dashboard for logs and metrics
+      - Auto-discovery of k3s services
+      - Alerting for critical issues
+  - secrets-management
+    - k3s Native Secrets
+      - Built-in k3s secrets (no extra pods)
+      - Store API keys, DB passwords, JWT secrets
+      - Inject as environment variables into pods
+      - Upgrade to Sealed Secrets for production if needed
+  - ssl-tls
+    - cert-manager + Let's Encrypt
+      - cert-manager pod manages SSL certificates
+      - Let's Encrypt provides free SSL certificates
+      - Automatic certificate issuance and renewal (every 90 days)
+      - Integrates with Kong for HTTPS
+      - Zero maintenance after setup
+  - ci-cd
+    - Gitea + Drone CI (self-hosted)
+      - Gitea: Self-hosted Git repository
+      - Drone CI: Lightweight CI/CD pipeline runner
+      - Docker Registry: Store built images (Gitea built-in or separate)
+      - Pipeline: Push to Git → Run tests → Build Docker image → Deploy to k3s
+      - k3s rolling updates (zero downtime deployment)
+      - Auto-rollback on failed health checks
+      - Database migration strategy with up/down scripts
+      - Notifications on success/failure
+  - backup-disaster-recovery
+    - MongoDB Backups
+      - k3s CronJob runs mongodump every 7 days
+      - Stored in persistent volumes
+      - Optional: External storage (self-hosted MinIO)
+    - Redis Persistence
+      - RDB: Snapshots every 15 minutes (fast recovery)
+      - AOF: Append-only log for every write (minimal data loss)
+      - Auto-compaction when AOF grows too large
+      - Stored in persistent volumes
+    - Server Failure Handling
+      - k3s multi-node cluster (main + worker nodes)
+      - Automatic pod rescheduling if node fails
+      - Persistent volumes for data survival
+      - Optional: MongoDB replica set for high availability
+  - deployment
+    - k3s (lightweight Kubernetes)
+      - Auto-scaling for big tasks
+      - Multi-server orchestration
+      - Worker nodes for task processing
+      - Self-hosted, zero external dependencies
+
+- Files
