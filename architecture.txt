@@ -73,5 +73,575 @@
       - Multi-server orchestration
       - Worker nodes for task processing
       - Self-hosted, zero external dependencies
+  - maintenance
+    - Static maintenance page (NGINX container)
+      - Always-running deployment, minimal resources
+      - Serves single static HTML, HTTP 503 + Retry-After header
+      - Activated/deactivated by toggling Kong routing (not by start/stop)
+      - `maintenance on|off` CLI wraps Kong Admin API
+      - Deactivation also exposed via admin-auth endpoint (POST /internal/maintenance/off)
+        - Callable from CLI or a login-gated control on the maintenance page
+      - Bypass list: maintenance-off endpoint, health checks, /metrics
+      - State persisted in ConfigMap so it survives Kong/pod restarts
+      - Optional: pause BullMQ queues while in maintenance
+  - security
+    - Baseline application security guidelines (enforced in code review + CI)
+      - Injection: no shell string interpolation
+        - Use execFile/spawn with arg arrays, not exec() / child_process.exec
+        - Python: subprocess.run([...]) without shell=True, never os.system()
+        - Parameterized DB queries only, never string-built MongoDB queries
+      - Code execution: no eval(), no new Function() on dynamic strings
+      - XSS: no raw innerHTML / outerHTML / insertAdjacentHTML / document.write
+        - React: avoid dangerouslySetInnerHTML; sanitize with DOMPurify if unavoidable
+        - Escape/encode all user content on output; set a strict Content-Security-Policy
+      - Unsafe deserialization: no pickle/marshal/yaml.load on untrusted input
+        - Use JSON or schema-validated parsers (pydantic, zod); yaml.safe_load only
+      - XXE: use a hardened XML parser (defusedxml), external entities disabled
+      - Secrets: never hardcode keys/passwords/tokens; load from k3s secrets
+        - Secret scanning in CI to block commits containing credentials
+      - Crypto: AES-GCM (or AES-CBC + HMAC), never ECB; use createCipheriv with IV
+        - Bcrypt/argon2 for passwords; never MD5/SHA1 for auth
+      - TLS: never disable certificate verification (no rejectUnauthorized:false,
+        verify=False, InsecureSkipVerify)
+      - Access control: authenticate every request at the gateway; enforce object-level
+        authorization in services (prevent IDOR); deny by default
+      - SSRF: validate/allowlist outbound URLs from user input; block internal IP ranges
+      - Path traversal: normalize paths, confine to an allowed base directory
+      - CI/CD: no untrusted input in shell steps or checkout refs; pin action versions
+      - Dependencies: lockfiles, npm audit / CVE scan in pipeline, patch critical/high
+      - Enforcement: security-guidance plugin (edit-time pattern warnings, LLM diff
+        review, agentic commit review) gates every change before merge
 
-- Files
+- Build Order (dependency-ordered; each layer stands on a working one below it)
+  - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
+  - Phase 0 - Substrate
+    - k3s cluster (single node ok; kubectl working, default StorageClass, PVCs bind)
+    - Container registry (Gitea built-in or standalone registry:2) - needed before anything deploys
+    - Namespace split + secrets convention (kubectl create secret by hand for now)
+  - Phase 1 - Data layer
+    - MongoDB (StatefulSet + PVC, single instance, no replica set yet)
+    - Redis (PVC, RDB enabled) - needed by BullMQ and Kong rate-limiting
+  - Phase 2 - Edge
+    - Kong (declarative/DB-less mode; routes / and /api/*) - integration point for auth, TLS, rate limiting, maintenance
+    - One trivial backend service (/api/ping) - end-to-end smoke test for every later change
+    - Frontend (React + NGINX image; Kong routes / to it)
+  - Phase 3 - Identity
+    - Auth service (Passport.js + JWT) issues tokens; Kong JWT plugin validates + injects claims
+    - Test IDOR / deny-by-default here
+  - Phase 4 - Async work
+    - BullMQ workers (separate Deployment, pulls from Redis) - after real jobs exist
+  - Phase 5 - Operate
+    - CI/CD (Gitea + Drone) - replaces manual push/apply; deliberately after manual path proven
+    - Observability (PLG stack) - no hard dependents; can slot earlier for bring-up visibility
+    - cert-manager + Let's Encrypt - needs real domain + Kong terminating traffic
+  - Phase 6 - Resilience & lifecycle
+    - Backup/DR (mongodump CronJob, Redis AOF, then replica set + multi-node k3s)
+    - Maintenance page (static 503 + maintenance CLI + ConfigMap state) - needs Kong Admin API + CI/CD
+  - Cross-cutting (from commit #1, never "done")
+    - Security guidelines: enable security-guidance plugin + CI checks (secret scanning,
+      no exec(), parameterized queries) as soon as a repo exists
+  - Minimum viable spine: k3s → registry → MongoDB + Redis → Kong → one placeholder service
+
+- Files (Phase 0 - Substrate)
+  Format: file_name | file_path | description | depends_on[]
+
+  - Repo root
+    - .gitignore | /.gitignore
+      | Ignore local state, secrets, kubeconfigs, build output.
+      | depends_on: []
+    - README.md | /README.md
+      | How to bring up Phase 0 from a bare machine; points at bootstrap script and order.
+      | depends_on: []
+    - .env.example | /.env.example
+      | Template of host-level vars (domain, registry host/port, k3s version, node IPs). Copied to .env, never committed.
+      | depends_on: []
+    - Makefile | /Makefile
+      | Task entrypoints: `make cluster`, `make registry`, `make namespaces`, `make secrets`, `make verify`.
+      | depends_on: [scripts/install-k3s.sh, scripts/bootstrap-registry.sh, k8s/base/namespaces.yaml, scripts/create-secrets.sh, scripts/verify-phase0.sh]
+
+  - k3s cluster bring-up
+    - install-k3s.sh | /scripts/install-k3s.sh
+      | Installs k3s server (and joins workers if node IPs set), writes kubeconfig to ./kubeconfig, waits for node Ready.
+      | depends_on: [.env.example]
+    - k3s-config.yaml | /config/k3s-config.yaml
+      | k3s server config: disable bundled traefik/servicelb (Kong is the gateway), set cluster CIDR, TLS SANs.
+      | depends_on: []
+    - kubeconfig.example | /config/kubeconfig.example
+      | Placeholder showing expected kubeconfig shape/location; real ./kubeconfig is gitignored.
+      | depends_on: [install-k3s.sh]
+
+  - Storage / prerequisites
+    - storageclass.yaml | /k8s/base/storageclass.yaml
+      | Marks local-path as default StorageClass so PVCs bind without annotation.
+      | depends_on: [install-k3s.sh]
+
+  - Namespaces
+    - namespaces.yaml | /k8s/base/namespaces.yaml
+      | Creates namespaces: platform, data, app (and optionally observability, ci).
+      | depends_on: [install-k3s.sh]
+
+  - Container registry
+    - bootstrap-registry.sh | /scripts/bootstrap-registry.sh
+      | Deploys standalone registry:2 into platform ns, applies manifest, waits ready, prints push URL.
+      | depends_on: [namespaces.yaml, storageclass.yaml, registry-secret.sh]
+    - registry-deployment.yaml | /k8s/platform/registry/deployment.yaml
+      | registry:2 Deployment with basic-auth (htpasswd) and TLS, mounts PVC and htpasswd secret.
+      | depends_on: [namespaces.yaml, storageclass.yaml]
+    - registry-pvc.yaml | /k8s/platform/registry/pvc.yaml
+      | PersistentVolumeClaim backing registry image storage.
+      | depends_on: [storageclass.yaml]
+    - registry-service.yaml | /k8s/platform/registry/service.yaml
+      | ClusterIP (or NodePort) exposing the registry to nodes/CI for push and pull.
+      | depends_on: [registry-deployment.yaml]
+    - registry-secret.sh | /scripts/registry-secret.sh
+      | Generates htpasswd + TLS cert, creates the registry-auth and registry-tls secrets in platform ns.
+      | depends_on: [namespaces.yaml]
+    - registries.yaml | /config/registries.yaml
+      | k3s /etc/rancher/k3s/registries.yaml so nodes trust and authenticate to the private registry.
+      | depends_on: [bootstrap-registry.sh]
+
+  - Secrets convention
+    - create-secrets.sh | /scripts/create-secrets.sh
+      | Reads .env, runs `kubectl create secret` for each Phase 0 secret (registry, later DB/JWT) into the right ns; idempotent.
+      | depends_on: [namespaces.yaml, .env.example]
+    - secrets.md | /docs/secrets.md
+      | Naming/namespace rules for secrets, what lives where, upgrade path to Sealed Secrets.
+      | depends_on: []
+
+  - Verification
+    - verify-phase0.sh | /scripts/verify-phase0.sh
+      | Asserts node Ready, default StorageClass set, namespaces exist, a test PVC binds, and a test image push+pull to the registry succeeds.
+      | depends_on: [install-k3s.sh, storageclass.yaml, namespaces.yaml, bootstrap-registry.sh, registries.yaml]
+
+- Files (Phase 1 - Data layer)
+  Format: file_name | file_path | description | depends_on[]
+  All manifests land in the `data` namespace and rely on the default StorageClass from Phase 0.
+
+  - Secrets
+    - data-secrets.sh | /scripts/data-secrets.sh
+      | Reads .env, creates mongodb-credentials (root user/pass, app user/pass) and redis-password secrets in data ns; idempotent.
+      | depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/create-secrets.sh]
+
+  - MongoDB
+    - mongo-statefulset.yaml | /k8s/data/mongodb/statefulset.yaml
+      | Single-replica MongoDB StatefulSet; auth enabled, root creds from secret, volumeClaimTemplate for /data/db, liveness/readiness probes.
+      | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, data-secrets.sh]
+    - mongo-service.yaml | /k8s/data/mongodb/service.yaml
+      | Headless ClusterIP service (mongodb.data.svc) for stable DNS to the StatefulSet pod.
+      | depends_on: [mongo-statefulset.yaml]
+    - mongo-init-configmap.yaml | /k8s/data/mongodb/init-configmap.yaml
+      | Mounted init JS: creates the application database + least-privilege app user scoped to that DB.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - mongo-config.yaml | /k8s/data/mongodb/mongod-conf-configmap.yaml
+      | mongod.conf ConfigMap: bindIp, wiredTiger cache sizing, auth on; replica-set line commented for Phase 6.
+      | depends_on: [k8s/base/namespaces.yaml]
+
+  - Redis
+    - redis-statefulset.yaml | /k8s/data/redis/statefulset.yaml
+      | Single-replica Redis StatefulSet; requirepass from secret, mounts redis.conf and a PVC at /data.
+      | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, data-secrets.sh, redis-config.yaml]
+    - redis-service.yaml | /k8s/data/redis/service.yaml
+      | Headless ClusterIP service (redis.data.svc) for stable DNS.
+      | depends_on: [redis-statefulset.yaml]
+    - redis-config.yaml | /k8s/data/redis/conf-configmap.yaml
+      | redis.conf ConfigMap: RDB save points enabled now, appendonly yes for AOF (Phase 6 tuning), maxmemory policy for BullMQ + rate-limit use.
+      | depends_on: [k8s/base/namespaces.yaml]
+
+  - Orchestration
+    - bootstrap-data.sh | /scripts/bootstrap-data.sh
+      | Applies data-secrets, then MongoDB configmaps+statefulset+service, then Redis; waits for each StatefulSet ready before the next.
+      | depends_on: [data-secrets.sh, mongo-statefulset.yaml, mongo-service.yaml, mongo-init-configmap.yaml, mongo-config.yaml, redis-statefulset.yaml, redis-service.yaml, redis-config.yaml]
+
+  - Verification
+    - verify-phase1.sh | /scripts/verify-phase1.sh
+      | From a throwaway pod: mongosh auth as app user + insert/read/drop; redis-cli AUTH + SET/GET/DEL; asserts PVCs Bound and data survives a pod delete.
+      | depends_on: [bootstrap-data.sh]
+
+- Files (Phase 2 - Edge)
+  Format: file_name | file_path | description | depends_on[]
+  Kong runs in `platform` ns (declarative/DB-less). ping-service and frontend run in `app` ns.
+  Images are built and pushed to the Phase 0 registry, then deployed.
+
+  - Kong gateway
+    - kong-config.yaml | /k8s/platform/kong/kong-configmap.yaml
+      | Declarative kong.yaml: services + routes (/ -> frontend, /api/* -> backend), plus stub for rate-limiting/JWT plugins wired in later phases.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - kong-deployment.yaml | /k8s/platform/kong/deployment.yaml
+      | Kong Deployment in DB-less mode; mounts kong-configmap as declarative config, env for proxy/admin listeners, health probes on /status.
+      | depends_on: [kong-config.yaml, scripts/create-secrets.sh]
+    - kong-service.yaml | /k8s/platform/kong/service.yaml
+      | Proxy Service (LoadBalancer/NodePort 80,443) as the single public entry point; Admin API kept ClusterIP-only.
+      | depends_on: [kong-deployment.yaml]
+    - kong-admin-service.yaml | /k8s/platform/kong/admin-service.yaml
+      | Internal ClusterIP for the Admin API (8001) - used by maintenance CLI and ops, never exposed publicly.
+      | depends_on: [kong-deployment.yaml]
+    - kongctl.sh | /scripts/kongctl.sh
+      | Thin wrapper over the Admin API (reload declarative config, list routes, add/remove a route) for local ops and later `maintenance` CLI reuse.
+      | depends_on: [kong-admin-service.yaml]
+
+  - ping-service (smoke-test backend)
+    - ping-src | /services/ping/src/index.js
+      | Minimal HTTP service exposing GET /api/ping -> 200 {status:"ok"} and GET /healthz; no DB, proves registry -> k3s -> Kong -> service.
+      | depends_on: []
+    - ping-package | /services/ping/package.json
+      | Node deps + start script for the ping service.
+      | depends_on: [ping-src]
+    - ping-dockerfile | /services/ping/Dockerfile
+      | Multi-stage build producing a small runtime image for the ping service.
+      | depends_on: [ping-src, ping-package]
+    - ping-deployment.yaml | /k8s/app/ping/deployment.yaml
+      | Deployment pulling ping image from the private registry (imagePullSecret), readiness/liveness on /healthz.
+      | depends_on: [ping-dockerfile, scripts/data-secrets.sh, k8s/base/namespaces.yaml]
+    - ping-service.yaml | /k8s/app/ping/service.yaml
+      | ClusterIP service (ping.app.svc) that Kong's /api/ping route targets.
+      | depends_on: [ping-deployment.yaml]
+
+  - frontend
+    - frontend-src | /services/frontend/src/
+      | React app source; a bare page that calls /api/ping and shows the result, confirming end-to-end routing through Kong.
+      | depends_on: []
+    - frontend-package | /services/frontend/package.json
+      | React build tooling + scripts.
+      | depends_on: [frontend-src]
+    - frontend-nginx-conf | /services/frontend/nginx.conf
+      | NGINX config: serve SPA build, try_files fallback to index.html, no API proxying (Kong owns that).
+      | depends_on: []
+    - frontend-dockerfile | /services/frontend/Dockerfile
+      | Multi-stage: Node build stage -> copy static assets into NGINX serve stage.
+      | depends_on: [frontend-src, frontend-package, frontend-nginx-conf]
+    - frontend-deployment.yaml | /k8s/app/frontend/deployment.yaml
+      | Deployment pulling frontend image from the private registry, probes on /.
+      | depends_on: [frontend-dockerfile, scripts/data-secrets.sh, k8s/base/namespaces.yaml]
+    - frontend-service.yaml | /k8s/app/frontend/service.yaml
+      | ClusterIP service (frontend.app.svc) that Kong's / route targets.
+      | depends_on: [frontend-deployment.yaml]
+
+  - Orchestration
+    - build-push.sh | /scripts/build-push.sh
+      | Builds ping + frontend images, tags with git SHA, pushes to the Phase 0 registry; shared by later CI.
+      | depends_on: [ping-dockerfile, frontend-dockerfile, config/registries.yaml]
+    - bootstrap-edge.sh | /scripts/bootstrap-edge.sh
+      | Applies Kong (configmap -> deployment -> services), then ping, then frontend; reloads Kong declarative config; waits for each rollout.
+      | depends_on: [kong-config.yaml, kong-deployment.yaml, kong-service.yaml, kong-admin-service.yaml, ping-deployment.yaml, ping-service.yaml, frontend-deployment.yaml, frontend-service.yaml, build-push.sh]
+
+  - Verification
+    - verify-phase2.sh | /scripts/verify-phase2.sh
+      | curl through the public Kong address: GET /api/ping returns ok, GET / returns the SPA HTML, Admin API is NOT reachable publicly; checks both rollouts Available.
+      | depends_on: [bootstrap-edge.sh]
+
+- Files (Phase 3 - Identity)
+  Format: file_name | file_path | description | depends_on[]
+  auth-service runs in `app` ns, stores users in MongoDB (Phase 1), sessions/refresh-tokens in Redis (Phase 1).
+  Kong (Phase 2) gains the JWT plugin so every /api/* request is verified at the gateway.
+
+  - Secrets / keys
+    - jwt-keys.sh | /scripts/jwt-keys.sh
+      | Generates the RS256 keypair; creates jwt-private-key secret (auth ns-scoped) and jwt-public-key secret/ConfigMap consumed by Kong; idempotent.
+      | depends_on: [k8s/base/namespaces.yaml, scripts/create-secrets.sh]
+
+  - auth-service
+    - auth-src | /services/auth/src/
+      | Express + Passport.js: POST /api/auth/register, /login (issues RS256 access + refresh JWT), /refresh, /logout, GET /api/auth/me; bcrypt/argon2 hashing.
+      | depends_on: []
+    - auth-passport | /services/auth/src/passport.js
+      | Passport strategy config: local strategy for login, JWT strategy for protected auth routes; loads private key from mounted secret.
+      | depends_on: [auth-src]
+    - auth-models | /services/auth/src/models/user.js
+      | Mongoose User schema (email unique, password hash, roles[]), connects with the least-privilege app user from Phase 1.
+      | depends_on: [auth-src]
+    - auth-token-store | /services/auth/src/tokenStore.js
+      | Redis-backed refresh-token allowlist / revocation (logout, rotation), AUTH via redis-password secret.
+      | depends_on: [auth-src]
+    - auth-package | /services/auth/package.json
+      | Node deps (passport, passport-local, passport-jwt, jsonwebtoken, mongoose, ioredis, argon2) + start script.
+      | depends_on: [auth-src]
+    - auth-dockerfile | /services/auth/Dockerfile
+      | Multi-stage build producing a small runtime image for the auth service.
+      | depends_on: [auth-src, auth-package]
+    - auth-deployment.yaml | /k8s/app/auth/deployment.yaml
+      | Deployment: pulls auth image (imagePullSecret), mounts jwt-private-key, env from mongodb-credentials + redis-password, probes on /healthz.
+      | depends_on: [auth-dockerfile, jwt-keys.sh, scripts/data-secrets.sh, k8s/base/namespaces.yaml]
+    - auth-service.yaml | /k8s/app/auth/service.yaml
+      | ClusterIP service (auth.app.svc) that Kong's /api/auth route targets.
+      | depends_on: [auth-deployment.yaml]
+
+  - Kong integration
+    - kong-jwt-plugin.yaml | /k8s/platform/kong/plugins/jwt.yaml
+      | Declarative JWT plugin: verifies RS256 on all /api/* routes EXCEPT /api/auth/login,register,refresh and /healthz; strips/forwards verified claims as headers (X-User-Id, X-User-Roles).
+      | depends_on: [k8s/platform/kong/kong-configmap.yaml, jwt-keys.sh]
+    - kong-consumer.yaml | /k8s/platform/kong/consumers.yaml
+      | Kong consumer + jwt credential registering the auth issuer and public key so the plugin can validate signatures.
+      | depends_on: [kong-jwt-plugin.yaml, jwt-keys.sh]
+    - auth-middleware | /services/common/authContext.js
+      | Shared helper for backend services: reads Kong-injected X-User-* headers, exposes req.user, provides requireRole() and assertOwnership() for object-level (IDOR) checks.
+      | depends_on: []
+
+  - Orchestration
+    - bootstrap-auth.sh | /scripts/bootstrap-auth.sh
+      | Runs jwt-keys, builds+pushes auth image, applies auth deployment+service, applies Kong JWT plugin + consumer, reloads Kong declarative config; waits for rollout.
+      | depends_on: [jwt-keys.sh, auth-dockerfile, auth-deployment.yaml, auth-service.yaml, kong-jwt-plugin.yaml, kong-consumer.yaml, scripts/build-push.sh, scripts/kongctl.sh]
+
+  - Verification
+    - verify-phase3.sh | /scripts/verify-phase3.sh
+      | Through public Kong: register+login returns a valid JWT; /api/auth/me with the token = 200, without/with tampered token = 401; a protected ping route rejects missing token; refresh rotates and old refresh token is revoked; cross-user object access is denied (IDOR).
+      | depends_on: [bootstrap-auth.sh]
+
+- Files (Phase 4 - Async work)
+  Format: file_name | file_path | description | depends_on[]
+  A job-producing API service + a separate worker Deployment, both in `app` ns.
+  Queue = Redis + BullMQ (Phase 1). Requests are auth-verified by Kong (Phase 3); worker uses authContext only for logging user provenance.
+
+  - Shared queue library
+    - queue-lib | /services/common/queue.js
+      | Shared BullMQ setup: creates Queue/Worker/QueueEvents against Redis (redis-password secret), central job-name enum, default job opts (attempts, exponential backoff, removeOnComplete/Fail).
+      | depends_on: [/services/common/authContext.js]
+
+  - jobs-api (producer)
+    - jobs-api-src | /services/jobs-api/src/
+      | Express service: POST /api/jobs enqueues a job (priority from body, owner = X-User-Id), GET /api/jobs/:id returns status/progress/result, GET /api/jobs lists the caller's jobs.
+      | depends_on: [queue-lib]
+    - jobs-api-model | /services/jobs-api/src/models/job.js
+      | Mongoose Job schema (jobId, ownerId, type, status, result ref, timestamps) - durable record beyond Redis retention.
+      | depends_on: [jobs-api-src]
+    - jobs-api-package | /services/jobs-api/package.json
+      | Node deps (express, bullmq, ioredis, mongoose) + start script.
+      | depends_on: [jobs-api-src]
+    - jobs-api-dockerfile | /services/jobs-api/Dockerfile
+      | Multi-stage build producing a small runtime image for the jobs-api service.
+      | depends_on: [jobs-api-src, jobs-api-package]
+    - jobs-api-deployment.yaml | /k8s/app/jobs-api/deployment.yaml
+      | Deployment: pulls image (imagePullSecret), env from redis-password + mongodb-credentials, probes on /healthz.
+      | depends_on: [jobs-api-dockerfile, scripts/data-secrets.sh, k8s/base/namespaces.yaml]
+    - jobs-api-service.yaml | /k8s/app/jobs-api/service.yaml
+      | ClusterIP service (jobs-api.app.svc) that Kong's /api/jobs route targets.
+      | depends_on: [jobs-api-deployment.yaml]
+
+  - worker (consumer)
+    - worker-src | /services/worker/src/
+      | BullMQ Worker process: pulls jobs, dispatches by job-name to handlers, reports progress, writes result to Mongo, structured logs; no HTTP surface except /healthz for the probe.
+      | depends_on: [queue-lib, jobs-api-model]
+    - worker-handlers | /services/worker/src/handlers/
+      | One module per job type (the actual heavy processing); pure functions taking job data, returning result.
+      | depends_on: [worker-src]
+    - worker-package | /services/worker/package.json
+      | Node deps (bullmq, ioredis, mongoose) + start script.
+      | depends_on: [worker-src]
+    - worker-dockerfile | /services/worker/Dockerfile
+      | Multi-stage build producing the worker runtime image.
+      | depends_on: [worker-src, worker-package]
+    - worker-deployment.yaml | /k8s/app/worker/deployment.yaml
+      | Deployment (replicas >=1, no Service): env from redis-password + mongodb-credentials, resource requests/limits sized for heavy tasks, graceful shutdown (SIGTERM drains in-flight job).
+      | depends_on: [worker-dockerfile, scripts/data-secrets.sh, k8s/base/namespaces.yaml]
+    - worker-hpa.yaml | /k8s/app/worker/hpa.yaml
+      | HorizontalPodAutoscaler scaling workers on CPU (and later a custom queue-depth metric from Phase 5 observability); min/max replica bounds.
+      | depends_on: [worker-deployment.yaml]
+
+  - Kong integration
+    - kong-jobs-route.yaml | /k8s/platform/kong/routes/jobs.yaml
+      | Declarative route /api/jobs -> jobs-api, JWT plugin enforced (inherits Phase 3), optional rate-limit plugin on enqueue.
+      | depends_on: [/k8s/platform/kong/plugins/jwt.yaml, jobs-api-service.yaml]
+
+  - Orchestration
+    - bootstrap-jobs.sh | /scripts/bootstrap-jobs.sh
+      | Builds+pushes jobs-api and worker images, applies jobs-api deployment+service, worker deployment+hpa, Kong jobs route; reloads Kong config; waits for both rollouts.
+      | depends_on: [jobs-api-dockerfile, worker-dockerfile, jobs-api-deployment.yaml, jobs-api-service.yaml, worker-deployment.yaml, worker-hpa.yaml, kong-jobs-route.yaml, scripts/build-push.sh, scripts/kongctl.sh]
+
+  - Verification
+    - verify-phase4.sh | /scripts/verify-phase4.sh
+      | Through public Kong with a valid JWT: POST /api/jobs returns an id; poll GET /api/jobs/:id to completed with a result; a failing job type retries then lands failed; killing a worker pod mid-job reschedules it; another user cannot read the job (IDOR).
+      | depends_on: [bootstrap-jobs.sh]
+
+- Files (Phase 5 - Operate)
+  Format: file_name | file_path | description | depends_on[]
+  Three independent tracks that can be built in any order: CI/CD (ci ns), Observability (observability ns), TLS (platform ns / cluster-wide).
+  All consume, but are not consumed by, Phases 0-4.
+
+  == Track A: CI/CD (Gitea + Drone) ==
+    - gitea-config.yaml | /k8s/ci/gitea/configmap.yaml
+      | Gitea app.ini ConfigMap: disable open registration, enable built-in package/container registry, webhook allowlist for the in-cluster Drone URL.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - gitea-secrets.sh | /scripts/gitea-secrets.sh
+      | Creates gitea-db-credentials (or SQLite note), gitea-admin, and the shared drone-rpc-secret; idempotent.
+      | depends_on: [k8s/base/namespaces.yaml, scripts/create-secrets.sh]
+    - gitea-statefulset.yaml | /k8s/ci/gitea/statefulset.yaml
+      | Gitea StatefulSet + PVC for repos/registry blobs; env from gitea-config and secrets; probes on /api/healthz.
+      | depends_on: [gitea-config.yaml, gitea-secrets.sh, k8s/base/storageclass.yaml]
+    - gitea-service.yaml | /k8s/ci/gitea/service.yaml
+      | ClusterIP for Gitea HTTP + SSH; Kong route git.<domain> -> gitea added to declarative config.
+      | depends_on: [gitea-statefulset.yaml]
+    - drone-server.yaml | /k8s/ci/drone/server-deployment.yaml
+      | Drone server Deployment + Service: OAuth app against Gitea, DRONE_RPC_SECRET from secret, webhook target for repo pushes.
+      | depends_on: [gitea-service.yaml, gitea-secrets.sh]
+    - drone-runner.yaml | /k8s/ci/drone/runner-deployment.yaml
+      | Drone kube runner Deployment: RBAC to create build pods, DRONE_RPC_SECRET, namespace it schedules build jobs into.
+      | depends_on: [drone-server.yaml]
+    - drone-rbac.yaml | /k8s/ci/drone/rbac.yaml
+      | ServiceAccount + Role/RoleBinding letting the runner create pods/secrets for pipeline steps and run `kubectl` deploys.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - deploy-key.sh | /scripts/deploy-key.sh
+      | Creates a limited kubeconfig / ServiceAccount token the pipeline uses for `kubectl set image` + rollout status against app ns; stored as a Drone secret.
+      | depends_on: [k8s/base/namespaces.yaml, drone-rbac.yaml]
+    - pipeline.example.yml | /ci/.drone.example.yml
+      | Reference pipeline dropped into each service repo: test -> build image -> push to Gitea registry -> `kubectl set image` -> wait rollout -> rollback on failed health -> notify.
+      | depends_on: [scripts/build-push.sh, deploy-key.sh]
+    - migrate.sh | /scripts/migrate.sh
+      | up/down MongoDB migration runner invoked as a pipeline step; tracks applied migrations in a _migrations collection.
+      | depends_on: [scripts/data-secrets.sh]
+    - notify.sh | /ci/notify.sh
+      | Posts pipeline success/failure to the configured channel (webhook URL from secret); reused by later phases.
+      | depends_on: []
+    - bootstrap-ci.sh | /scripts/bootstrap-ci.sh
+      | Applies gitea (config -> secrets -> statefulset -> service), then drone (rbac -> server -> runner), registers the OAuth app, adds Kong git route; waits for rollouts.
+      | depends_on: [gitea-config.yaml, gitea-secrets.sh, gitea-statefulset.yaml, gitea-service.yaml, drone-rbac.yaml, drone-server.yaml, drone-runner.yaml, deploy-key.sh, scripts/kongctl.sh]
+
+  == Track B: Observability (PLG stack) ==
+    - prometheus-config.yaml | /k8s/observability/prometheus/configmap.yaml
+      | prometheus.yml: k3s service-discovery (pods/endpoints), scrape Kong /metrics, node-exporter, kube-state-metrics; retention + external_labels.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - prometheus-rbac.yaml | /k8s/observability/prometheus/rbac.yaml
+      | ServiceAccount + ClusterRole for endpoint/pod/node discovery.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - prometheus-deployment.yaml | /k8s/observability/prometheus/deployment.yaml
+      | Prometheus Deployment + PVC + Service; loads config and alert rules.
+      | depends_on: [prometheus-config.yaml, prometheus-rbac.yaml, k8s/base/storageclass.yaml]
+    - alert-rules.yaml | /k8s/observability/prometheus/alert-rules.yaml
+      | PrometheusRule set: node down, pod crashloop, high 5xx rate at Kong, PVC near full, BullMQ queue-depth high, cert expiry <15d.
+      | depends_on: [prometheus-config.yaml]
+    - alertmanager.yaml | /k8s/observability/alertmanager/deployment.yaml
+      | Alertmanager Deployment + Service + config secret; routes alerts to notify.sh webhook / email.
+      | depends_on: [k8s/base/namespaces.yaml, /ci/notify.sh]
+    - loki-config.yaml | /k8s/observability/loki/configmap.yaml
+      | Loki single-binary config: filesystem/boltdb-shipper store, retention, ingestion limits.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - loki-statefulset.yaml | /k8s/observability/loki/statefulset.yaml
+      | Loki StatefulSet + PVC + Service.
+      | depends_on: [loki-config.yaml, k8s/base/storageclass.yaml]
+    - promtail-daemonset.yaml | /k8s/observability/promtail/daemonset.yaml
+      | Promtail DaemonSet: tails /var/log/pods on every node, relabels with namespace/pod/container, ships to Loki.
+      | depends_on: [loki-statefulset.yaml]
+    - grafana-config.yaml | /k8s/observability/grafana/configmap.yaml
+      | Grafana provisioning: datasources (Prometheus + Loki), dashboard providers, anonymous off.
+      | depends_on: [prometheus-deployment.yaml, loki-statefulset.yaml]
+    - grafana-dashboards | /k8s/observability/grafana/dashboards/
+      | JSON dashboards: cluster health, Kong traffic/latency/5xx, MongoDB, Redis, BullMQ queues, per-service logs.
+      | depends_on: [grafana-config.yaml]
+    - grafana-deployment.yaml | /k8s/observability/grafana/deployment.yaml
+      | Grafana Deployment + PVC + Service; admin creds from secret; Kong route grafana.<domain> -> grafana.
+      | depends_on: [grafana-config.yaml, grafana-dashboards, scripts/create-secrets.sh]
+    - service-metrics-mixin | /services/common/metrics.js
+      | Shared prom-client middleware added to every backend service: /metrics endpoint, default + HTTP histograms; BullMQ queue-depth gauge for the worker.
+      | depends_on: [/services/common/queue.js]
+    - servicemonitor-annotations.md | /docs/metrics-scraping.md
+      | Convention doc: pod annotations (prometheus.io/scrape/port/path) services must set so Prometheus auto-discovers them.
+      | depends_on: [prometheus-config.yaml]
+    - bootstrap-observability.sh | /scripts/bootstrap-observability.sh
+      | Applies Prometheus (rbac/config/deploy/rules) -> Alertmanager -> Loki -> Promtail -> Grafana (config/dashboards/deploy); adds Kong grafana route; waits for rollouts.
+      | depends_on: [prometheus-deployment.yaml, alert-rules.yaml, alertmanager.yaml, loki-statefulset.yaml, promtail-daemonset.yaml, grafana-deployment.yaml, scripts/kongctl.sh]
+
+  == Track C: TLS (cert-manager + Let's Encrypt) ==
+    - cert-manager-install.sh | /scripts/cert-manager-install.sh
+      | Installs cert-manager (static manifest, pinned version) into cert-manager ns; waits for the 3 pods Ready + webhook healthy.
+      | depends_on: [scripts/install-k3s.sh]
+    - cluster-issuer-staging.yaml | /k8s/platform/cert-manager/clusterissuer-staging.yaml
+      | ACME staging ClusterIssuer (HTTP-01 via Kong) for dry-run issuance without hitting rate limits.
+      | depends_on: [cert-manager-install.sh]
+    - cluster-issuer-prod.yaml | /k8s/platform/cert-manager/clusterissuer-prod.yaml
+      | ACME production ClusterIssuer (HTTP-01 solver routed through Kong); email + private-key secret ref.
+      | depends_on: [cert-manager-install.sh, cluster-issuer-staging.yaml]
+    - certificate.yaml | /k8s/platform/cert-manager/certificate.yaml
+      | Certificate for <domain> + subdomains (git, grafana), secretName consumed by Kong's TLS listener.
+      | depends_on: [cluster-issuer-prod.yaml]
+    - kong-tls.yaml | /k8s/platform/kong/tls.yaml
+      | Kong declarative TLS: HTTPS listener using the cert-manager secret, HTTP->HTTPS redirect, ACME challenge path (/.well-known/acme-challenge) left un-redirected.
+      | depends_on: [certificate.yaml, /k8s/platform/kong/kong-configmap.yaml]
+    - bootstrap-tls.sh | /scripts/bootstrap-tls.sh
+      | Installs cert-manager, applies staging issuer + test cert, verifies, swaps to prod issuer + real cert, applies kong-tls, reloads Kong.
+      | depends_on: [cert-manager-install.sh, cluster-issuer-prod.yaml, certificate.yaml, kong-tls.yaml, scripts/kongctl.sh]
+
+  == Verification ==
+    - verify-phase5.sh | /scripts/verify-phase5.sh
+      | CI: push to a test repo triggers a Drone build that deploys and the change is live; a failing health check auto-rolls back.
+        Observability: Prometheus targets all UP, Loki returns recent logs for a known pod, Grafana datasources green, a synthetic alert fires to notify.
+        TLS: https://<domain> serves a valid Let's Encrypt cert, http:// 301-redirects, cert renewal (staging) succeeds.
+      | depends_on: [bootstrap-ci.sh, bootstrap-observability.sh, bootstrap-tls.sh]
+
+- Files (Phase 6 - Resilience & lifecycle)
+  Format: file_name | file_path | description | depends_on[]
+  Two tracks: Backup/DR (data + platform ns) and Maintenance (platform ns).
+  Backup/DR builds on Phase 1 data + optional Phase 5 MinIO; Maintenance builds on Kong Admin API (Phase 2) and reuses CI/notify (Phase 5).
+
+  == Track A: Backup / Disaster Recovery ==
+    - backup-secrets.sh | /scripts/backup-secrets.sh
+      | Creates backup-storage-credentials (MinIO/S3 access keys) and reuses mongodb-credentials/redis-password; idempotent.
+      | depends_on: [k8s/base/namespaces.yaml, scripts/create-secrets.sh]
+    - minio-statefulset.yaml | /k8s/data/minio/statefulset.yaml
+      | Optional self-hosted MinIO StatefulSet + PVC + Service for off-cluster-style object storage of backups.
+      | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, backup-secrets.sh]
+    - backup-pvc.yaml | /k8s/data/backup/pvc.yaml
+      | PersistentVolumeClaim holding local backup artifacts before/instead of upload to MinIO.
+      | depends_on: [k8s/base/storageclass.yaml]
+    - mongo-backup-cronjob.yaml | /k8s/data/backup/mongo-cronjob.yaml
+      | CronJob (weekly): mongodump with creds from secret -> gzip -> write to backup PVC -> optional `mc cp` to MinIO -> prune older than N; notify on failure.
+      | depends_on: [k8s/data/mongodb/service.yaml, backup-pvc.yaml, backup-secrets.sh, /ci/notify.sh]
+    - mongo-restore.sh | /scripts/mongo-restore.sh
+      | Interactive/parametrized restore: lists available dumps, mongorestore --drop from a chosen archive into MongoDB; guarded by a confirm flag.
+      | depends_on: [mongo-backup-cronjob.yaml]
+    - redis-persistence-patch.yaml | /k8s/data/redis/persistence-patch.yaml
+      | Patch to redis.conf ConfigMap: RDB save points (900 1 / 300 10 / 60 10000), appendonly yes, appendfsync everysec, auto-aof-rewrite thresholds.
+      | depends_on: [/k8s/data/redis/conf-configmap.yaml]
+    - redis-backup-cronjob.yaml | /k8s/data/backup/redis-cronjob.yaml
+      | CronJob: copy dump.rdb + appendonly.aof from the Redis PVC (via a sidecar/exec) to backup PVC / MinIO; prune old; notify on failure.
+      | depends_on: [k8s/data/redis/service.yaml, backup-pvc.yaml, redis-persistence-patch.yaml, /ci/notify.sh]
+    - mongo-replicaset-patch.yaml | /k8s/data/mongodb/replicaset-patch.yaml
+      | Optional HA: bump MongoDB StatefulSet to 3 replicas, enable replSet in mongod.conf, keyfile secret for internal auth, init script to rs.initiate().
+      | depends_on: [/k8s/data/mongodb/statefulset.yaml, /k8s/data/mongodb/mongod-conf-configmap.yaml]
+    - worker-node-join.sh | /scripts/worker-node-join.sh
+      | Joins additional k3s agent nodes (token + server URL from .env), labels them, waits Ready - enables pod rescheduling on node failure.
+      | depends_on: [scripts/install-k3s.sh]
+    - pdb.yaml | /k8s/base/pdb.yaml
+      | PodDisruptionBudgets for Kong, auth, MongoDB, Redis so drains/node failures keep minAvailable.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - bootstrap-dr.sh | /scripts/bootstrap-dr.sh
+      | Applies backup-secrets, (optional MinIO), backup PVC, redis persistence patch, both CronJobs, PDBs; optionally applies replicaset patch + joins worker nodes.
+      | depends_on: [backup-secrets.sh, minio-statefulset.yaml, backup-pvc.yaml, redis-persistence-patch.yaml, mongo-backup-cronjob.yaml, redis-backup-cronjob.yaml, pdb.yaml]
+
+  == Track B: Maintenance mode ==
+    - maint-page | /services/maintenance/html/index.html
+      | Static maintenance page: message, Retry-After note, and a login-gated control that POSTs /internal/maintenance/off.
+      | depends_on: []
+    - maint-nginx-conf | /services/maintenance/nginx.conf
+      | NGINX config: serve index.html for all paths with HTTP 503 + Retry-After header; /healthz returns 200 so the pod stays Ready.
+      | depends_on: [maint-page]
+    - maint-dockerfile | /services/maintenance/Dockerfile
+      | Tiny NGINX image bundling the static page and config.
+      | depends_on: [maint-page, maint-nginx-conf]
+    - maint-deployment.yaml | /k8s/platform/maintenance/deployment.yaml
+      | Always-running Deployment (1 replica, minimal requests) serving the maintenance page; never scaled to zero.
+      | depends_on: [maint-dockerfile, k8s/base/namespaces.yaml, scripts/data-secrets.sh]
+    - maint-service.yaml | /k8s/platform/maintenance/service.yaml
+      | ClusterIP (maintenance.platform.svc) that Kong routes to when maintenance is ON.
+      | depends_on: [maint-deployment.yaml]
+    - maint-state-configmap.yaml | /k8s/platform/maintenance/state-configmap.yaml
+      | ConfigMap holding maintenance state (on/off) so it survives Kong/pod restarts; read on Kong boot to re-apply routing.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - kong-maint-routes.yaml | /k8s/platform/kong/routes/maintenance.yaml
+      | Declarative fragment: the swap between normal upstreams and the maintenance upstream, plus the permanent bypass list (maintenance-off endpoint, /healthz, /metrics, ACME challenge).
+      | depends_on: [/k8s/platform/kong/kong-configmap.yaml, maint-service.yaml]
+    - maintenance-cli | /scripts/maintenance
+      | `maintenance on|off [--pause-queues]`: reads/writes the state ConfigMap, calls Kong Admin API (via kongctl.sh) to swap routing, optionally pauses/resumes BullMQ queues.
+      | depends_on: [scripts/kongctl.sh, maint-state-configmap.yaml, kong-maint-routes.yaml]
+    - maint-off-endpoint | /services/auth/src/routes/maintenance.js
+      | Auth-gated POST /internal/maintenance/off in the auth service: verifies an admin JWT/role, then performs the same off-swap the CLI does; callable from the maintenance page control.
+      | depends_on: [/services/auth/src/passport.js, maintenance-cli]
+    - queue-pause.js | /services/common/queuePause.js
+      | Helper to pause/resume all BullMQ queues, used by the CLI and the off-endpoint when --pause-queues is set.
+      | depends_on: [/services/common/queue.js]
+    - bootstrap-maintenance.sh | /scripts/bootstrap-maintenance.sh
+      | Builds+pushes the maintenance image, applies deployment/service/state ConfigMap, adds the Kong maintenance route fragment + bypass list, installs the CLI, deploys the updated auth service with the off-endpoint.
+      | depends_on: [maint-dockerfile, maint-deployment.yaml, maint-service.yaml, maint-state-configmap.yaml, kong-maint-routes.yaml, maintenance-cli, maint-off-endpoint, scripts/build-push.sh, scripts/kongctl.sh]
+
+  == Verification ==
+    - verify-phase6.sh | /scripts/verify-phase6.sh
+      | DR: trigger the Mongo CronJob manually -> artifact in PVC/MinIO; run mongo-restore into a scratch DB and diff; kill a node (or cordon+drain) and confirm pods reschedule and data intact; Redis survives restart with AOF.
+        Maintenance: `maintenance on` -> public paths return 503 + Retry-After while bypass list still 200; the login-gated page control and POST /internal/maintenance/off both restore service; state ConfigMap persists across a Kong pod restart.
+      | depends_on: [bootstrap-dr.sh, bootstrap-maintenance.sh]
