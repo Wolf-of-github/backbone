@@ -287,6 +287,93 @@
         scripts pass `bash -n` (shellcheck where available); k8s/base passes `kubectl apply --dry-run=server`.
       - README covers both modes and lets a new person reproduce either unaided.
 
+- Commands (every command to set up Phase 0, in order)
+  Run from the repo root. `$` = your shell; `#` = comment. Nothing here needs to be
+  memorised - `make phase0` chains it all - but this is the full expansion.
+
+  == 0. One-time tooling (per machine) ==
+    # kubectl (all modes)
+    $ brew install kubectl                 # macOS
+    $ sudo snap install kubectl --classic  # Debian/Ubuntu   (or: az/gcloud/apt per distro)
+
+    # MULTI_NODE=false only - Docker + k3d
+    $ brew install --cask docker && open -a Docker      # macOS: install + start Docker Desktop
+    #   Linux: install Docker Engine per https://docs.docker.com/engine/install/ then:  sudo systemctl enable --now docker
+    $ brew install k3d                                   # macOS
+    $ curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash   # Linux/macOS
+    #   Windows:  choco install k3d   (or  scoop install k3d)
+
+    # MULTI_NODE=true only - on the SERVER host and on every WORKER host
+    $ sudo apt-get update && sudo apt-get install -y curl        # curl + sudo are the only worker prereqs
+
+  == 1. Get the repo + config ==
+    $ git clone <this-repo> backbone && cd backbone
+    $ cp .env.example .env
+    $ $EDITOR .env
+    #   MULTI_NODE=false : defaults work locally. Change HTTP_PORT/HTTPS_PORT/REGISTRY_PORT only on a collision.
+    #   MULTI_NODE=true  : set MULTI_NODE=true, K3S_SERVER_ADDR=<ip/DNS all workers can reach>,
+    #                      NODE_EXTERNAL_IP=<public ip>  (only if workers are on another network),
+    #                      WIREGUARD=true  (keep for cross-network).
+
+  == 2A. Bring up - single machine (MULTI_NODE=false) ==
+    $ make phase0
+    #   = make cluster  -> ./scripts/cluster-up.sh   (k3d cluster + built-in registry, writes ./kubeconfig)
+    #     make base     -> kubectl apply -f k8s/base/namespaces.yaml
+    #                      kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+    #     make secrets  -> ./scripts/create-secrets.sh   (no-op in Phase 0)
+    #     make verify   -> ./scripts/verify-phase0.sh    -> prints "PHASE 0 OK"
+
+    # ad-hoc kubectl afterwards:
+    $ export KUBECONFIG=$PWD/kubeconfig
+    $ kubectl get nodes,ns,sc
+
+    # push an image later:
+    $ docker build -t localhost:5001/myapp:dev . && docker push localhost:5001/myapp:dev
+    #   reference it in k8s as:  backbone-registry:5000/myapp:dev
+
+    # tear down:
+    $ make down
+
+  == 2B. Bring up - many machines (MULTI_NODE=true) ==
+    # --- on the CONTROL-PLANE host (Linux) ---
+    $ make phase0
+    #   installs the k3s server, writes ./kubeconfig, caches the join token to
+    #   .secrets/cluster-join.env, prints the exact join command, ends "PHASE 0 OK".
+
+    # open BETWEEN nodes (e.g. one AWS security group referencing itself):
+    #   6443/tcp   API (workers -> server)
+    #   10250/tcp  kubelet (all <-> all)
+    #   51820/udp  flannel WireGuard (all <-> all)   [WIREGUARD=true]
+    #   8472/udp   flannel VXLAN (all <-> all)       [WIREGUARD=false]
+
+    # --- add a WORKER, option 1: from the server over SSH ---
+    $ make node-join TARGET=ubuntu@<worker-ip>
+    #   = ./scripts/node-join.sh ubuntu@<worker-ip>   (ships the script + cached creds, runs it there)
+
+    # --- add a WORKER, option 2: on the worker box itself ---
+    #   copy the repo (or just scripts/) to the worker, then:
+    $ K3S_URL=https://<server>:6443 K3S_TOKEN=<token from .secrets/cluster-join.env> ./scripts/node-join.sh
+
+    # --- verify the cluster (from the server) ---
+    $ export KUBECONFIG=$PWD/kubeconfig
+    $ kubectl get nodes -o wide -L backbone.dev/role      # every machine Ready
+    $ make verify                                          # re-run the gate multi-node -> "PHASE 0 OK"
+
+    # tear down:
+    $ make down                                            # uninstalls the k3s SERVER on this host
+    #   on EACH worker:
+    $ sudo /usr/local/bin/k3s-agent-uninstall.sh
+
+  == 3. Checks / troubleshooting (any mode) ==
+    $ make lint                                            # shellcheck + kubectl --dry-run=server -f k8s/base/
+    $ for f in scripts/*.sh; do bash -n "$f"; done         # script syntax
+    $ kubectl get pods -A                                  # everything Running/Completed
+    $ kubectl -n data get pvc                              # PVCs Bound
+    #   k3d: registry not reachable?  docker ps | grep backbone-registry
+    #   k3d: port already in use?     edit HTTP_PORT / HTTPS_PORT / REGISTRY_PORT in .env, `make down && make phase0`
+    #   k3s: worker stuck NotReady?   check the 3 ports above; on the worker: sudo systemctl status k3s-agent; journalctl -u k3s-agent -f
+    #   k3s: regenerate join token?   on the server: sudo cat /var/lib/rancher/k3s/server/node-token
+
 - Build Order (dependency-ordered; each layer stands on a working one below it)
   - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
   - Phase 0 - Substrate
