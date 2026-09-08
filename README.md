@@ -2,7 +2,9 @@
 
 A from-scratch, self-hosted platform substrate on k3s. **Linux only.** Built for
 horizontal scale: stand up one control-plane machine, then join as many worker
-machines as you want — including across networks / behind NAT, via Tailscale.
+machines as you want. Nodes can be on one LAN or VPC (the common case — e.g.
+several EC2s in one security group), across networks with public IPs, or behind
+NAT with no public IP at all (via Tailscale). One config switch picks which.
 
 `architecture.txt` has the full design. This file is the operator's guide:
 every command, what it does, and what you should see.
@@ -41,11 +43,13 @@ address workers will use to reach this machine's API server:
 
 | Your situation | Set `K3S_SERVER_ADDR` to | Also set |
 |---|---|---|
-| single node, or all nodes on one LAN / VPC | this machine's private IP | — |
+| single node | `127.0.0.1` (or the private IP) | — |
+| **all nodes in one VPC / LAN** (e.g. several EC2s in one security group) | this machine's **private** IP | — |
 | nodes on different networks, this machine **has** a public IP | that public IP / DNS name | — |
 | nodes on different networks, this machine has **no** public IP (home box, NAT) | this machine's Tailscale IP (`tailscale ip -4`) | `TAILSCALE=true`, `WIREGUARD=false` |
 
-For the Tailscale case, `tailscale` must be installed and `sudo tailscale up`
+Defaults (`TAILSCALE=false`, `WIREGUARD=true`) are right for the first three
+rows. For the Tailscale row, `tailscale` must be installed and `sudo tailscale up`
 already run on this machine.
 
 ---
@@ -108,22 +112,23 @@ worker.
 
 **One-time: let the control plane SSH to the worker.**
 
-- Same network: normal SSH key auth to the worker.
-- Cloud instance with a `.pem` key: put the key on the control-plane host and add
-  to its `~/.ssh/config`:
+- EC2s in one VPC (or any cloud instance with a `.pem` key): copy the key onto
+  the control-plane host, then either set `SSH_KEY=/path/to/key.pem` in `.env`,
+  or add to the control-plane host's `~/.ssh/config`:
 
   ```
-  Host <worker-address>
-    User <login-user>
+  Host <worker-private-ip>
+    User ubuntu
     IdentityFile ~/.ssh/<key>.pem
   ```
 
-  (or set `SSH_KEY=/path/to/key.pem` in `.env`).
+- Same LAN, your own key already on the worker: nothing to do.
 
 **If the cluster is Tailscale-based**, also install Tailscale on the worker
 first — on the worker: `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`.
 
-**Then, from the control-plane host:**
+**Then, from the control-plane host** — address the worker by whatever the
+control plane can reach it on (private IP in a VPC, Tailscale IP otherwise):
 
 ```bash
 make node-join TARGET=<login-user>@<worker-address>
