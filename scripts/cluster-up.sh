@@ -13,11 +13,21 @@ require_vars K3S_VERSION CLUSTER_NAME K3S_SERVER_ADDR
 : "${WIREGUARD:=true}"
 : "${NODE_ROLE:=control-plane}"
 : "${NODE_EXTERNAL_IP:=}"
+: "${TAILSCALE:=false}"
 
 [ "$(uname -s)" = "Linux" ] || die "backbone runs on Linux. cluster-up.sh installs a k3s server here.
   Run it on the machine that will be the control plane (a Linux VM / bare metal / EC2)."
 need curl
 command -v sudo >/dev/null 2>&1 || die "sudo required"
+
+# TAILSCALE=true -> the server advertises its own tailnet IP (and, unless the
+# user overrode it, K3S_SERVER_ADDR should be that same IP).
+if [ "$TAILSCALE" = "true" ] && [ -z "$NODE_EXTERNAL_IP" ]; then
+  command -v tailscale >/dev/null 2>&1 || die "TAILSCALE=true but 'tailscale' not found - install it and 'sudo tailscale up' first"
+  NODE_EXTERNAL_IP="$(tailscale ip -4 | head -1)"
+  [ -n "$NODE_EXTERNAL_IP" ] || die "could not read this machine's tailscale IP"
+  log "tailscale: advertising this node as ${NODE_EXTERNAL_IP}"
+fi
 
 mkdir -p "$REPO_ROOT/.secrets"; chmod 700 "$REPO_ROOT/.secrets"
 
