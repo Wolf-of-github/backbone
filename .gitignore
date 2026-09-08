@@ -11,7 +11,7 @@
 # Rendered k3d config (may contain env-specific values)
 /config/.k3d-cluster.rendered.yaml
 
-# Any secret material added by later phases
+# Secret material: cluster join token (multi-node), later-phase certs, etc.
 /.secrets/
 *.pem
 *.key

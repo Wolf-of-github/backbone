@@ -111,24 +111,56 @@
       - Dependencies: lockfiles, npm audit / CVE scan in pipeline, patch critical/high
       - Enforcement: security-guidance plugin (edit-time pattern warnings, LLM diff
         review, agentic commit review) gates every change before merge
+  - horizontal-scale
+    - The point of backbone: add machines, get capacity - no per-service rewiring.
+    - Two cluster shapes, one switch (MULTI_NODE in .env):
+      - MULTI_NODE=false -> k3d (k3s-in-Docker) on ONE machine. Dev/demo. Cannot span hosts (k3d limitation).
+      - MULTI_NODE=true  -> a real k3s SERVER (control plane) on one Linux host; every other machine
+        (EC2, spare box, another cloud) joins as a k3s AGENT with `scripts/node-join.sh`.
+    - A joined machine installs ONLY the k3s agent (~100 MB, its own containerd). No Docker, no k3d,
+      no kubectl. One command: `curl ... | K3S_URL=https://<server>:6443 K3S_TOKEN=<tok> sh -`.
+    - Location transparency: a pod on the EC2 node and a pod on the main box talk via the same
+      `svc.namespace.svc.cluster.local` DNS. The flannel overlay carries pod-to-pod across machines.
+      You never wire IPs between services.
+    - Scaling a service = raise `replicas` / HPA `maxReplicas`; the scheduler spreads pods across all
+      nodes. Out of room -> join another machine. No reconfiguration.
+    - Node-to-node networking (the one real cost). Open BETWEEN nodes only:
+        6443/tcp   Kubernetes API      (agents -> server)
+        10250/tcp  kubelet             (all <-> all)
+        51820/udp  flannel WireGuard   (all <-> all)   [WIREGUARD=true, default]
+        8472/udp   flannel VXLAN       (all <-> all)   [WIREGUARD=false, trusted network only]
+      Cross-network (home/office <-> AWS VPC): WIREGUARD=true (encrypts the overlay) + NODE_EXTERNAL_IP
+      set to each node's routable IP. Same-VPC: plain VXLAN is fine.
+    - Failure: an agent dying -> its pods reschedule onto the others. The server is still a single
+      point of failure until Phase 6 (embedded-etcd HA: 3 servers).
+    - External services that will NEVER run in-cluster (managed RDS, a GPU box you won't put k3s on):
+      represent them as a selector-less Service + EndpointSlice, or ExternalName. Callers use a normal
+      Service DNS name; the target lives outside. This is the exception, not the scaling mechanism.
 
 - Plan
   - Phase 0 - Substrate: develop from 0 -> 100 (instantiate every file, then code it, then verify)
-    - Runtime decision: MACHINE-AGNOSTIC via k3d (k3s-in-Docker), same model as Minikube.
-      - Cluster = k3s nodes running as Docker containers, created by `k3d cluster create`.
-        Works identically on Linux / macOS / Windows+WSL2. No Linux VM, no `sudo`, no host k3s install.
-      - Prereqs on the developer machine: a running Docker daemon, `k3d`, `kubectl` (+ `docker` CLI for
-        the verify push test). Docker Desktop / Rancher Desktop / Colima / plain dockerd all fine.
-      - Registry = k3d's BUILT-IN registry (a `registry:2` container k3d creates and auto-trusts on every
-        node). No htpasswd, no TLS, no /etc/rancher/k3s/registries.yaml - k3d wires it up. It is
-        unauthenticated by design (local to the machine); Phase 5 introduces the real registry behind Kong+TLS.
-      - Two names, one registry: host `docker push` -> `localhost:<REGISTRY_PORT>`;
-        image refs inside k8s -> `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>` (default 5000). k3d injects the
-        hostname into every node so both resolve to the same container. Host and internal ports may differ
-        so a host-port collision never forces a manifest rewrite.
-      - This REPLACES the earlier "install k3s on a Linux host + build an authenticated registry" plan;
-        install-k3s.sh, k3s-config.yaml, registry-secret.sh, bootstrap-registry.sh, registries.yaml, and
-        k8s/platform/registry/* are all DROPPED. See "Files (Phase 0 - Substrate)" for the current list.
+    - Runtime decision: ONE switch (MULTI_NODE in .env) picks the cluster shape. See Diagram > horizontal-scale.
+      - MULTI_NODE=false (default) - k3d (k3s-in-Docker), machine-agnostic, same model as Minikube.
+        Cluster = k3s nodes as Docker containers via `k3d cluster create`. Linux / macOS / Windows+WSL2,
+        no Linux VM, no `sudo`, no host k3s install.
+        Prereqs: Docker daemon + `k3d` + `kubectl` (+ `docker` CLI for the verify push test).
+        Registry = k3d's BUILT-IN `registry:2` container, auto-trusted on every node, unauthenticated by
+        design (local). Two names: host push -> `localhost:<REGISTRY_PORT>`; image refs in k8s ->
+        `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>` (default 5000). Ports may differ so host-port
+        collisions never force a manifest rewrite.
+      - MULTI_NODE=true - a real k3s SERVER on this Linux host; other machines join as agents.
+        Prereqs on the server: Linux + `curl` + `sudo`. Prereqs on a joining worker: Linux + `curl` +
+        `sudo` ONLY (no Docker, no k3d, no kubectl).
+        `scripts/cluster-up.sh` installs k3s server with `--cluster-init` (embedded etcd, HA-ready),
+        `--disable=traefik`, `--flannel-backend=wireguard-native` when WIREGUARD=true, `--tls-san` and
+        `--node-external-ip` from .env. It caches the join token to `.secrets/cluster-join.env` (gitignored).
+        No in-cluster registry yet in this mode - workers pull from public registries until Phase 5 stands
+        up the real one behind Kong + TLS.
+      - Either way the downstream phases are identical - namespaces, Services, Deployments don't change.
+      - This REPLACES the earlier "always install k3s on a Linux host + hand-build an authenticated
+        registry" plan. DROPPED: k3s-config.yaml, kubeconfig.example, registry-secret.sh,
+        bootstrap-registry.sh, registries.yaml(.example), k8s/platform/registry/*. The k3s-server install
+        now lives inside cluster-up.sh behind the MULTI_NODE branch. See "Files (Phase 0 - Substrate)".
 
     - Guiding rules
       - Bottom-up by depends_on: never create a file before the files it depends on are in place.
@@ -143,7 +175,7 @@
       - Directory tree: /scripts /config /k8s/base /docs
       - Instantiate headered stubs:
         /.gitignore, /README.md, /.env.example, /Makefile,
-        /scripts/lib.sh, /scripts/cluster-up.sh, /scripts/cluster-down.sh,
+        /scripts/lib.sh, /scripts/cluster-up.sh, /scripts/cluster-down.sh, /scripts/node-join.sh,
         /scripts/create-secrets.sh, /scripts/verify-phase0.sh,
         /config/k3d-cluster.yaml, /k8s/base/namespaces.yaml, /k8s/base/storageclass.yaml,
         /docs/secrets.md
@@ -151,32 +183,49 @@
 
     - Step 1 - Ground rules files (no cluster needed)
       - .gitignore: /.env, /kubeconfig, *.kubeconfig, /config/.k3d-cluster.rendered.yaml,
-        /.secrets/, cert material, build output, .DS_Store.
-      - .env.example: DOMAIN, CLUSTER_NAME, K3S_VERSION (rancher/k3s tag), K3D_AGENTS,
-        HTTP_PORT/HTTPS_PORT (k3d loadbalancer -> host), REGISTRY_NAME, REGISTRY_PORT (host),
-        REGISTRY_INTERNAL_PORT (in-cluster, default 5000). Local defaults must "just work".
+        /.secrets/ (holds the multi-node join token), cert material, build output, .DS_Store.
+      - .env.example: MULTI_NODE (false), DOMAIN, CLUSTER_NAME, K3S_VERSION.
+        MULTI_NODE=false block: K3D_AGENTS, HTTP_PORT/HTTPS_PORT, REGISTRY_NAME, REGISTRY_PORT,
+          REGISTRY_INTERNAL_PORT (5000). Local defaults must "just work".
+        MULTI_NODE=true block: K3S_SERVER_ADDR, NODE_EXTERNAL_IP, WIREGUARD (true), NODE_ROLE,
+          K3S_TOKEN (blank - generated). Plus a firewall comment: 6443/tcp, 10250/tcp,
+          51820/udp (WireGuard) or 8472/udp (VXLAN).
       - docs/secrets.md: namespace map (platform/data/app), <component>-<purpose> naming,
-        "Phase 0 creates NO secrets (k3d registry is local + auto-trusted)", Sealed Secrets upgrade path.
-      - README.md: prereqs (Docker + k3d + kubectl), `cp .env.example .env`, `make phase0`, done criteria,
-        the two-registry-names table.
-      - Verify: `grep` that .env / kubeconfig are ignored; `bash -n` on all scripts.
+        "Phase 0 creates NO secrets (k3d registry local + auto-trusted; multi-node join token cached
+        under .secrets/, gitignored)", Sealed Secrets upgrade path.
+      - README.md: both modes; prereqs per mode; `cp .env.example .env`, `make phase0`;
+        `make node-join TARGET=user@host`; done criteria; the two-registry-names table.
+      - Verify: `grep` that .env / kubeconfig / .secrets are ignored; `bash -n` on all scripts.
 
-    - Step 2 - Cluster definition + bring-up (config/k3d-cluster.yaml -> scripts/cluster-up.sh)
+    - Step 2 - Cluster bring-up - dual mode (config/k3d-cluster.yaml + scripts/cluster-up.sh + node-join.sh)
       - lib.sh: REPO_ROOT, KUBECONFIG default = ./kubeconfig, load_env, require_vars, need, log/ok/die.
-      - k3d-cluster.yaml: k3d.io/v1alpha5 Simple config with <angle-bracket> placeholders -
-        name, image rancher/k3s:<K3S_VERSION>, servers 1 + agents <K3D_AGENTS>,
-        ports <HTTP_PORT>:80 / <HTTPS_PORT>:443 on the loadbalancer,
-        registries.create {name, host 0.0.0.0, hostPort <REGISTRY_PORT>},
-        options.k3s.extraArgs --disable=traefik (KEEP servicelb - k3d's loadbalancer needs klipper),
-        kubeconfig.updateDefaultKubeconfig false (script writes ./kubeconfig).
-      - cluster-up.sh: `set -euo pipefail`; source lib; load_env; require Docker daemon reachable;
-        require `k3d` (else die with install one-liners); render placeholders from .env ->
-        config/.k3d-cluster.rendered.yaml (gitignored); if the cluster exists -> `k3d cluster start` and
-        reuse, else `k3d cluster create --config <rendered>`; `k3d kubeconfig get <name>` -> ./kubeconfig (0600);
-        `kubectl wait --for=condition=Ready node --all --timeout=120s`; print both registry names.
-      - cluster-down.sh: `k3d cluster delete <name>`; rm ./kubeconfig + rendered config.
-      - Verify: node Ready; `kubectl get sc` shows local-path; `docker ps` shows k3d-<name>-server-0 +
-        <REGISTRY_NAME> containers.
+      - k3d-cluster.yaml: k3d.io/v1alpha5 Simple config, <placeholders> - name, image
+        rancher/k3s:<K3S_VERSION>, servers 1 + agents <K3D_AGENTS>, LB ports <HTTP_PORT>:80 /
+        <HTTPS_PORT>:443, registries.create {name, host 0.0.0.0, hostPort <REGISTRY_PORT>},
+        k3s extraArgs --disable=traefik (KEEP servicelb - k3d LB needs klipper),
+        kubeconfig.updateDefaultKubeconfig false.
+      - cluster-up.sh: `set -euo pipefail`; source lib; load_env; branch on MULTI_NODE:
+        - false -> cluster_up_k3d(): require Docker + k3d; render k3d-cluster.yaml ->
+          config/.k3d-cluster.rendered.yaml (gitignored); create-or-reuse the cluster;
+          `k3d kubeconfig get` -> ./kubeconfig (0600); wait nodes Ready; print both registry names.
+        - true  -> cluster_up_k3s_server(): require Linux + curl + sudo; translate K3S_VERSION
+          (-k3s -> +k3s); `curl https://get.k3s.io | INSTALL_K3S_EXEC="server --cluster-init
+          --tls-san=<addr> --disable=traefik [--flannel-backend=wireguard-native]
+          [--node-external-ip=<ip>] --node-label=backbone.dev/role=<role>" sh -`;
+          write ./kubeconfig with server URL rewritten to K3S_SERVER_ADDR; cache
+          .secrets/cluster-join.env (K3S_URL + node-token, umask 077); wait Ready;
+          print the exact `node-join.sh` command + the node-to-node port list.
+      - node-join.sh: join a machine as a k3s AGENT. Local mode (run on the worker): needs K3S_URL +
+        K3S_TOKEN in env or from .secrets/cluster-join.env; `curl get.k3s.io | K3S_URL/K3S_TOKEN
+        INSTALL_K3S_EXEC="agent --node-label=backbone.dev/role=worker [--node-external-ip=...]" sh -`;
+        prints the ports it needs open. Remote mode (`node-join.sh user@host` on the server): reads the
+        cached creds, `ssh`es the script to the target and runs it there.
+      - cluster-down.sh: branch on MULTI_NODE - k3d -> `k3d cluster delete`; k3s -> run
+        `/usr/local/bin/k3s-uninstall.sh` (and remind: each worker runs k3s-agent-uninstall.sh).
+        Both: rm ./kubeconfig (+ rendered config / cached join creds).
+      - Verify (k3d): node Ready; local-path present; `docker ps` shows k3d-<name>-server-0 + registry.
+        Verify (k3s): server node Ready; `kubectl get nodes -L backbone.dev/role`; after a join,
+        the new node shows Ready within ~30s.
 
     - Step 3 - Cluster base objects (k8s/base/*.yaml)
       - storageclass.yaml: desired end state for the default `local-path` SC (is-default-class annotation,
@@ -194,48 +243,58 @@
 
     - Step 5 - Makefile wiring
       - Targets (.PHONY; `KUBECONFIG ?= ./kubeconfig` exported at top):
-        `make cluster`  -> scripts/cluster-up.sh
-        `make base`     -> kubectl apply namespaces.yaml + kubectl patch local-path default annotation
-        `make secrets`  -> scripts/create-secrets.sh
-        `make verify`   -> scripts/verify-phase0.sh
-        `make phase0`   -> cluster base secrets verify
-        `make down`     -> scripts/cluster-down.sh
-        `make lint`     -> shellcheck scripts/*.sh + `kubectl apply --dry-run=server -f k8s/base/`
-      - Every target except `cluster`/`down` fails fast if ./kubeconfig is missing.
+        `make cluster`                    -> scripts/cluster-up.sh   (branches on MULTI_NODE)
+        `make base`                       -> kubectl apply namespaces.yaml + patch local-path default
+        `make secrets`                    -> scripts/create-secrets.sh
+        `make verify`                     -> scripts/verify-phase0.sh (branches on MULTI_NODE)
+        `make phase0`                     -> cluster base secrets verify
+        `make node-join TARGET=user@host` -> scripts/node-join.sh (MULTI_NODE=true; SSH join a worker)
+        `make down`                       -> scripts/cluster-down.sh (branches on MULTI_NODE)
+        `make lint`                       -> shellcheck scripts + `kubectl apply --dry-run=server -f k8s/base/`
+      - `help` prints the MULTI_NODE meaning first. Every target except `cluster`/`down`/`node-join`
+        fails fast if ./kubeconfig is missing.
 
     - Step 6 - Verification script (scripts/verify-phase0.sh) - the 100% gate
-      - `set -euo pipefail`; source lib; load_env; KUBECONFIG=./kubeconfig.
+      - `set -euo pipefail`; source lib; load_env; KUBECONFIG=./kubeconfig; MODE from MULTI_NODE.
       - [1] `kubectl wait` node(s) Ready.
       - [2] exactly one default StorageClass and it is `local-path`.
       - [3] namespaces platform/data/app exist AND each has its `default` ServiceAccount
             (poll up to ~30s - the token controller creates it a beat after the namespace).
-      - [4] apply a 1Gi PVC + a busybox pod in `data` (local-path is WaitForFirstConsumer, so a consumer
-            is required to force binding), `kubectl wait` pvc Bound, then clean up.
-      - [5] `docker build` a tiny image, `docker push localhost:<REGISTRY_PORT>/verify:<ts>`, then run a pod
-            with image `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify:<ts>` and `kubectl wait` it Succeeded -
-            proves push from host + pull in-cluster by the in-cluster name.
+      - [4] apply a 1Gi PVC + a busybox consumer pod in `data` (local-path is WaitForFirstConsumer),
+            `kubectl wait` pvc Bound, then clean up.
+      - [5] image pull:
+            k3d  -> `docker build` + `docker push localhost:<REGISTRY_PORT>/verify:<ts>`, then a pod on
+                    `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify:<ts>` reaches Succeeded (push+pull).
+            k3s  -> one pinned busybox pod per node (nodeName=<n>) all reach Succeeded - proves every
+                    node can pull. (Shared in-cluster registry lands in Phase 5.)
       - Exit non-zero with a clear message on the first failed assertion; print "PHASE 0 OK" on success.
 
     - Step 7 - Clean-machine dry run
-      - `make down` (if any), then from scratch: `cp .env.example .env`, `make phase0`.
-      - Fix anything that only worked due to leftover state; note host-port collisions in .env.example
-        (e.g. macOS holds :5000 - default REGISTRY_PORT is 5001).
-      - Tag `phase-0-complete` once `make phase0` is green from a fresh cluster twice in a row.
+      - MULTI_NODE=false: `make down` (if any), fresh `cp .env.example .env`, `make phase0`.
+        Note host-port collisions in .env.example (macOS holds :5000 - default REGISTRY_PORT is 5001).
+      - MULTI_NODE=true: on a Linux server VM set K3S_SERVER_ADDR (+ NODE_EXTERNAL_IP if cross-network),
+        `make phase0`; on a second VM run `make node-join` (or the printed one-liner); confirm
+        `kubectl get nodes` shows both Ready and `make verify` still passes with 2 nodes.
+      - Tag `phase-0-complete` once BOTH modes are green from scratch (k3d twice; k3s server + >=1 join).
 
     - Definition of done (Phase 0)
       - Every file in "Files (Phase 0 - Substrate)" exists with real content (no STUB markers).
-      - On any machine with Docker + k3d + kubectl: `make phase0` ends with "PHASE 0 OK" and `make` exits 0;
-        `make down` removes everything.
-      - No .env, ./kubeconfig, rendered k3d config, or secret material committed; scripts pass `bash -n`
-        (shellcheck where available); k8s/base manifests pass `kubectl apply --dry-run=server`.
-      - README lets a new person reproduce it unaided.
+      - MULTI_NODE=false on any machine with Docker + k3d + kubectl: `make phase0` -> "PHASE 0 OK",
+        `make` exits 0, `make down` removes everything.
+      - MULTI_NODE=true on a Linux server: `make phase0` -> "PHASE 0 OK"; a second Linux box joins with
+        one command and appears Ready; `make verify` passes multi-node.
+      - No .env, ./kubeconfig, rendered k3d config, or secret material (incl. the join token) committed;
+        scripts pass `bash -n` (shellcheck where available); k8s/base passes `kubectl apply --dry-run=server`.
+      - README covers both modes and lets a new person reproduce either unaided.
 
 - Build Order (dependency-ordered; each layer stands on a working one below it)
   - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
   - Phase 0 - Substrate
-    - k3s cluster (single node ok; kubectl working, default StorageClass, PVCs bind)
-    - Container registry (Gitea built-in or standalone registry:2) - needed before anything deploys
-    - Namespace split + secrets convention (kubectl create secret by hand for now)
+    - Cluster (kubectl working, default StorageClass, PVCs bind). MULTI_NODE=false -> k3d (one machine);
+      MULTI_NODE=true -> k3s server + `node-join.sh` for each extra machine (see Diagram > horizontal-scale).
+    - Container registry: k3d built-in (false) / public registries only (true). The real authenticated
+      in-cluster registry is deferred to Phase 5 (behind Kong + TLS) for both modes.
+    - Namespace split + secrets convention (no K8s secrets in Phase 0; join token cached under .secrets/).
   - Phase 1 - Data layer
     - MongoDB (StatefulSet + PVC, single instance, no replica set yet)
     - Redis (PVC, RDB enabled) - needed by BullMQ and Kong rate-limiting
@@ -262,42 +321,62 @@
 
 - Files (Phase 0 - Substrate)
   Format: file_name | file_path | description | depends_on[]
-  Runtime: k3d (k3s-in-Docker). Machine-agnostic; prereqs = Docker daemon + k3d + kubectl (+ docker CLI).
-  IMPLEMENTED and verified: `make phase0` -> "PHASE 0 OK" on macOS via Docker (green twice from a fresh cluster).
+  DUAL MODE via MULTI_NODE in .env:
+    false -> k3d (k3s-in-Docker), one machine.  Prereqs: Docker + k3d + kubectl (+ docker CLI for verify).
+    true  -> real k3s server + joinable workers. Prereqs (server): Linux + curl + sudo.
+             Prereqs (worker): Linux + curl + sudo ONLY - no Docker, no k3d, no kubectl.
+  IMPLEMENTED and verified: MULTI_NODE=false `make phase0` -> "PHASE 0 OK" on macOS via Docker
+  (green twice from a fresh cluster). MULTI_NODE=true path implemented; needs a Linux server + a
+  second box to exercise end-to-end (Step 7).
 
   - Repo root
     - .gitignore | /.gitignore
-      | Ignore .env, ./kubeconfig, rendered k3d config, cert material, build output.
+      | Ignore .env, ./kubeconfig, rendered k3d config, /.secrets/ (join token), cert material, build output.
       | depends_on: []
     - README.md | /README.md
-      | Prereqs (Docker + k3d + kubectl), `cp .env.example .env`, `make phase0`, done criteria, two-registry-names table.
+      | Both modes: per-mode prereqs, `cp .env.example .env`, `make phase0`, `make node-join TARGET=user@host`,
+        done criteria, two-registry-names table.
       | depends_on: []
     - .env.example | /.env.example
-      | Template: DOMAIN, CLUSTER_NAME, K3S_VERSION (rancher/k3s tag), K3D_AGENTS, HTTP_PORT/HTTPS_PORT,
-        REGISTRY_NAME, REGISTRY_PORT (host), REGISTRY_INTERNAL_PORT (in-cluster, 5000). Copied to .env, never committed.
+      | MULTI_NODE (false) + DOMAIN + CLUSTER_NAME + K3S_VERSION, then a k3d block (K3D_AGENTS,
+        HTTP_PORT/HTTPS_PORT, REGISTRY_NAME/PORT/INTERNAL_PORT) and a k3s block (K3S_SERVER_ADDR,
+        NODE_EXTERNAL_IP, WIREGUARD, NODE_ROLE, K3S_TOKEN blank) + a node-to-node firewall comment
+        (6443/tcp, 10250/tcp, 51820/udp or 8472/udp). Copied to .env, never committed.
       | depends_on: []
     - Makefile | /Makefile
-      | Task entrypoints: `make cluster|base|secrets|verify|phase0|down|lint`.
-      | depends_on: [scripts/cluster-up.sh, scripts/cluster-down.sh, k8s/base/namespaces.yaml, scripts/create-secrets.sh, scripts/verify-phase0.sh]
+      | `make cluster|base|secrets|verify|phase0|down|lint` (all branch on MULTI_NODE where relevant)
+        + `make node-join TARGET=user@host`.
+      | depends_on: [scripts/cluster-up.sh, scripts/cluster-down.sh, scripts/node-join.sh, k8s/base/namespaces.yaml, scripts/create-secrets.sh, scripts/verify-phase0.sh]
 
   - Shared
     - lib.sh | /scripts/lib.sh
       | Sourced by every script: REPO_ROOT, KUBECONFIG default (./kubeconfig), load_env, require_vars, need, log/ok/die.
       | depends_on: []
 
-  - Cluster bring-up (k3d)
+  - Cluster bring-up (dual mode)
     - k3d-cluster.yaml | /config/k3d-cluster.yaml
-      | k3d.io/v1alpha5 Simple config with <placeholders>: image rancher/k3s:<K3S_VERSION>, 1 server + <K3D_AGENTS> agents,
-        loadbalancer ports <HTTP_PORT>:80 / <HTTPS_PORT>:443, built-in registries.create block,
-        k3s extraArgs --disable=traefik (servicelb kept for k3d's loadbalancer).
+      | (MULTI_NODE=false) k3d.io/v1alpha5 Simple config, <placeholders>: image rancher/k3s:<K3S_VERSION>,
+        1 server + <K3D_AGENTS> agents, LB ports <HTTP_PORT>:80 / <HTTPS_PORT>:443, built-in registries.create,
+        k3s extraArgs --disable=traefik (servicelb kept for the k3d LB).
       | depends_on: []
     - cluster-up.sh | /scripts/cluster-up.sh
-      | Requires Docker + k3d; renders k3d-cluster.yaml from .env -> config/.k3d-cluster.rendered.yaml (gitignored);
-        creates (or starts+reuses) the k3d cluster; writes ./kubeconfig via `k3d kubeconfig get`; waits node Ready;
-        prints both registry names. Idempotent.
+      | Branches on MULTI_NODE.
+        false: require Docker + k3d; render k3d-cluster.yaml -> config/.k3d-cluster.rendered.yaml (gitignored);
+               create/reuse the cluster; ./kubeconfig via `k3d kubeconfig get`; wait Ready; print both registry names.
+        true:  require Linux + curl + sudo; install k3s server (`--cluster-init --tls-san --disable=traefik`,
+               `--flannel-backend=wireguard-native` when WIREGUARD, `--node-external-ip`, role node-label);
+               write ./kubeconfig (server URL = K3S_SERVER_ADDR); cache .secrets/cluster-join.env (umask 077);
+               wait Ready; print the node-join command + node-to-node ports.
       | depends_on: [.env.example, config/k3d-cluster.yaml, scripts/lib.sh]
+    - node-join.sh | /scripts/node-join.sh
+      | (MULTI_NODE=true) Join a machine as a k3s AGENT. Local mode (on the worker): K3S_URL + K3S_TOKEN
+        from env or .secrets/cluster-join.env, then `curl get.k3s.io | ... INSTALL_K3S_EXEC="agent ..." sh -`;
+        prints the ports it needs. Remote mode (`node-join.sh user@host` on the server): ssh the script to
+        the target with the cached creds and run it there.
+      | depends_on: [scripts/cluster-up.sh, scripts/lib.sh]
     - cluster-down.sh | /scripts/cluster-down.sh
-      | `k3d cluster delete <name>`; removes ./kubeconfig and the rendered k3d config. Local only.
+      | Branches on MULTI_NODE. false: `k3d cluster delete <name>`. true: `/usr/local/bin/k3s-uninstall.sh`
+        (+ remind: each worker runs k3s-agent-uninstall.sh). Both: rm ./kubeconfig (+ rendered config / join creds).
       | depends_on: [scripts/cluster-up.sh]
 
   - Cluster base objects
@@ -311,24 +390,30 @@
 
   - Secrets convention
     - create-secrets.sh | /scripts/create-secrets.sh
-      | Phase 0 creates NO secrets (k3d registry is local + auto-trusted). Stable entrypoint: asserts namespaces,
-        documents the idempotent `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` pattern for later phases.
+      | Phase 0 creates NO Kubernetes secrets (k3d registry local + auto-trusted; the multi-node join token
+        is cached to .secrets/, gitignored, by cluster-up.sh). Stable entrypoint: asserts namespaces, documents
+        the idempotent `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -` pattern.
       | depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/lib.sh]
     - secrets.md | /docs/secrets.md
-      | Namespace map, <component>-<purpose> naming, "no Phase 0 secrets", Sealed Secrets upgrade path.
+      | Namespace map, <component>-<purpose> naming, "no Phase 0 K8s secrets; join token under .secrets/",
+        Sealed Secrets upgrade path.
       | depends_on: []
 
   - Verification
     - verify-phase0.sh | /scripts/verify-phase0.sh
-      | The 100% gate. Asserts: node(s) Ready; exactly one default SC = local-path; namespaces platform/data/app exist
-        AND have their default ServiceAccount; a 1Gi PVC (+ consumer pod) binds; `docker push localhost:<REGISTRY_PORT>/verify`
-        then an in-cluster pod pulls `<REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify`. Prints "PHASE 0 OK".
+      | The 100% gate, MODE from MULTI_NODE. Asserts: node(s) Ready; one default SC = local-path;
+        namespaces platform/data/app exist AND have their default ServiceAccount; a 1Gi PVC (+ consumer pod) binds;
+        image pull - k3d: docker push localhost:<REGISTRY_PORT>/verify then in-cluster pull of
+        <REGISTRY_NAME>:<REGISTRY_INTERNAL_PORT>/verify; k3s: one busybox pod per node reaches Succeeded.
+        Prints "PHASE 0 OK".
       | depends_on: [scripts/cluster-up.sh, k8s/base/storageclass.yaml, k8s/base/namespaces.yaml, scripts/lib.sh]
 
-  - DROPPED from the earlier Linux-host plan (k3d makes them unnecessary):
+  - DROPPED from the earlier always-Linux-host plan (superseded by the dual-mode cluster-up.sh):
     scripts/install-k3s.sh, config/k3s-config.yaml, config/kubeconfig.example,
     scripts/registry-secret.sh, scripts/bootstrap-registry.sh, config/registries.yaml(.example),
     k8s/platform/registry/{deployment,pvc,service}.yaml
+    (The k3s-server install is now the MULTI_NODE=true branch of cluster-up.sh; the authenticated
+     in-cluster registry is deferred to Phase 5, behind Kong + TLS, for both modes.)
 
 - Files (Phase 1 - Data layer)
   Format: file_name | file_path | description | depends_on[]

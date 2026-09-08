@@ -8,10 +8,15 @@ Kubernetes Secrets, created by hand for now via `scripts/create-secrets.sh`
 (idempotent `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`).
 No secret material is ever committed to git.
 
-**Phase 0 creates none.** The cluster is k3d (k3s in Docker); its built-in
-registry is local, unauthenticated, and trusted by every node automatically, so
-there is nothing to store yet. `create-secrets.sh` exists as the stable
-entrypoint that later phases plug into.
+**Phase 0 creates no Kubernetes secrets.**
+- `MULTI_NODE=false`: the k3d built-in registry is local, unauthenticated, and
+  auto-trusted by every node — nothing to store.
+- `MULTI_NODE=true`: `cluster-up.sh` generates the k3s **join token** and caches
+  it at `.secrets/cluster-join.env` (mode 0600, gitignored). It is a node-join
+  credential, not a Kubernetes Secret; `node-join.sh` reads it. Treat it like a
+  password — anyone with it and network access to `:6443` can join a node.
+
+`create-secrets.sh` exists as the stable entrypoint that later phases plug into.
 
 ## Namespace map
 
