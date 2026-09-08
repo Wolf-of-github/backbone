@@ -67,6 +67,10 @@
       - Automatic pod rescheduling if node fails
       - Persistent volumes for data survival
       - Optional: MongoDB replica set for high availability
+      - Worker fleet: Terraform-provisioned cloud VMs that self-join as k3s
+        agents via cloud-init (`make workers COUNT=n` on the control plane).
+        Spot-friendly for burst load; `make workers-destroy` to release.
+        See Phase 6 Files > Track C.
   - deployment
     - k3s (lightweight Kubernetes)
       - Auto-scaling for big tasks
@@ -373,6 +377,7 @@
   - Phase 6 - Resilience & lifecycle
     - Backup/DR (mongodump CronJob, Redis AOF, then replica set + multi-node k3s)
     - Maintenance page (static 503 + maintenance CLI + ConfigMap state) - needs Kong Admin API + CI/CD
+    - Provisioned worker fleet (Terraform + cloud-init self-join) - `make workers COUNT=n`; independent of the other two tracks
   - Cross-cutting (from commit #1, never "done")
     - Security guidelines: enable security-guidance plugin + CI checks (secret scanning,
       no exec(), parameterized queries) as soon as a repo exists
@@ -835,8 +840,10 @@
 
 - Files (Phase 6 - Resilience & lifecycle)
   Format: file_name | file_path | description | depends_on[]
-  Two tracks: Backup/DR (data + platform ns) and Maintenance (platform ns).
-  Backup/DR builds on Phase 1 data + optional Phase 5 MinIO; Maintenance builds on Kong Admin API (Phase 2) and reuses CI/notify (Phase 5).
+  Three independent tracks: Backup/DR (data + platform ns), Maintenance (platform ns),
+  and Provisioned worker nodes (Terraform, control-plane host).
+  Backup/DR builds on Phase 1 data + optional Phase 5 MinIO; Maintenance builds on Kong Admin API (Phase 2)
+  and reuses CI/notify (Phase 5); Track C builds only on Phase 0's node-join mechanism.
 
   == Track A: Backup / Disaster Recovery ==
     - backup-secrets.sh | /scripts/backup-secrets.sh
@@ -908,8 +915,81 @@
       | Builds+pushes the maintenance image, applies deployment/service/state ConfigMap, adds the Kong maintenance route fragment + bypass list, installs the CLI, deploys the updated auth service with the off-endpoint.
       | depends_on: [maint-dockerfile, maint-deployment.yaml, maint-service.yaml, maint-state-configmap.yaml, kong-maint-routes.yaml, maintenance-cli, maint-off-endpoint, scripts/build-push.sh, scripts/kongctl.sh]
 
+  == Track C: Provisioned worker nodes (Terraform) ==
+    Goal: `make workers COUNT=n` on the CONTROL PLANE creates n cloud VMs that
+    join themselves as k3s agents on first boot, no SSH. `make workers-destroy`
+    removes them. Reuses the exact agent-install snippet node-join.sh already
+    emits; adds only cloud provisioning + (for a NAT'd control plane) a Tailscale
+    auth-key bootstrap.
+
+    - terraform-main | /terraform/main.tf
+      | Provider config (aws, region from var); a `worker` module block with
+        `count = var.worker_count`. Reads K3S_URL + K3S_TOKEN from
+        `.secrets/cluster-join.env` via an external data source or a
+        `-var-file` written by the Makefile. Outputs the instances' ids + IPs.
+      | depends_on: [scripts/cluster-up.sh]
+    - terraform-vars | /terraform/variables.tf
+      | worker_count, instance_type (default t3.small), ami (Ubuntu 24.04 SSM
+        param default), subnet_id, key_name (optional - for break-glass SSH),
+        k3s_url, k3s_token, tailscale (bool), tailscale_authkey (sensitive),
+        node_labels (default backbone.dev/role=worker), spot (bool).
+      | depends_on: []
+    - terraform-worker-module | /terraform/modules/worker/main.tf
+      | Per-instance: aws_instance (spot when var.spot), an aws_security_group
+        allowing 6443/tcp,10250/tcp,51820/udp,8472/udp FROM the control plane /
+        the cluster SG + egress all, and `user_data` from cloudinit.yaml.tftpl.
+        Tags Name = "backbone-worker-${count.index}".
+      | depends_on: [terraform-vars]
+    - terraform-cloudinit | /terraform/modules/worker/cloudinit.yaml.tftpl
+      | cloud-init that on first boot:
+        (1) if var.tailscale: install tailscale, `tailscale up --authkey=... --hostname=backbone-worker-N`;
+        (2) run the k3s agent installer -
+            curl -sfL https://get.k3s.io | K3S_URL=${k3s_url} K3S_TOKEN=${k3s_token}
+              INSTALL_K3S_EXEC="agent --node-label=${node_labels}
+              $([ tailscale ] && echo --node-external-ip=$(tailscale ip -4))" sh -
+        Same command node-join.sh's emit_remote_script produces - keep them in sync.
+      | depends_on: [terraform-cloudinit is the source of truth; node-join.sh mirrors it]
+    - terraform-outputs | /terraform/outputs.tf
+      | instance_ids, private_ips, tailscale_hostnames - consumed by
+        `make workers-destroy` and by a `kubectl delete node` cleanup step.
+      | depends_on: [terraform-main]
+    - terraform-backend | /terraform/backend.tf.example
+      | Optional remote state (S3 + DynamoDB lock) template; local state is the
+        default for a single operator. Real backend.tf is gitignored.
+      | depends_on: []
+    - tf-secrets-doc | /docs/terraform.md
+      | What AWS IAM permissions the control plane needs (ec2 run/terminate/
+        describe instances, security groups, tags - scoped policy JSON included);
+        how to get a Tailscale auth key (reusable, ephemeral, pre-approved,
+        tagged); the NAT'd-control-plane caveat (workers can't reach a home
+        control plane without Tailscale); spot-instance interruption -> node
+        auto-reschedule handles it.
+      | depends_on: []
+    - makefile-workers | /Makefile  (targets added)
+      | `make workers COUNT=n`  -> writes .secrets/tf.tfvars from .env +
+                                   .secrets/cluster-join.env; `terraform -chdir=terraform init`;
+                                   `terraform -chdir=terraform apply -auto-approve -var-file=...`;
+                                   waits `kubectl wait --for=condition=Ready node -l backbone.dev/role=worker`.
+        `make workers-destroy`   -> for each TF-managed node: `kubectl delete node <name>`;
+                                    `terraform -chdir=terraform destroy -auto-approve`.
+        `make workers-list`      -> `terraform -chdir=terraform output` + `kubectl get nodes -l backbone.dev/role=worker`.
+      | depends_on: [terraform-main, terraform-outputs]
+
+    Notes / decisions:
+      - cloud-init self-join (no SSH) is the primary path; the SSH `node-join.sh`
+        stays for hand-added / non-cloud machines.
+      - The agent-install command lives in TWO places (cloudinit.yaml.tftpl and
+        node-join.sh's emit_remote_script). Pick one as source of truth; a
+        `verify` step greps that they match, or factor it into a shared template.
+      - .gitignore adds: /terraform/.terraform/, /terraform/*.tfstate*,
+        /terraform/backend.tf, /.secrets/tf.tfvars.
+      - Provider-agnostic later: the `worker` module is the seam - a GCP/Hetzner
+        module with the same inputs/outputs drops in without touching the Makefile.
+
   == Verification ==
     - verify-phase6.sh | /scripts/verify-phase6.sh
       | DR: trigger the Mongo CronJob manually -> artifact in PVC/MinIO; run mongo-restore into a scratch DB and diff; kill a node (or cordon+drain) and confirm pods reschedule and data intact; Redis survives restart with AOF.
         Maintenance: `maintenance on` -> public paths return 503 + Retry-After while bypass list still 200; the login-gated page control and POST /internal/maintenance/off both restore service; state ConfigMap persists across a Kong pod restart.
-      | depends_on: [bootstrap-dr.sh, bootstrap-maintenance.sh]
+        Provisioned workers: `make workers COUNT=2` -> 2 nodes Ready within ~3 min, labelled backbone.dev/role=worker;
+          a test Deployment schedules pods onto them; `make workers-destroy` -> nodes gone from `kubectl get nodes` and instances terminated.
+      | depends_on: [bootstrap-dr.sh, bootstrap-maintenance.sh, makefile-workers]
