@@ -464,6 +464,23 @@
     The whole /config directory is gone. The authenticated in-cluster registry is deferred to Phase 5
     (behind Kong + TLS).
 
+- Phase 0 - what is accomplished
+  The substrate everything else runs on. `make phase0` on a Linux host delivers:
+  1. A k3s cluster - k3s server installed on the host (embedded etcd; Traefik disabled, Kong comes later).
+  2. Horizontal scale built in - any other Linux machine joins as a worker with one command
+     (`make node-join TARGET=user@ip`) over a WireGuard-encrypted overlay. The scheduler spreads pods
+     across all nodes; services reach each other by DNS regardless of which machine they land on.
+  3. Working storage - `local-path` set as the default StorageClass, so PVCs bind with no annotation.
+  4. Namespace layout - `platform` / `data` / `app`.
+  5. A secrets convention - no secrets yet, but `create-secrets.sh` is the stable entrypoint later
+     phases plug into; the k3s join token is cached to `.secrets/` (gitignored).
+  6. An acceptance gate - `make verify` asserts nodes Ready, default SC correct, namespaces present,
+     a PVC binds, and every node can pull an image -> prints "PHASE 0 OK".
+  Plus repo scaffolding: Makefile, .env.example, .gitignore, README.md, architecture.txt.
+  NOT included (deferred by design): the authenticated image registry, Kong, databases, TLS - Phases 1-5.
+  Status: implemented; scripts pass `bash -n`. End-to-end run (server + a joined worker) is Step 7,
+  pending real Linux hosts, before tagging `phase-0-complete`.
+
 - Files (Phase 1 - Data layer)
   Format: file_name | file_path | description | depends_on[]
   All manifests land in the `data` namespace and rely on the default StorageClass from Phase 0.
