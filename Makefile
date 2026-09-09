@@ -1,19 +1,23 @@
-# backbone - Phase 0 task entrypoints. Linux; installs a k3s server + joinable workers.
+# backbone - task entrypoints. Linux; installs a k3s server + joinable workers,
+# then brings up the platform phase by phase.
 # depends_on: [scripts/cluster-up.sh, scripts/cluster-down.sh, scripts/node-join.sh,
 #              k8s/base/namespaces.yaml, scripts/create-secrets.sh,
-#              scripts/verify-phase0.sh]
+#              scripts/verify-phase0.sh, scripts/data-secrets.sh,
+#              scripts/bootstrap-data.sh, scripts/verify-phase1.sh]
 
 SHELL := /usr/bin/env bash
 KUBECONFIG ?= ./kubeconfig
 export KUBECONFIG
 
-.PHONY: help cluster base secrets verify phase0 down lint node-join
+.PHONY: help cluster base secrets verify phase0 down lint node-join \
+        secrets-data data verify-phase1 phase1
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
 	@echo "other machines join as workers. Set K3S_SERVER_ADDR in .env first."
 	@echo ""
 	@echo "Targets:"
+	@echo "  Phase 0 - Substrate"
 	@echo "  make phase0                       - cluster -> base -> secrets -> verify"
 	@echo "  make cluster                      - install the k3s server, write ./kubeconfig"
 	@echo "  make base                         - apply namespaces + default StorageClass"
@@ -21,6 +25,13 @@ help:
 	@echo "  make verify                       - run the Phase 0 acceptance gate"
 	@echo "  make node-join TARGET=user@host   - join a worker machine over SSH"
 	@echo "  make down                         - uninstall the k3s server on this host"
+	@echo ""
+	@echo "  Phase 1 - Data layer (set the Phase 1 vars in .env first)"
+	@echo "  make phase1                       - data -> verify-phase1"
+	@echo "  make secrets-data                 - create mongodb-credentials + redis-password"
+	@echo "  make data                         - bootstrap Redis + MongoDB in the data namespace"
+	@echo "  make verify-phase1               - run the Phase 1 acceptance gate"
+	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
 
 cluster:
@@ -44,13 +55,26 @@ verify: _need-kubeconfig
 
 phase0: cluster base secrets verify
 
+# --- Phase 1: Data layer -------------------------------------------------
+secrets-data: _need-kubeconfig
+	./scripts/data-secrets.sh
+
+data: _need-kubeconfig
+	./scripts/bootstrap-data.sh
+
+verify-phase1: _need-kubeconfig
+	./scripts/verify-phase1.sh
+
+phase1: data verify-phase1
+
 down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
+	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
 	else \
 	  echo "no ./kubeconfig - skipping manifest dry-run"; \
 	fi

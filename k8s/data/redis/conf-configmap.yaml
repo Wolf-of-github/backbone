@@ -1,0 +1,40 @@
+# redis.conf for the Phase 1 Redis StatefulSet.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# `requirepass` is deliberately NOT here - it is passed on the command line from
+# the redis-password Secret so the value never lands in a ConfigMap.
+# AOF fsync policy and RDB save points are revisited in Phase 6 (Backup/DR).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-conf
+  namespace: data
+  labels:
+    app.kubernetes.io/name: redis
+    backbone.dev/tier: data
+data:
+  redis.conf: |
+    # --- network ---------------------------------------------------------
+    bind 0.0.0.0
+    port 6379
+    # requirepass is the gate; this Service is cluster-internal only (no Kong,
+    # no NodePort). protected-mode would otherwise refuse non-loopback clients.
+    protected-mode no
+
+    # --- persistence: RDB snapshots ------------------------------------------
+    dir /data
+    dbfilename dump.rdb
+    save 900 1
+    save 300 10
+    save 60 10000
+
+    # --- persistence: AOF -------------------------------------------------
+    appendonly yes
+    appendfilename "appendonly.aof"
+    appendfsync everysec
+    auto-aof-rewrite-percentage 100
+    auto-aof-rewrite-min-size 64mb
+
+    # --- memory --------------------------------------------------------------
+    # BullMQ job state must never be evicted; rate-limit counters expire on TTL.
+    maxmemory-policy noeviction

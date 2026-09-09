@@ -139,6 +139,43 @@
         8472/udp   flannel VXLAN       (all <-> all)   [WIREGUARD=false, trusted network only]
       Cross-network (home/office <-> AWS VPC): WIREGUARD=true (encrypts the overlay) + NODE_EXTERNAL_IP
       set to each node's routable IP. Same-VPC: plain VXLAN is fine.
+
+    - FIREWALL / SECURITY-GROUP REQUIREMENTS (authoritative list - Terraform, cloud-init, and any
+      hand-provisioned node must match this exactly):
+
+        proto/port   direction                  needed for                       when
+        ----------   ------------------------   ------------------------------    -------------------
+        6443/tcp     agents  -> server          Kubernetes API / node join       always (multi-node)
+        10250/tcp    all    <-> all             kubelet (logs, exec, metrics)    always (multi-node)
+        51820/udp    all    <-> all             flannel WireGuard overlay        WIREGUARD=true (default)
+        8472/udp     all    <-> all             flannel VXLAN overlay            WIREGUARD=false
+        2379-2380/tcp servers <-> servers       embedded-etcd peer/client        Phase 6 HA (>1 server) only
+
+      - EXACTLY ONE overlay port is required: 51820/udp (WireGuard) OR 8472/udp (VXLAN), matching
+        WIREGUARD. Opening both is harmless; opening neither = cross-node pod traffic and in-cluster
+        DNS silently time out (no error, 100% packet loss). This is the single most common bring-up
+        failure.
+      - Source scoping: in one cloud, use a security group that references itself. Cross-network,
+        scope the overlay + kubelet ports to the other nodes' routable IPs (or the tailnet CIDR
+        100.64.0.0/10 when TAILSCALE=true - see below).
+      - Public ingress (80/443 to Kong) is NOT in this list - it is Phase 2, on the gateway node
+        only, never node-to-node.
+      - Egress: nodes need outbound 443/tcp to fetch images and the k3s installer (until the Phase 5
+        in-cluster registry). Terraform modules should allow egress-all unless there is a reason not to.
+
+    - TAILSCALE=true specifics (NAT'd / no-public-IP nodes, joined over a tailnet):
+      - The overlay still needs its UDP port (51820 or 8472) reachable between the nodes' TAILNET
+        addresses. If Tailscale negotiates a DIRECT connection (common on cloud VMs), that UDP rides
+        the nodes' PUBLIC IPs and is subject to the cloud security group - so the SG must still allow
+        51820/udp (or 8472/udp), sourced from 100.64.0.0/10. Only pure DERP-relayed tailnets avoid
+        this, and you should not rely on relay for the data plane.
+      - Every node must pin its k3s identity + flannel to the tailnet interface, or k3s picks the
+        default-route NIC (e.g. LAN wifi) and peers cannot route to it:
+          --node-ip=<tailscale ip -4>   --flannel-iface=tailscale0   --node-external-ip=<same>
+        cluster-up.sh and node-join.sh set all three when TAILSCALE=true; the Terraform cloud-init
+        MUST do the same.
+      - MTU: flannel auto-sizes its overlay MTU to ~1200 to fit inside the 1280-byte tailnet MTU.
+        Do not override it upward.
     - Failure: an agent dying -> its pods reschedule onto the others. The server is still a single
       point of failure until Phase 6 (embedded-etcd HA: 3 servers).
     - External services that will NEVER run in-cluster (managed RDS, a GPU box you won't put k3s on):
@@ -272,6 +309,190 @@
         `bash -n` (shellcheck where available); k8s/base passes `kubectl apply --dry-run=server`.
       - README covers the flow and lets a new person reproduce it unaided.
 
+  - Phase 1 - Data layer: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Scope: MongoDB + Redis, each a single-replica StatefulSet in the `data` namespace, on the
+      Phase 0 `local-path` default StorageClass. No replica set / HA yet (that is Phase 6). No Kong
+      in front (Phase 2) - reachability is proven from an in-cluster throwaway pod only. These two
+      datastores are the hard dependency for auth (Phase 3), BullMQ workers (Phase 4) and Kong
+      rate-limiting (Phase 2).
+    - Runtime decision: everything is plain k3s manifests + one secrets script + two bootstrap/verify
+      scripts. No Helm, no operators. StatefulSets (not Deployments) so each pod gets a stable name
+      (`mongodb-0`, `redis-0`), stable DNS via a headless Service, and a `volumeClaimTemplate` PVC
+      that survives pod restarts. Pinned image tags from public registries (no in-cluster registry
+      until Phase 5): `mongo:7.0`, `redis:7.2-alpine`.
+    - This is the FIRST phase that creates Kubernetes Secrets. `scripts/data-secrets.sh` is the first
+      concrete `<phase>-secrets.sh` plugging into the `create-secrets.sh` convention from Phase 0
+      Step 4. Pattern (documented there): `kubectl create secret generic ... --dry-run=client -o yaml
+      | kubectl apply -f -` - idempotent, no `--from-file` of anything gitignored, never echo values.
+    - Credential model:
+      - `mongodb-credentials` (ns data): root-username / root-password (cluster admin, used only by
+        the init container + break-glass) AND app-username / app-password / app-db (least-privilege
+        user scoped to the one application database). Backend services get ONLY the app-* values.
+      - `redis-password` (ns data): a single `password` key; Redis `requirepass` + every client's AUTH.
+      - Values come from `.env` (new keys below). `.env` stays gitignored; `.env.example` ships blank
+        placeholders + a one-line `openssl rand` hint. If a value is blank, `data-secrets.sh` dies
+        with a clear message (does NOT auto-generate - the operator must set and record them).
+
+    - Guiding rules (same as Phase 0)
+      - Bottom-up by depends_on: never create a file before the files it depends on are in place.
+      - Two passes per file: (1) instantiate with a header comment (purpose + depends_on, body a STUB
+        marker); (2) implement - real content, remove the STUB marker.
+      - Nothing is "done" until `make verify-phase1` (verify-phase1.sh) prints "PHASE 1 OK" and the
+        full chain `make phase1` exits 0 on a cluster that has passed Phase 0.
+      - Security: secret values only ever come from `.env` (gitignored); scripts `set -euo pipefail`,
+        source `scripts/lib.sh`, never echo secret values; manifests reference secrets by
+        `secretKeyRef` / `valueFrom`, never inline literals.
+      - Phase 0 must still be green afterwards: `make verify` (the Phase 0 gate) keeps passing.
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories: /k8s/data/mongodb /k8s/data/redis
+      - Instantiate headered stubs:
+        /scripts/data-secrets.sh, /scripts/bootstrap-data.sh, /scripts/verify-phase1.sh,
+        /k8s/data/mongodb/{statefulset,service,init-configmap,mongod-conf-configmap}.yaml,
+        /k8s/data/redis/{statefulset,service,conf-configmap}.yaml
+      - `chmod +x` the new /scripts/*.sh.
+
+    - Step 1 - .env + secrets contract (no cluster needed)
+      - .env.example: add a "Phase 1 - Data layer" block with blank values +
+        `# generate: openssl rand -base64 24`:
+          MONGO_ROOT_USER=root
+          MONGO_ROOT_PASSWORD=
+          MONGO_APP_USER=backbone_app
+          MONGO_APP_PASSWORD=
+          MONGO_APP_DB=backbone
+          REDIS_PASSWORD=
+      - docs/secrets.md: fill in the `data` namespace row of the map - `mongodb-credentials`
+        (root-* + app-*) and `redis-password`; note "created by scripts/data-secrets.sh, values from
+        .env, never committed"; keep the Sealed Secrets upgrade note.
+      - Verify: `grep` confirms the six keys exist in `.env.example` and are blank where secret;
+        `bash -n scripts/data-secrets.sh`.
+
+    - Step 2 - Secrets script (scripts/data-secrets.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl`.
+      - Assert ns `data` exists (`kubectl get ns data` || die "run 'make base' first").
+      - `require_vars MONGO_ROOT_USER MONGO_ROOT_PASSWORD MONGO_APP_USER MONGO_APP_PASSWORD
+        MONGO_APP_DB REDIS_PASSWORD` - die listing any blank one.
+      - Create `mongodb-credentials` (keys: root-username, root-password, app-username, app-password,
+        app-db) and `redis-password` (key: password) in ns data via the idempotent
+        `--dry-run=client -o yaml | kubectl apply -f -` pattern. Never echo values.
+      - Idempotent: re-running with changed .env values updates the Secret objects (pods pick up
+        changes only on restart - documented inline).
+      - Verify: `make secrets-data` on a cluster with ns data -> both secrets exist
+        (`kubectl -n data get secret mongodb-credentials redis-password`); fails clearly if a var is blank.
+
+    - Step 3 - Redis manifests (k8s/data/redis/*)
+      - conf-configmap.yaml: `redis.conf` -
+          bind 0.0.0.0
+          protected-mode no            # requirepass is the gate; cluster-internal only
+          appendonly yes               # AOF on now; fsync policy tuned in Phase 6
+          appendfsync everysec
+          save 900 1 / save 300 10 / save 60 10000     # RDB snapshots
+          maxmemory-policy noeviction  # BullMQ jobs must not be evicted
+          dir /data
+        (requirepass is NOT in the file - passed via `--requirepass "$(cat /secret/password)"` in the
+        container command so the value never lands in a ConfigMap.)
+      - statefulset.yaml: `redis` StatefulSet, `serviceName: redis`, replicas 1, image `redis:7.2-alpine`.
+        Command: `redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"` with
+        `REDIS_PASSWORD` from `secretKeyRef: redis-password/password`. Mounts: conf-configmap at
+        /etc/redis, `volumeClaimTemplate` `data` (1Gi, RWO, default SC) at /data. Probes:
+        `redis-cli -a "$REDIS_PASSWORD" ping` for liveness+readiness (`exec` probe). `securityContext`
+        runAsNonRoot, fsGroup so the PVC is writable.
+      - service.yaml: headless (`clusterIP: None`) Service `redis` in ns data, port 6379 -> stable DNS
+        `redis.data.svc.cluster.local`.
+      - Verify: `kubectl -n data rollout status statefulset/redis`; from a throwaway `redis:7.2-alpine`
+        pod, `redis-cli -h redis.data.svc -a <pw> SET k v` / `GET k` / `DEL k`; PVC `data-redis-0` Bound.
+
+    - Step 4 - MongoDB manifests (k8s/data/mongodb/*)
+      - mongod-conf-configmap.yaml: `mongod.conf` -
+          net: { bindIp: 0.0.0.0, port: 27017 }
+          storage: { wiredTiger: { engineConfig: { cacheSizeGB: 0.25 } } }
+          security: { authorization: enabled }
+          # replication: { replSetName: rs0 }   # commented - Phase 6
+      - init-configmap.yaml: `init-app-user.js` - run once against the fresh volume; creates
+        `MONGO_APP_DB` and the least-privilege app user (`readWrite` on that DB only) from env vars
+        the init step passes in. Idempotent (guarded by a `db.getUser()` check).
+      - statefulset.yaml: `mongodb` StatefulSet, `serviceName: mongodb`, replicas 1, image `mongo:7.0`.
+        - Env: `MONGO_INITDB_ROOT_USERNAME` / `MONGO_INITDB_ROOT_PASSWORD` from
+          `secretKeyRef: mongodb-credentials/root-*` (the official image bootstraps the root user on an
+          empty datadir).
+        - App user + DB: an `initContainer` OR a `postStart`/one-shot Job running `mongosh` with the
+          init-configmap script, taking app-* + root-* from the secret. Chosen approach: a small
+          `initContainer` is race-prone against mongod start; use a one-shot `Job`
+          (`k8s/data/mongodb/init-job.yaml`, added here) that runs after the StatefulSet is Ready and
+          `mongosh`es the init script. bootstrap-data.sh sequences it.
+        - Mounts: mongod-conf-configmap at /etc/mongo, `volumeClaimTemplate` `data` (2Gi, RWO,
+          default SC) at /data/db. Command: `mongod --config /etc/mongo/mongod.conf`.
+        - Probes: `mongosh --quiet --eval "db.adminCommand('ping')"` (exec) for liveness+readiness.
+        - `securityContext`: runAsNonRoot (mongo uid 999), fsGroup 999.
+      - service.yaml: headless Service `mongodb` in ns data, port 27017 -> `mongodb.data.svc.cluster.local`.
+      - Update Step 0 stub list to include /k8s/data/mongodb/init-job.yaml.
+      - Verify: `kubectl -n data rollout status statefulset/mongodb`; init Job `Completed`; from a
+        throwaway `mongo:7.0` pod, `mongosh "mongodb://<app-user>:<pw>@mongodb.data.svc/<db>"` then
+        `insertOne` / `findOne` / `drop`; a root-only op from the app user is denied; PVC
+        `data-mongodb-0` Bound.
+
+    - Step 5 - Orchestration (scripts/bootstrap-data.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl`; assert ns data + Phase 0
+        default SC present.
+      - Order: (1) `scripts/data-secrets.sh`; (2) apply redis conf-configmap -> statefulset -> service,
+        `kubectl -n data rollout status statefulset/redis --timeout=120s`; (3) apply mongodb
+        configmaps -> statefulset -> service, wait rollout; (4) apply the mongo init Job, `kubectl -n
+        data wait --for=condition=complete job/mongodb-init --timeout=120s`.
+      - Idempotent (re-apply is a no-op when nothing changed); safe to re-run after a partial failure.
+      - Verify: on a clean Phase 0 cluster, one `bootstrap-data.sh` run leaves both StatefulSets Ready,
+        the init Job Complete, three PVCs Bound.
+
+    - Step 6 - Makefile wiring
+      - New targets (.PHONY; reuse the top-of-file `KUBECONFIG`):
+        `make secrets-data`   -> scripts/data-secrets.sh
+        `make data`           -> scripts/bootstrap-data.sh
+        `make verify-phase1`  -> scripts/verify-phase1.sh
+        `make phase1`         -> data verify-phase1
+      - All three fail fast via `_need-kubeconfig` if ./kubeconfig is missing.
+      - `make lint`: add the new scripts to the shellcheck list and `k8s/data/` to the
+        `kubectl apply --dry-run=server` set.
+      - `make help`: add the Phase 1 lines.
+
+    - Step 7 - Verification script (scripts/verify-phase1.sh) - the 100% gate
+      - `set -euo pipefail`; source lib.sh; `load_env`; `require_vars` the six Phase 1 vars; KUBECONFIG
+        from lib. `fail() { die "verify-phase1: $*"; }`. Numbered `[n/N]` logs like verify-phase0.sh.
+      - [1] Both StatefulSets exist and are Ready (`kubectl -n data rollout status`, 1/1 each).
+      - [2] Secrets `mongodb-credentials` (5 keys) and `redis-password` (1 key) exist with the
+        expected keys (check keys, never print values).
+      - [3] PVCs `data-mongodb-0` and `data-redis-0` are Bound.
+      - [4] Redis round-trip from a throwaway pod: `redis-cli -h redis.data.svc -a <pw>` SET/GET/DEL;
+        assert a no-AUTH command is refused (`NOAUTH`).
+      - [5] MongoDB round-trip from a throwaway pod: connect as the app user to the app DB, insert +
+        read + drop a doc in a scratch collection; assert the app user CANNOT create a new database /
+        do an admin command (least-privilege holds).
+      - [6] Persistence: `kubectl -n data delete pod mongodb-0 redis-0`; wait both Ready again; the
+        Redis key written pre-delete (with a short TTL beyond the test window) and a Mongo doc written
+        pre-delete are both still readable -> data survived the restart on the same PVC.
+      - Clean up every throwaway pod / scratch key / scratch collection (trap EXIT, like verify-phase0.sh).
+      - Exit non-zero with a clear message on the first failed assertion; print "PHASE 1 OK" on success.
+
+    - Step 8 - Clean-cluster dry run
+      - On a cluster that has passed Phase 0: fill the six Phase 1 vars in `.env`
+        (`openssl rand -base64 24` for the three passwords), then `make phase1` -> "PHASE 1 OK".
+      - Re-run `make verify` (Phase 0 gate) -> still "PHASE 0 OK" (Phase 1 did not regress the substrate).
+      - Multi-node: confirm `mongodb-0` / `redis-0` schedule on whichever node the scheduler picks and
+        the throwaway test pods on the other node still reach them by `*.data.svc` DNS.
+      - Tag `phase-1-complete` once `make phase1` is green from a clean Phase 0 cluster and
+        `verify-phase1.sh`'s persistence check (Step 7 [6]) passes.
+
+    - Definition of done (Phase 1)
+      - Every file in "Files (Phase 1 - Data layer)" exists with real content (no STUB markers),
+        plus `k8s/data/mongodb/init-job.yaml` (added in Step 4).
+      - On a Phase 0 cluster: `make phase1` -> "PHASE 1 OK" and `make` exits 0; `make verify` still
+        prints "PHASE 0 OK".
+      - `mongodb.data.svc` and `redis.data.svc` resolve cluster-wide; a pod on any node authenticates
+        and does I/O against both.
+      - Deleting `mongodb-0` / `redis-0` loses no data (PVC-backed); the app user is least-privilege.
+      - No secret values in git, in ConfigMaps, or echoed by any script; new scripts pass `bash -n`
+        (shellcheck where available); `k8s/data/` passes `kubectl apply --dry-run=server`.
+      - README gains a "Phase 1 - Data layer" section: the six `.env` vars, `make phase1`, expected
+        `verify-phase1.sh` output, and how to connect a client from inside the cluster.
+
 - Commands (every command to set up Phase 0, in order)
   Run from the repo root. `$` = shell; `#` = comment. Linux only. Nothing here
   needs to be memorised - `make phase0` chains it - this is the full expansion.
@@ -349,6 +570,57 @@
     #   need the join token?     on the server: sudo cat /var/lib/rancher/k3s/server/node-token
     #   server won't start?      journalctl -u k3s -f ; check K3S_SERVER_ADDR resolves and :6443 is free
 
+- Commands (Phase 1 - Data layer, in order)
+  Run from the repo root on a cluster that has already passed Phase 0. `make phase1` chains it.
+
+  == 1. Set the data credentials (on the control-plane host) ==
+    $ $EDITOR .env
+    #   fill the Phase 1 block:
+    #     MONGO_ROOT_USER=root
+    #     MONGO_ROOT_PASSWORD=$(openssl rand -base64 24)
+    #     MONGO_APP_USER=backbone_app
+    #     MONGO_APP_PASSWORD=$(openssl rand -base64 24)
+    #     MONGO_APP_DB=backbone
+    #     REDIS_PASSWORD=$(openssl rand -base64 24)
+    #   record these somewhere safe - data-secrets.sh does NOT generate or print them.
+
+  == 2. Bring up the data layer ==
+    $ make phase1
+    #   = make data          -> ./scripts/bootstrap-data.sh
+    #       ./scripts/data-secrets.sh
+    #         kubectl -n data create secret generic mongodb-credentials --from-literal=... \
+    #           --dry-run=client -o yaml | kubectl apply -f -
+    #         kubectl -n data create secret generic redis-password --from-literal=password=... \
+    #           --dry-run=client -o yaml | kubectl apply -f -
+    #       kubectl apply -f k8s/data/redis/    ; kubectl -n data rollout status statefulset/redis
+    #       kubectl apply -f k8s/data/mongodb/  ; kubectl -n data rollout status statefulset/mongodb
+    #       kubectl apply -f k8s/data/mongodb/init-job.yaml
+    #       kubectl -n data wait --for=condition=complete job/mongodb-init --timeout=120s
+    #     make verify-phase1   -> ./scripts/verify-phase1.sh   -> prints "PHASE 1 OK"
+
+    $ kubectl -n data get statefulset,svc,pvc,secret
+    $ make verify                                          # Phase 0 gate still green
+
+  == 3. Connect a client from inside the cluster ==
+    $ kubectl -n data run redis-cli --rm -it --restart=Never --image=redis:7.2-alpine -- \
+        redis-cli -h redis.data.svc -a "$REDIS_PASSWORD"
+    $ kubectl -n data run mongosh --rm -it --restart=Never --image=mongo:7.0 -- \
+        mongosh "mongodb://$MONGO_APP_USER:$MONGO_APP_PASSWORD@mongodb.data.svc/$MONGO_APP_DB"
+
+  == 4. Rotate a credential ==
+    $ $EDITOR .env                    # change the value
+    $ make secrets-data               # updates the Secret object
+    $ kubectl -n data rollout restart statefulset/redis      # or mongodb - pods pick it up on restart
+
+  == 5. Checks / troubleshooting ==
+    $ make lint                                            # + k8s/data/ dry-run
+    $ kubectl -n data get pods -o wide                     # both Running; init Job Completed
+    $ kubectl -n data logs statefulset/mongodb             # auth / init errors
+    $ kubectl -n data describe pvc data-mongodb-0          # Bound? which node?
+    #   pod Pending?              default StorageClass missing -> re-run Phase 0 `make base`
+    #   auth failures?            secret changed but pod not restarted -> rollout restart the StatefulSet
+    #   init Job failed?          check `kubectl -n data logs job/mongodb-init`; it is safe to re-apply
+
 - Build Order (dependency-ordered; each layer stands on a working one below it)
   - Core chain: k3s → container registry → Kong → one real service → MongoDB/Redis → auth → CI/CD → observability → TLS → backups → maintenance
   - Phase 0 - Substrate
@@ -358,9 +630,16 @@
     - Container registry: none in Phase 0 - workers pull from public registries. The real authenticated
       in-cluster registry is deferred to Phase 5 (behind Kong + TLS).
     - Namespace split + secrets convention (no K8s secrets in Phase 0; k3s join token cached under .secrets/).
-  - Phase 1 - Data layer
-    - MongoDB (StatefulSet + PVC, single instance, no replica set yet)
-    - Redis (PVC, RDB enabled) - needed by BullMQ and Kong rate-limiting
+  - Phase 1 - Data layer  (`make phase1`; gate: verify-phase1.sh -> "PHASE 1 OK")
+    - First K8s Secrets: scripts/data-secrets.sh (mongodb-credentials, redis-password) from .env,
+      idempotent, plugs into the Phase 0 create-secrets.sh convention.
+    - Redis first (redis:7.2-alpine, StatefulSet + PVC, requirepass, AOF + RDB, noeviction) -
+      needed by BullMQ and Kong rate-limiting.
+    - Then MongoDB (mongo:7.0, StatefulSet + PVC, auth on, root from secret + one-shot init Job that
+      creates a least-privilege app user/DB). Single instance, no replica set yet (Phase 6).
+    - Headless Services mongodb.data.svc / redis.data.svc; no Kong in front yet (Phase 2) - reached
+      only from in-cluster pods. verify-phase1.sh proves auth, least-privilege, and PVC persistence
+      across a pod delete.
   - Phase 2 - Edge
     - Kong (declarative/DB-less mode; routes / and /api/*) - integration point for auth, TLS, rate limiting, maintenance
     - One trivial backend service (/api/ping) - end-to-end smoke test for every later change
@@ -489,45 +768,86 @@
 - Files (Phase 1 - Data layer)
   Format: file_name | file_path | description | depends_on[]
   All manifests land in the `data` namespace and rely on the default StorageClass from Phase 0.
+  STATUS: DONE. Verified end-to-end on a real 2-node cluster (home control plane + AWS worker over
+  Tailscale/WireGuard): `make phase1` -> "PHASE 1 OK", all 6 checks incl. cross-node PVC persistence.
+  Tagged `phase-1-complete`. Bring-up also surfaced and fixed a Phase 0 networking bug: with
+  TAILSCALE=true, cluster-up.sh / node-join.sh now also pass --node-ip / --flannel-iface=tailscale0
+  (see Diagram > horizontal-scale > FIREWALL / SECURITY-GROUP REQUIREMENTS).
+
+  Also updated (not new files): .env.example (six Phase 1 vars), docs/secrets.md (data ns row),
+  scripts/create-secrets.sh convention consumed, Makefile (secrets-data/data/verify-phase1/phase1
+  targets + lint/help), README.md (Phase 1 section).
 
   - Secrets
     - data-secrets.sh | /scripts/data-secrets.sh
-      | Reads .env, creates mongodb-credentials (root user/pass, app user/pass) and redis-password secrets in data ns; idempotent.
-      | depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/create-secrets.sh]
+      | Reads .env, require_vars the six Phase 1 keys, creates mongodb-credentials (root-username/
+        root-password + app-username/app-password/app-db) and redis-password (password) in data ns
+        via `kubectl create secret ... --dry-run=client -o yaml | kubectl apply -f -`; idempotent;
+        dies (no auto-generate) on any blank value; never echoes values.
+      | depends_on: [k8s/base/namespaces.yaml, .env.example, scripts/create-secrets.sh, scripts/lib.sh]
 
-  - MongoDB
-    - mongo-statefulset.yaml | /k8s/data/mongodb/statefulset.yaml
-      | Single-replica MongoDB StatefulSet; auth enabled, root creds from secret, volumeClaimTemplate for /data/db, liveness/readiness probes.
-      | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, data-secrets.sh]
-    - mongo-service.yaml | /k8s/data/mongodb/service.yaml
-      | Headless ClusterIP service (mongodb.data.svc) for stable DNS to the StatefulSet pod.
-      | depends_on: [mongo-statefulset.yaml]
-    - mongo-init-configmap.yaml | /k8s/data/mongodb/init-configmap.yaml
-      | Mounted init JS: creates the application database + least-privilege app user scoped to that DB.
+  - Redis (built before MongoDB - simpler, no init step)
+    - redis-config.yaml | /k8s/data/redis/conf-configmap.yaml
+      | redis.conf ConfigMap: bind 0.0.0.0, protected-mode no, RDB save points, appendonly yes +
+        appendfsync everysec (AOF; fsync tuned in Phase 6), maxmemory-policy noeviction (BullMQ jobs
+        must not be evicted), dir /data. requirepass is NOT in the file - passed on the command line
+        from the secret so the value never lands in a ConfigMap.
       | depends_on: [k8s/base/namespaces.yaml]
-    - mongo-config.yaml | /k8s/data/mongodb/mongod-conf-configmap.yaml
-      | mongod.conf ConfigMap: bindIp, wiredTiger cache sizing, auth on; replica-set line commented for Phase 6.
-      | depends_on: [k8s/base/namespaces.yaml]
-
-  - Redis
     - redis-statefulset.yaml | /k8s/data/redis/statefulset.yaml
-      | Single-replica Redis StatefulSet; requirepass from secret, mounts redis.conf and a PVC at /data.
+      | Single-replica Redis StatefulSet (image redis:7.2-alpine), serviceName redis. Command
+        `redis-server /etc/redis/redis.conf --requirepass "$REDIS_PASSWORD"`, REDIS_PASSWORD from
+        secretKeyRef redis-password/password. Mounts conf-configmap at /etc/redis; volumeClaimTemplate
+        `data` (1Gi, RWO, default SC) at /data. exec probes `redis-cli -a "$REDIS_PASSWORD" ping`.
+        securityContext runAsNonRoot + fsGroup.
       | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, data-secrets.sh, redis-config.yaml]
     - redis-service.yaml | /k8s/data/redis/service.yaml
-      | Headless ClusterIP service (redis.data.svc) for stable DNS.
+      | Headless Service (clusterIP None) `redis` in data ns, port 6379 -> redis.data.svc.cluster.local.
       | depends_on: [redis-statefulset.yaml]
-    - redis-config.yaml | /k8s/data/redis/conf-configmap.yaml
-      | redis.conf ConfigMap: RDB save points enabled now, appendonly yes for AOF (Phase 6 tuning), maxmemory policy for BullMQ + rate-limit use.
+
+  - MongoDB
+    - mongo-config.yaml | /k8s/data/mongodb/mongod-conf-configmap.yaml
+      | mongod.conf ConfigMap: net.bindIp 0.0.0.0 / port 27017, storage.wiredTiger cacheSizeGB 0.25,
+        security.authorization enabled; replication.replSetName line commented for Phase 6.
       | depends_on: [k8s/base/namespaces.yaml]
+    - mongo-init-configmap.yaml | /k8s/data/mongodb/init-configmap.yaml
+      | Mounted init-app-user.js: creates MONGO_APP_DB + the least-privilege app user (readWrite on
+        that DB only) from env; guarded by a db.getUser() check so re-running is a no-op.
+      | depends_on: [k8s/base/namespaces.yaml]
+    - mongo-statefulset.yaml | /k8s/data/mongodb/statefulset.yaml
+      | Single-replica MongoDB StatefulSet (image mongo:7.0), serviceName mongodb. Command
+        `mongod --config /etc/mongo/mongod.conf`. MONGO_INITDB_ROOT_USERNAME/PASSWORD from
+        secretKeyRef mongodb-credentials/root-* (official image bootstraps root on an empty datadir).
+        Mounts mongod-conf-configmap at /etc/mongo; volumeClaimTemplate `data` (2Gi, RWO, default SC)
+        at /data/db. exec probes `mongosh --quiet --eval "db.adminCommand('ping')"`. securityContext
+        runAsNonRoot (uid 999) + fsGroup 999.
+      | depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml, data-secrets.sh, mongo-config.yaml]
+    - mongo-service.yaml | /k8s/data/mongodb/service.yaml
+      | Headless Service (clusterIP None) `mongodb` in data ns, port 27017 -> mongodb.data.svc.cluster.local.
+      | depends_on: [mongo-statefulset.yaml]
+    - mongo-init-job.yaml | /k8s/data/mongodb/init-job.yaml
+      | One-shot Job `mongodb-init`: after the StatefulSet is Ready, runs mongosh with the
+        init-configmap script, passing app-* + root-* from mongodb-credentials, to create the app DB +
+        app user. Preferred over an initContainer (which races mongod start). Re-runnable (script is
+        idempotent); bootstrap-data.sh waits on its completion.
+      | depends_on: [mongo-statefulset.yaml, mongo-service.yaml, mongo-init-configmap.yaml, data-secrets.sh]
 
   - Orchestration
     - bootstrap-data.sh | /scripts/bootstrap-data.sh
-      | Applies data-secrets, then MongoDB configmaps+statefulset+service, then Redis; waits for each StatefulSet ready before the next.
-      | depends_on: [data-secrets.sh, mongo-statefulset.yaml, mongo-service.yaml, mongo-init-configmap.yaml, mongo-config.yaml, redis-statefulset.yaml, redis-service.yaml, redis-config.yaml]
+      | set -euo pipefail; source lib.sh; assert ns data + Phase 0 default SC. Runs data-secrets.sh,
+        then Redis (configmap -> statefulset -> service, wait rollout), then MongoDB (configmaps ->
+        statefulset -> service, wait rollout), then applies mongo init-job and waits for completion.
+        Idempotent; safe to re-run after a partial failure.
+      | depends_on: [data-secrets.sh, redis-config.yaml, redis-statefulset.yaml, redis-service.yaml,
+                     mongo-config.yaml, mongo-init-configmap.yaml, mongo-statefulset.yaml,
+                     mongo-service.yaml, mongo-init-job.yaml]
 
   - Verification
     - verify-phase1.sh | /scripts/verify-phase1.sh
-      | From a throwaway pod: mongosh auth as app user + insert/read/drop; redis-cli AUTH + SET/GET/DEL; asserts PVCs Bound and data survives a pod delete.
+      | The Phase 1 gate. Asserts: both StatefulSets 1/1 Ready; secrets present with the expected keys
+        (keys only, never values); PVCs data-mongodb-0 + data-redis-0 Bound; Redis SET/GET/DEL from a
+        throwaway pod + NOAUTH refused; Mongo insert/read/drop as the app user + admin op denied
+        (least-privilege); persistence - delete mongodb-0 + redis-0, both come back Ready and the
+        pre-delete key/doc are still there. Cleans up all throwaways (trap EXIT). Prints "PHASE 1 OK".
       | depends_on: [bootstrap-data.sh]
 
 - Files (Phase 2 - Edge)
@@ -935,19 +1255,29 @@
         node_labels (default backbone.dev/role=worker), spot (bool).
       | depends_on: []
     - terraform-worker-module | /terraform/modules/worker/main.tf
-      | Per-instance: aws_instance (spot when var.spot), an aws_security_group
-        allowing 6443/tcp,10250/tcp,51820/udp,8472/udp FROM the control plane /
-        the cluster SG + egress all, and `user_data` from cloudinit.yaml.tftpl.
-        Tags Name = "backbone-worker-${count.index}".
+      | Per-instance: aws_instance (spot when var.spot), an aws_security_group, and `user_data`
+        from cloudinit.yaml.tftpl. Tags Name = "backbone-worker-${count.index}".
+      | Security group - implement EXACTLY the "FIREWALL / SECURITY-GROUP REQUIREMENTS" table in
+        Diagram > horizontal-scale (do not free-hand the ports):
+          ingress 6443/tcp, 10250/tcp  from the cluster SG (self-reference) OR, cross-network,
+                                       from var.control_plane_cidr / the tailnet CIDR 100.64.0.0/10
+          ingress 51820/udp            when var.wireguard (default true)   } exactly one of these,
+          ingress 8472/udp             when !var.wireguard                 } keyed off var.wireguard
+          ingress 22/tcp               from var.ssh_cidr, only if var.key_name set (break-glass)
+          egress  all                  (image + installer fetch over 443)
+        New var: wireguard (bool, default true) - must match the server's WIREGUARD. Passed into
+        cloud-init so the agent install and the SG agree.
       | depends_on: [terraform-vars]
     - terraform-cloudinit | /terraform/modules/worker/cloudinit.yaml.tftpl
       | cloud-init that on first boot:
         (1) if var.tailscale: install tailscale, `tailscale up --authkey=... --hostname=backbone-worker-N`;
-        (2) run the k3s agent installer -
-            curl -sfL https://get.k3s.io | K3S_URL=${k3s_url} K3S_TOKEN=${k3s_token}
-              INSTALL_K3S_EXEC="agent --node-label=${node_labels}
-              $([ tailscale ] && echo --node-external-ip=$(tailscale ip -4))" sh -
-        Same command node-join.sh's emit_remote_script produces - keep them in sync.
+        (2) run the k3s agent installer. INSTALL_K3S_EXEC must be byte-for-byte what
+            node-join.sh's emit_remote_script produces for the same inputs:
+              agent --node-label=${node_labels}
+              [--node-external-ip=<ip>]                              when tailscale OR a public IP
+              [--node-ip=<tailscale ip -4> --flannel-iface=tailscale0]   when tailscale (REQUIRED -
+                without these, k3s binds the default-route NIC and peers cannot reach this node)
+        A `verify` step greps that this template and emit_remote_script still match.
       | depends_on: [terraform-cloudinit is the source of truth; node-join.sh mirrors it]
     - terraform-outputs | /terraform/outputs.tf
       | instance_ids, private_ips, tailscale_hostnames - consumed by

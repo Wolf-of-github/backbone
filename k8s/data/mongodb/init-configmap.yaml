@@ -1,0 +1,39 @@
+# Init script run once by the mongodb-init Job (k8s/data/mongodb/init-job.yaml)
+# after the StatefulSet is Ready. Creates the least-privilege application user
+# and its database. Idempotent - guarded by a getUser() check.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# mongosh runs this connected as the root user (from mongodb-credentials).
+# App user/password/db come in as the env vars APP_USER / APP_PASSWORD / APP_DB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-init
+  namespace: data
+  labels:
+    app.kubernetes.io/name: mongodb
+    backbone.dev/tier: data
+data:
+  init-app-user.js: |
+    const appDb   = process.env.APP_DB;
+    const appUser = process.env.APP_USER;
+    const appPass = process.env.APP_PASSWORD;
+
+    if (!appDb || !appUser || !appPass) {
+      print("ERROR: APP_DB / APP_USER / APP_PASSWORD not all set");
+      quit(1);
+    }
+
+    const target = db.getSiblingDB(appDb);
+    const existing = target.getUser(appUser);
+
+    if (existing) {
+      print(`app user '${appUser}' already exists on '${appDb}' - nothing to do`);
+    } else {
+      target.createUser({
+        user: appUser,
+        pwd: appPass,
+        roles: [{ role: "readWrite", db: appDb }],
+      });
+      print(`created least-privilege user '${appUser}' (readWrite on '${appDb}')`);
+    }

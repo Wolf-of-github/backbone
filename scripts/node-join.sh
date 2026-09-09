@@ -33,15 +33,19 @@ command -v sudo >/dev/null 2>&1 || { echo "ERROR sudo required" >&2; exit 1; }
 
 K3S_VER="${ver/-k3s/+k3s}"
 EXT_IP=""
+TS_IP=""
 if [ "${tailscale}" = "true" ]; then
   command -v tailscale >/dev/null 2>&1 || { echo "ERROR TAILSCALE=true but tailscale not installed here - run: curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up" >&2; exit 1; }
-  EXT_IP="\$(tailscale ip -4 | head -1)"
-  [ -n "\$EXT_IP" ] || { echo "ERROR could not read this machine's tailscale IP" >&2; exit 1; }
-  echo "  tailscale: advertising this node as \$EXT_IP" >&2
+  TS_IP="\$(tailscale ip -4 | head -1)"
+  [ -n "\$TS_IP" ] || { echo "ERROR could not read this machine's tailscale IP" >&2; exit 1; }
+  EXT_IP="\$TS_IP"
+  echo "  tailscale: node-ip / flannel-iface / external-ip = \$TS_IP (tailscale0)" >&2
 fi
 
 EXEC="agent --node-label=backbone.dev/role=${role}"
 [ -n "\$EXT_IP" ] && EXEC="\$EXEC --node-external-ip=\$EXT_IP"
+# Pin InternalIP + flannel overlay to the tailnet interface (see cluster-up.sh).
+[ -n "\$TS_IP" ] && EXEC="\$EXEC --node-ip=\$TS_IP --flannel-iface=tailscale0"
 
 echo "  joining this machine to ${url} as a worker" >&2
 echo "  reachability needed to server/peers: 6443/tcp, 10250/tcp, $([ "$wireguard" = true ] && echo 51820/udp || echo 8472/udp)" >&2
