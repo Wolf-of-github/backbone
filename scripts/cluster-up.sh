@@ -20,13 +20,18 @@ require_vars K3S_VERSION CLUSTER_NAME K3S_SERVER_ADDR
 need curl
 command -v sudo >/dev/null 2>&1 || die "sudo required"
 
-# TAILSCALE=true -> the server advertises its own tailnet IP (and, unless the
-# user overrode it, K3S_SERVER_ADDR should be that same IP).
-if [ "$TAILSCALE" = "true" ] && [ -z "$NODE_EXTERNAL_IP" ]; then
+# TAILSCALE=true -> the node's InternalIP, the flannel overlay, AND the
+# advertised external IP must all be the tailnet IP. Otherwise k3s picks the
+# default-route interface (e.g. LAN wifi), and a worker on another network
+# cannot reach that address - pod-to-pod traffic across nodes silently fails.
+TS_IP=""
+TS_IFACE="tailscale0"
+if [ "$TAILSCALE" = "true" ]; then
   command -v tailscale >/dev/null 2>&1 || die "TAILSCALE=true but 'tailscale' not found - install it and 'sudo tailscale up' first"
-  NODE_EXTERNAL_IP="$(tailscale ip -4 | head -1)"
-  [ -n "$NODE_EXTERNAL_IP" ] || die "could not read this machine's tailscale IP"
-  log "tailscale: advertising this node as ${NODE_EXTERNAL_IP}"
+  TS_IP="$(tailscale ip -4 | head -1)"
+  [ -n "$TS_IP" ] || die "could not read this machine's tailscale IP - is 'sudo tailscale up' done?"
+  [ -n "$NODE_EXTERNAL_IP" ] || NODE_EXTERNAL_IP="$TS_IP"
+  log "tailscale: node-ip / flannel-iface / external-ip = ${TS_IP} (${TS_IFACE})"
 fi
 
 mkdir -p "$REPO_ROOT/.secrets"; chmod 700 "$REPO_ROOT/.secrets"
@@ -44,11 +49,16 @@ EXEC_ARGS=(
   "--write-kubeconfig-mode=0644"
 )
 [ -n "$NODE_EXTERNAL_IP" ] && EXEC_ARGS+=( "--node-external-ip=${NODE_EXTERNAL_IP}" )
+# Pin the node's InternalIP and the flannel overlay to the tailnet interface so
+# every node addresses peers on an IP they can all route to.
+if [ "$TAILSCALE" = "true" ]; then
+  EXEC_ARGS+=( "--node-ip=${TS_IP}" "--flannel-iface=${TS_IFACE}" )
+fi
 if [ "$WIREGUARD" = "true" ]; then
   EXEC_ARGS+=( "--flannel-backend=wireguard-native" )
   log "node-to-node overlay: WireGuard (encrypted). Open 51820/udp between nodes."
 else
-  log "node-to-node overlay: plain VXLAN. Open 8472/udp between nodes (trusted network only)."
+  log "node-to-node overlay: plain VXLAN. Open 8472/udp between nodes$( [ "$TAILSCALE" = true ] && echo ' (rides the Tailscale tunnel)' || echo ' (trusted network only)' )."
 fi
 
 if command -v k3s >/dev/null 2>&1 && sudo systemctl is-active --quiet k3s 2>/dev/null; then
