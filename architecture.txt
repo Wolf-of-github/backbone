@@ -768,9 +768,11 @@
 - Files (Phase 1 - Data layer)
   Format: file_name | file_path | description | depends_on[]
   All manifests land in the `data` namespace and rely on the default StorageClass from Phase 0.
-  STATUS: implemented on branch `phase-1-data-layer`; scripts pass `bash -n` + shellcheck (SC1091
-  info only, same as Phase 0); all manifests parse. Needs a live Phase 0 cluster to run
-  `make phase1` -> "PHASE 1 OK" end-to-end (Step 8) before tagging phase-1-complete.
+  STATUS: DONE. Verified end-to-end on a real 2-node cluster (home control plane + AWS worker over
+  Tailscale/WireGuard): `make phase1` -> "PHASE 1 OK", all 6 checks incl. cross-node PVC persistence.
+  Tagged `phase-1-complete`. Bring-up also surfaced and fixed a Phase 0 networking bug: with
+  TAILSCALE=true, cluster-up.sh / node-join.sh now also pass --node-ip / --flannel-iface=tailscale0
+  (see Diagram > horizontal-scale > FIREWALL / SECURITY-GROUP REQUIREMENTS).
 
   Also updated (not new files): .env.example (six Phase 1 vars), docs/secrets.md (data ns row),
   scripts/create-secrets.sh convention consumed, Makefile (secrets-data/data/verify-phase1/phase1
