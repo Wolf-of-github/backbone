@@ -71,7 +71,6 @@ ok "Frontend deployed"
 
 # Step 5: Wait for kong-proxy endpoint
 log "Step 5: Waiting for Kong proxy endpoint..."
-local node_port
 node_port=$(kubectl -n platform get svc kong-proxy -o jsonpath='{.spec.ports[0].nodePort}')
 ok "Kong proxy available on NodePort: $node_port"
 
