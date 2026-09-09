@@ -862,6 +862,264 @@
         pre-delete key/doc are still there. Cleans up all throwaways (trap EXIT). Prints "PHASE 1 OK".
       | depends_on: [bootstrap-data.sh]
 
+  - Phase 2 - Edge: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Scope: Kong API Gateway (DB-less/declarative mode) as the single public entry point, a minimal
+      ping-service backend to prove the registry->k8s->Kong->service path works end-to-end, and a
+      React+NGINX frontend served through Kong. Kong runs in `platform` ns; ping and frontend in `app`.
+      No auth yet (Phase 3) - Kong routes traffic but doesn't validate tokens. No TLS yet (Phase 5) -
+      HTTP only. This phase establishes the edge routing foundation that auth, rate-limiting, and TLS
+      will layer onto.
+    - Runtime decision: Kong in declarative/DB-less mode (kong.yaml ConfigMap, no Postgres). Images
+      built locally and pushed to public registries (Docker Hub or ghcr.io) - the in-cluster authenticated
+      registry is deferred to Phase 5. Multi-stage Docker builds for ping and frontend (Node build ->
+      minimal runtime). Kong exposes two routes: / -> frontend, /api/* -> backend services. A thin
+      kongctl.sh wrapper around the Admin API provides reload/inspect operations for later phases.
+    - Image registry strategy (Phase 2 only): until Phase 5 stands up the in-cluster registry, images
+      are pushed to a public registry (Docker Hub or GitHub Container Registry). .env gains
+      `REGISTRY_URL` (e.g., `docker.io/youruser` or `ghcr.io/youruser`), and build-push.sh tags with
+      both the git SHA and `latest`. No imagePullSecret needed if the registry is public; if private,
+      create a docker-registry secret manually and reference it in deployments. Phase 5 will migrate
+      to the in-cluster registry behind Kong+TLS.
+
+    - Guiding rules (same as Phase 0 and Phase 1)
+      - Bottom-up by depends_on: never create a file before the files it depends on are in place.
+      - Two passes per file: (1) instantiate with a header comment (purpose + depends_on, body a STUB
+        marker); (2) implement - real content, remove the STUB marker.
+      - Nothing is "done" until `make verify-phase2` (verify-phase2.sh) prints "PHASE 2 OK" and the
+        full chain `make phase2` exits 0 on a cluster that has passed Phase 0 and Phase 1.
+      - Security: no hardcoded secrets; scripts `set -euo pipefail`, source `scripts/lib.sh`; Dockerfiles
+        use non-root users, minimal base images; no eval(), no shell interpolation with user input.
+      - Phase 0 and Phase 1 must still be green afterwards: `make verify` and `make verify-phase1`
+        keep passing.
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories: /k8s/platform/kong /services/ping/src /services/frontend/src
+      - Instantiate headered stubs:
+        /scripts/build-push.sh, /scripts/bootstrap-edge.sh, /scripts/verify-phase2.sh, /scripts/kongctl.sh,
+        /k8s/platform/kong/{kong-configmap,deployment,proxy-service,admin-service}.yaml,
+        /services/ping/{src/index.js,package.json,Dockerfile,.dockerignore},
+        /services/frontend/{src/App.jsx,src/index.jsx,package.json,nginx.conf,Dockerfile,.dockerignore},
+        /k8s/app/ping/{deployment,service}.yaml,
+        /k8s/app/frontend/{deployment,service}.yaml
+      - `chmod +x` the new /scripts/*.sh.
+
+    - Step 1 - .env + build config (no cluster needed)
+      - .env.example: add a "Phase 2 - Edge" block:
+          REGISTRY_URL=docker.io/youruser       # or ghcr.io/youruser for GitHub Container Registry
+          KONG_PROXY_PORT=80                     # public HTTP port (443 added in Phase 5)
+          KONG_ADMIN_PORT=8001                   # internal ClusterIP only, never exposed publicly
+        (REGISTRY_URL blank by default; operator must set it. If using a private registry, document
+        that a docker-registry secret is needed until Phase 5.)
+      - .dockerignore templates for ping and frontend: node_modules/, .git/, .env, *.md, tests/.
+      - Verify: `grep` confirms the three keys exist in `.env.example`; .dockerignore files present.
+
+    - Step 2 - Build and push script (scripts/build-push.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need docker git`.
+      - `require_vars REGISTRY_URL` - die if blank.
+      - Discover the git SHA (short): `GIT_SHA=$(git rev-parse --short HEAD || echo "dev")`.
+      - For each service (ping, frontend):
+          cd services/<service>
+          docker build -t ${REGISTRY_URL}/backbone-<service>:${GIT_SHA} \
+                       -t ${REGISTRY_URL}/backbone-<service>:latest .
+          docker push ${REGISTRY_URL}/backbone-<service>:${GIT_SHA}
+          docker push ${REGISTRY_URL}/backbone-<service>:latest
+      - Idempotent (re-running rebuilds and pushes with the current SHA).
+      - Log each build and push; die on any failure.
+      - Verify: on a machine with Docker and a set REGISTRY_URL, `build-push.sh` builds both images
+        and pushes them (or dry-run if no registry access yet).
+
+    - Step 3 - Ping service (minimal backend smoke test)
+      - services/ping/package.json: `{ "name": "ping", "scripts": { "start": "node src/index.js" },
+        "dependencies": { "express": "^4.18.0" } }`.
+      - services/ping/src/index.js: Express server on port 3000, two routes:
+          GET /api/ping -> 200 { status: "ok", timestamp: Date.now() }
+          GET /healthz  -> 200 { status: "healthy" }
+        No database, no auth - pure connectivity test. `app.listen(3000, '0.0.0.0')` so it binds
+        inside the container.
+      - services/ping/Dockerfile: multi-stage -
+          FROM node:20-alpine AS build
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production
+          COPY src ./src
+
+          FROM node:20-alpine
+          RUN addgroup -g 1001 appgroup && adduser -D -u 1001 -G appgroup appuser
+          WORKDIR /app
+          COPY --from=build --chown=appuser:appgroup /app ./
+          USER appuser
+          EXPOSE 3000
+          CMD ["node", "src/index.js"]
+      - k8s/app/ping/deployment.yaml: Deployment `ping` in `app` ns, image
+        `${REGISTRY_URL}/backbone-ping:latest`, replicas 2, container port 3000. readinessProbe +
+        livenessProbe on GET /healthz (httpGet, initialDelay 5s, period 10s). If using a private
+        registry, `imagePullSecrets: [{ name: registry-credentials }]` (created manually for Phase 2;
+        Phase 5 automates it).
+      - k8s/app/ping/service.yaml: ClusterIP Service `ping` in `app` ns, port 80 -> targetPort 3000,
+        selector app=ping. DNS: `ping.app.svc.cluster.local`.
+      - Verify: after `kubectl apply -f k8s/app/ping/`, `kubectl -n app rollout status deploy/ping`;
+        from a throwaway pod, `curl ping.app.svc/api/ping` returns ok.
+
+    - Step 4 - Frontend (React SPA served by NGINX)
+      - services/frontend/package.json: React app with vite, `{ "scripts": { "build": "vite build" },
+        "dependencies": { "react": "^18.2.0", "react-dom": "^18.2.0" },
+        "devDependencies": { "vite": "^5.0.0", "@vitejs/plugin-react": "^4.2.0" } }`.
+      - services/frontend/src/index.jsx: React entry point, renders <App />.
+      - services/frontend/src/App.jsx: minimal SPA that on mount fetches GET /api/ping and displays
+        the result ("Backend status: ok" or an error). No auth - proves end-to-end Kong routing.
+      - services/frontend/vite.config.js: `export default { plugins: [react()], build: { outDir:
+        'dist' } }`.
+      - services/frontend/nginx.conf: NGINX config serving the SPA -
+          server {
+            listen 8080;
+            root /usr/share/nginx/html;
+            index index.html;
+            location / {
+              try_files $uri $uri/ /index.html;   # SPA fallback
+            }
+          }
+        No API proxying - Kong owns all /api/* routing.
+      - services/frontend/Dockerfile: multi-stage -
+          FROM node:20-alpine AS build
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+
+          FROM nginx:1.25-alpine
+          COPY --from=build /app/dist /usr/share/nginx/html
+          COPY nginx.conf /etc/nginx/conf.d/default.conf
+          EXPOSE 8080
+          CMD ["nginx", "-g", "daemon off;"]
+      - k8s/app/frontend/deployment.yaml: Deployment `frontend` in `app` ns, image
+        `${REGISTRY_URL}/backbone-frontend:latest`, replicas 2, container port 8080. Probes on GET /
+        (httpGet to :8080/). imagePullSecrets if private registry.
+      - k8s/app/frontend/service.yaml: ClusterIP Service `frontend` in `app` ns, port 80 -> 8080,
+        selector app=frontend. DNS: `frontend.app.svc.cluster.local`.
+      - Verify: after apply, `kubectl -n app rollout status deploy/frontend`; from a pod,
+        `curl frontend.app.svc` returns the SPA HTML.
+
+    - Step 5 - Kong gateway (declarative/DB-less)
+      - k8s/platform/kong/kong-configmap.yaml: ConfigMap `kong-declarative-config` with a `kong.yaml`
+        key containing the declarative config:
+          _format_version: "3.0"
+          services:
+            - name: frontend-service
+              url: http://frontend.app.svc:80
+              routes:
+                - name: frontend-route
+                  paths: ["/"]
+                  strip_path: false
+            - name: ping-service
+              url: http://ping.app.svc:80
+              routes:
+                - name: ping-route
+                  paths: ["/api/ping"]
+                  strip_path: false
+        (Auth plugins, rate-limiting, and TLS added in later phases - this is the routing skeleton.)
+      - k8s/platform/kong/deployment.yaml: Deployment `kong` in `platform` ns, image `kong:3.4`,
+        replicas 2. Env:
+          KONG_DATABASE=off
+          KONG_DECLARATIVE_CONFIG=/kong/declarative/kong.yaml
+          KONG_PROXY_LISTEN=0.0.0.0:8000
+          KONG_ADMIN_LISTEN=0.0.0.0:8001
+        volumeMount: kong-declarative-config at /kong/declarative. Probes on GET :8001/status (admin
+        API). securityContext runAsNonRoot (kong uid 1000).
+      - k8s/platform/kong/proxy-service.yaml: Service `kong-proxy` in `platform` ns, type LoadBalancer
+        (or NodePort for bare-metal/home clusters), port 80 -> 8000. This is the single public entry
+        point. DNS (external): cluster's external IP or NodePort.
+      - k8s/platform/kong/admin-service.yaml: Service `kong-admin` in `platform` ns, type ClusterIP,
+        port 8001 -> 8001. Internal only - maintenance CLI and ops use this, never exposed publicly.
+        DNS: `kong-admin.platform.svc.cluster.local`.
+      - Verify: `kubectl -n platform rollout status deploy/kong`; `kubectl get svc -n platform
+        kong-proxy` shows an external IP (LoadBalancer) or NodePort; from outside the cluster,
+        `curl http://<external-ip>/api/ping` returns ok, `curl http://<external-ip>/` returns the SPA.
+
+    - Step 6 - Kong control wrapper (scripts/kongctl.sh)
+      - `set -euo pipefail`; source lib.sh; `need kubectl curl`.
+      - Functions:
+          reload_declarative() - POST to kong-admin:8001/config with the current kong.yaml from the
+            ConfigMap (via kubectl port-forward or an in-cluster curl pod). Used after editing the
+            declarative config.
+          list_routes() - GET kong-admin:8001/routes, pretty-print route names and paths.
+          health() - GET kong-admin:8001/status, print version and config hash.
+      - CLI: `kongctl.sh reload|routes|health`.
+      - Verify: `kongctl.sh health` returns Kong's version; `kongctl.sh routes` lists frontend-route
+        and ping-route.
+
+    - Step 7 - Orchestration (scripts/bootstrap-edge.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl docker`.
+      - Assert Phase 0 namespaces (platform, app) exist; assert Phase 1 is healthy (`kubectl -n data
+        get statefulset/redis statefulset/mongodb` both 1/1).
+      - Order:
+        (1) Run `build-push.sh` to build and push ping + frontend images.
+        (2) Apply Kong: configmap -> deployment -> proxy-service -> admin-service,
+            `kubectl -n platform rollout status deploy/kong --timeout=120s`.
+        (3) Apply ping: deployment -> service, wait rollout.
+        (4) Apply frontend: deployment -> service, wait rollout.
+        (5) Wait for kong-proxy to get an external IP (if LoadBalancer): `kubectl -n platform get svc
+            kong-proxy -o jsonpath='{.status.loadBalancer.ingress[0].ip}'` with a retry loop
+            (cloud LBs can take 1-2 min). For NodePort, print the NodePort and a node IP.
+        (6) Run `kongctl.sh health` to confirm the declarative config loaded.
+      - Idempotent (re-apply is safe; re-running build-push rebuilds with the current SHA).
+      - Log each step; die on any failure.
+      - Verify: one `bootstrap-edge.sh` run on a Phase 1 cluster leaves Kong, ping, and frontend all
+        Running and reachable through the public kong-proxy endpoint.
+
+    - Step 8 - Makefile wiring
+      - New targets (.PHONY; reuse top-of-file `KUBECONFIG`):
+        `make build-push`     -> scripts/build-push.sh
+        `make edge`           -> scripts/bootstrap-edge.sh
+        `make verify-phase2`  -> scripts/verify-phase2.sh
+        `make phase2`         -> edge verify-phase2
+      - All fail fast via `_need-kubeconfig` if ./kubeconfig is missing.
+      - `make lint`: add the new scripts to shellcheck; add `k8s/platform/kong/` and `k8s/app/` to
+        `kubectl apply --dry-run=server`.
+      - `make help`: add Phase 2 lines.
+
+    - Step 9 - Verification script (scripts/verify-phase2.sh) - the 100% gate
+      - `set -euo pipefail`; source lib.sh; `load_env`; KUBECONFIG from lib.
+        `fail() { die "verify-phase2: $*"; }`. Numbered `[n/N]` logs like verify-phase0/1.
+      - [1] Kong Deployment exists and is Available (2/2 replicas); kong-proxy Service has an
+        externalIP (LoadBalancer) or a NodePort.
+      - [2] Ping and frontend Deployments exist and are Available (2/2 each).
+      - [3] End-to-end HTTP routing from OUTSIDE the cluster:
+          Get the public endpoint (LB IP or <node-ip>:<nodeport>).
+          `curl http://<endpoint>/api/ping` -> 200 { status: "ok", ... }
+          `curl http://<endpoint>/` -> 200, HTML containing "react" or "backbone" (the SPA).
+      - [4] Kong Admin API is ClusterIP-only (NOT reachable from outside) but IS reachable from
+        inside: spawn a throwaway curl pod, `curl kong-admin.platform.svc:8001/status` -> 200.
+      - [5] `kongctl.sh routes` lists both routes; `kongctl.sh health` exits 0.
+      - Clean up any throwaway pods (trap EXIT).
+      - Exit non-zero with a clear message on the first failed assertion; print "PHASE 2 OK" on success.
+
+    - Step 10 - Clean-cluster dry run
+      - On a cluster that has passed Phase 0 and Phase 1: set `REGISTRY_URL` in `.env`, then
+        `make phase2` -> "PHASE 2 OK".
+      - Re-run `make verify` and `make verify-phase1` -> both still pass (Phase 2 did not regress
+        earlier phases).
+      - From a browser / curl outside the cluster: `http://<kong-proxy-ip>/` loads the SPA,
+        `http://<kong-proxy-ip>/api/ping` returns ok. The frontend's fetch to /api/ping works
+        (proves Kong routes both / and /api/* correctly).
+      - Tag `phase-2-complete` once `make phase2` is green from a clean Phase 1 cluster and the
+        end-to-end browser test passes.
+
+    - Definition of done (Phase 2)
+      - Every file in "Files (Phase 2 - Edge)" exists with real content (no STUB markers).
+      - On a Phase 1 cluster: `make phase2` -> "PHASE 2 OK" and `make` exits 0; `make verify` and
+        `make verify-phase1` still pass.
+      - Kong is the single public entry point (kong-proxy Service); the Admin API is ClusterIP-only.
+      - `curl http://<public-ip>/api/ping` returns ok; `curl http://<public-ip>/` returns the SPA
+        HTML; the SPA's client-side fetch to /api/ping succeeds (browser or curl both work).
+      - Images built locally (build-push.sh), tagged with git SHA, pushed to the registry in
+        REGISTRY_URL, and pulled by the cluster. Deployments reference `${REGISTRY_URL}/backbone-<service>:latest`.
+      - No secrets in git (REGISTRY_URL in .env.example is blank); no hardcoded IPs or passwords;
+        scripts pass `bash -n` (shellcheck where available); `k8s/platform/` and `k8s/app/` pass
+        `kubectl apply --dry-run=server`.
+      - README gains a "Phase 2 - Edge" section: setting REGISTRY_URL, `make phase2`, expected output,
+        and how to access the frontend and API from outside the cluster.
+
 - Files (Phase 2 - Edge)
   Format: file_name | file_path | description | depends_on[]
   Kong runs in `platform` ns (declarative/DB-less). ping-service and frontend run in `app` ns.

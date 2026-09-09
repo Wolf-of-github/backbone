@@ -1,0 +1,21 @@
+# proxy-service.yaml
+# Purpose: Kong proxy Service (LoadBalancer/NodePort) - public entry point
+# depends_on: [deployment.yaml]
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-proxy
+  namespace: platform
+  labels:
+    app: kong
+spec:
+  type: NodePort
+  selector:
+    app: kong
+  ports:
+  - name: proxy
+    port: 80
+    targetPort: 8000
+    protocol: TCP
+    nodePort: 30080

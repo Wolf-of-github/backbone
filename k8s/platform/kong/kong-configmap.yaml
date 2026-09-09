@@ -1,0 +1,29 @@
+# kong-configmap.yaml
+# Purpose: Kong declarative config (kong.yaml)
+# depends_on: [k8s/base/namespaces.yaml]
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kong-declarative-config
+  namespace: platform
+data:
+  kong.yaml: |
+    _format_version: "3.0"
+
+    services:
+      - name: frontend-service
+        url: http://frontend.app.svc:80
+        routes:
+          - name: frontend-route
+            paths:
+              - /
+            strip_path: false
+
+      - name: ping-service
+        url: http://ping.app.svc:80
+        routes:
+          - name: ping-route
+            paths:
+              - /api/ping
+            strip_path: false

@@ -10,7 +10,8 @@ KUBECONFIG ?= ./kubeconfig
 export KUBECONFIG
 
 .PHONY: help cluster base secrets verify phase0 down lint node-join \
-        secrets-data data verify-phase1 phase1
+        secrets-data data verify-phase1 phase1 \
+        build-push edge verify-phase2 phase2
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
@@ -30,7 +31,13 @@ help:
 	@echo "  make phase1                       - data -> verify-phase1"
 	@echo "  make secrets-data                 - create mongodb-credentials + redis-password"
 	@echo "  make data                         - bootstrap Redis + MongoDB in the data namespace"
-	@echo "  make verify-phase1               - run the Phase 1 acceptance gate"
+	@echo "  make verify-phase1                - run the Phase 1 acceptance gate"
+	@echo ""
+	@echo "  Phase 2 - Edge (set REGISTRY_URL in .env first)"
+	@echo "  make phase2                       - edge -> verify-phase2"
+	@echo "  make build-push                   - build and push ping + frontend images"
+	@echo "  make edge                         - bootstrap Kong + ping + frontend"
+	@echo "  make verify-phase2                - run the Phase 2 acceptance gate"
 	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
 
@@ -67,14 +74,28 @@ verify-phase1: _need-kubeconfig
 
 phase1: data verify-phase1
 
+# --- Phase 2: Edge -------------------------------------------------------
+build-push: _need-kubeconfig
+	./scripts/build-push.sh
+
+edge: _need-kubeconfig
+	./scripts/bootstrap-edge.sh
+
+verify-phase2: _need-kubeconfig
+	./scripts/verify-phase2.sh
+
+phase2: edge verify-phase2
+
 down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
+	  kubectl apply --dry-run=server -R -f k8s/platform/ ; \
+	  kubectl apply --dry-run=server -R -f k8s/app/ ; \
 	else \
 	  echo "no ./kubeconfig - skipping manifest dry-run"; \
 	fi

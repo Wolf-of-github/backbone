@@ -1,0 +1,20 @@
+# admin-service.yaml
+# Purpose: Kong Admin API Service (ClusterIP only, internal)
+# depends_on: [deployment.yaml]
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong-admin
+  namespace: platform
+  labels:
+    app: kong
+spec:
+  type: ClusterIP
+  selector:
+    app: kong
+  ports:
+  - name: admin
+    port: 8001
+    targetPort: 8001
+    protocol: TCP

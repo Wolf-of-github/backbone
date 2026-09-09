@@ -1,0 +1,2 @@
+get nodes => kubectl get nodes
+get pods =>  kubectl -n data get pods -o wide

@@ -1,0 +1,50 @@
+# deployment.yaml
+# Purpose: Ping service Deployment
+# depends_on: [services/ping/Dockerfile, k8s/base/namespaces.yaml]
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ping
+  namespace: app
+  labels:
+    app: ping
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ping
+  template:
+    metadata:
+      labels:
+        app: ping
+    spec:
+      containers:
+      - name: ping
+        image: ${REGISTRY_URL}/backbone-ping:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: PORT
+          value: "3000"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+          limits:
+            cpu: "200m"
+            memory: "128Mi"

@@ -1,0 +1,12 @@
+{
+  "name": "ping",
+  "version": "1.0.0",
+  "description": "Minimal ping service for backbone Phase 2",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  }
+}
