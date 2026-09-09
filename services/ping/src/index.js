@@ -1,23 +1,28 @@
 // index.js
-// Purpose: Minimal Express server for ping endpoint
+// Purpose: Minimal Express server for ping endpoint (now with auth)
 // depends_on: []
 
 const express = require('express');
+const { requireAuth } = require('./common/authContext');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint for k8s probes
+// Health check endpoint for k8s probes (no auth required)
 app.get('/healthz', (req, res) => {
   res.status(200).json({ status: 'healthy' });
 });
 
-// Main ping endpoint
-app.get('/api/ping', (req, res) => {
+// Main ping endpoint (requires authentication)
+app.get('/api/ping', requireAuth, (req, res) => {
   res.status(200).json({
     status: 'ok',
     timestamp: Date.now(),
-    message: 'pong'
+    message: 'pong',
+    user: {
+      id: req.user.id,
+      email: req.user.email
+    }
   });
 });
 

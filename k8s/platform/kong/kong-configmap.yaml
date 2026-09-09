@@ -20,6 +20,14 @@ data:
               - /
             strip_path: false
 
+      - name: auth-service
+        url: http://auth.app.svc:80
+        routes:
+          - name: auth-route
+            paths:
+              - /api/auth
+            strip_path: false
+
       - name: ping-service
         url: http://ping.app.svc:80
         routes:
@@ -27,3 +35,8 @@ data:
             paths:
               - /api/ping
             strip_path: false
+            plugins:
+              - name: jwt
+                config:
+                  claims_to_verify:
+                    - exp

@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  namespace: app
+  labels:
+    app: auth
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth
+  template:
+    metadata:
+      labels:
+        app: auth
+    spec:
+      containers:
+      - name: auth
+        image: REGISTRY_URL/backbone-auth:latest
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        # MongoDB credentials (from Phase 1 secret)
+        - name: MONGO_APP_USER
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-username
+        - name: MONGO_APP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-password
+        - name: MONGO_APP_DB
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-db
+        # Redis credentials (from Phase 1 secret)
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-password
+              key: password
+        # JWT settings (from ConfigMap)
+        - name: JWT_ACCESS_EXPIRY
+          valueFrom:
+            configMapKeyRef:
+              name: auth-config
+              key: JWT_ACCESS_EXPIRY
+        - name: JWT_REFRESH_EXPIRY
+          valueFrom:
+            configMapKeyRef:
+              name: auth-config
+              key: JWT_REFRESH_EXPIRY
+        - name: FRONTEND_URL
+          valueFrom:
+            configMapKeyRef:
+              name: auth-config
+              key: FRONTEND_URL
+        volumeMounts:
+        - name: jwt-keys
+          mountPath: /secrets/jwt
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 2
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      volumes:
+      - name: jwt-keys
+        secret:
+          secretName: jwt-keypair

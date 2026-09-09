@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-config
+  namespace: app
+data:
+  JWT_ACCESS_EXPIRY: "15m"
+  JWT_REFRESH_EXPIRY: "7d"
+  # FRONTEND_URL will be filled by bootstrap-auth.sh from .env
+  FRONTEND_URL: "http://localhost:30080"
