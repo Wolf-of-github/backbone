@@ -139,6 +139,43 @@
         8472/udp   flannel VXLAN       (all <-> all)   [WIREGUARD=false, trusted network only]
       Cross-network (home/office <-> AWS VPC): WIREGUARD=true (encrypts the overlay) + NODE_EXTERNAL_IP
       set to each node's routable IP. Same-VPC: plain VXLAN is fine.
+
+    - FIREWALL / SECURITY-GROUP REQUIREMENTS (authoritative list - Terraform, cloud-init, and any
+      hand-provisioned node must match this exactly):
+
+        proto/port   direction                  needed for                       when
+        ----------   ------------------------   ------------------------------    -------------------
+        6443/tcp     agents  -> server          Kubernetes API / node join       always (multi-node)
+        10250/tcp    all    <-> all             kubelet (logs, exec, metrics)    always (multi-node)
+        51820/udp    all    <-> all             flannel WireGuard overlay        WIREGUARD=true (default)
+        8472/udp     all    <-> all             flannel VXLAN overlay            WIREGUARD=false
+        2379-2380/tcp servers <-> servers       embedded-etcd peer/client        Phase 6 HA (>1 server) only
+
+      - EXACTLY ONE overlay port is required: 51820/udp (WireGuard) OR 8472/udp (VXLAN), matching
+        WIREGUARD. Opening both is harmless; opening neither = cross-node pod traffic and in-cluster
+        DNS silently time out (no error, 100% packet loss). This is the single most common bring-up
+        failure.
+      - Source scoping: in one cloud, use a security group that references itself. Cross-network,
+        scope the overlay + kubelet ports to the other nodes' routable IPs (or the tailnet CIDR
+        100.64.0.0/10 when TAILSCALE=true - see below).
+      - Public ingress (80/443 to Kong) is NOT in this list - it is Phase 2, on the gateway node
+        only, never node-to-node.
+      - Egress: nodes need outbound 443/tcp to fetch images and the k3s installer (until the Phase 5
+        in-cluster registry). Terraform modules should allow egress-all unless there is a reason not to.
+
+    - TAILSCALE=true specifics (NAT'd / no-public-IP nodes, joined over a tailnet):
+      - The overlay still needs its UDP port (51820 or 8472) reachable between the nodes' TAILNET
+        addresses. If Tailscale negotiates a DIRECT connection (common on cloud VMs), that UDP rides
+        the nodes' PUBLIC IPs and is subject to the cloud security group - so the SG must still allow
+        51820/udp (or 8472/udp), sourced from 100.64.0.0/10. Only pure DERP-relayed tailnets avoid
+        this, and you should not rely on relay for the data plane.
+      - Every node must pin its k3s identity + flannel to the tailnet interface, or k3s picks the
+        default-route NIC (e.g. LAN wifi) and peers cannot route to it:
+          --node-ip=<tailscale ip -4>   --flannel-iface=tailscale0   --node-external-ip=<same>
+        cluster-up.sh and node-join.sh set all three when TAILSCALE=true; the Terraform cloud-init
+        MUST do the same.
+      - MTU: flannel auto-sizes its overlay MTU to ~1200 to fit inside the 1280-byte tailnet MTU.
+        Do not override it upward.
     - Failure: an agent dying -> its pods reschedule onto the others. The server is still a single
       point of failure until Phase 6 (embedded-etcd HA: 3 servers).
     - External services that will NEVER run in-cluster (managed RDS, a GPU box you won't put k3s on):
@@ -1216,19 +1253,29 @@
         node_labels (default backbone.dev/role=worker), spot (bool).
       | depends_on: []
     - terraform-worker-module | /terraform/modules/worker/main.tf
-      | Per-instance: aws_instance (spot when var.spot), an aws_security_group
-        allowing 6443/tcp,10250/tcp,51820/udp,8472/udp FROM the control plane /
-        the cluster SG + egress all, and `user_data` from cloudinit.yaml.tftpl.
-        Tags Name = "backbone-worker-${count.index}".
+      | Per-instance: aws_instance (spot when var.spot), an aws_security_group, and `user_data`
+        from cloudinit.yaml.tftpl. Tags Name = "backbone-worker-${count.index}".
+      | Security group - implement EXACTLY the "FIREWALL / SECURITY-GROUP REQUIREMENTS" table in
+        Diagram > horizontal-scale (do not free-hand the ports):
+          ingress 6443/tcp, 10250/tcp  from the cluster SG (self-reference) OR, cross-network,
+                                       from var.control_plane_cidr / the tailnet CIDR 100.64.0.0/10
+          ingress 51820/udp            when var.wireguard (default true)   } exactly one of these,
+          ingress 8472/udp             when !var.wireguard                 } keyed off var.wireguard
+          ingress 22/tcp               from var.ssh_cidr, only if var.key_name set (break-glass)
+          egress  all                  (image + installer fetch over 443)
+        New var: wireguard (bool, default true) - must match the server's WIREGUARD. Passed into
+        cloud-init so the agent install and the SG agree.
       | depends_on: [terraform-vars]
     - terraform-cloudinit | /terraform/modules/worker/cloudinit.yaml.tftpl
       | cloud-init that on first boot:
         (1) if var.tailscale: install tailscale, `tailscale up --authkey=... --hostname=backbone-worker-N`;
-        (2) run the k3s agent installer -
-            curl -sfL https://get.k3s.io | K3S_URL=${k3s_url} K3S_TOKEN=${k3s_token}
-              INSTALL_K3S_EXEC="agent --node-label=${node_labels}
-              $([ tailscale ] && echo --node-external-ip=$(tailscale ip -4))" sh -
-        Same command node-join.sh's emit_remote_script produces - keep them in sync.
+        (2) run the k3s agent installer. INSTALL_K3S_EXEC must be byte-for-byte what
+            node-join.sh's emit_remote_script produces for the same inputs:
+              agent --node-label=${node_labels}
+              [--node-external-ip=<ip>]                              when tailscale OR a public IP
+              [--node-ip=<tailscale ip -4> --flannel-iface=tailscale0]   when tailscale (REQUIRED -
+                without these, k3s binds the default-route NIC and peers cannot reach this node)
+        A `verify` step greps that this template and emit_remote_script still match.
       | depends_on: [terraform-cloudinit is the source of truth; node-join.sh mirrors it]
     - terraform-outputs | /terraform/outputs.tf
       | instance_ids, private_ips, tailscale_hostnames - consumed by
