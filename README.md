@@ -324,3 +324,145 @@ kubectl -n data rollout restart statefulset/redis   # or mongodb — pods reload
 | auth failures after a rotation | the Secret changed but the pod didn't restart — `kubectl -n data rollout restart statefulset/<name>` |
 | `mongodb-init` Job failed | `kubectl -n data logs job/mongodb-init`; safe to re-run `make data` |
 | `make verify-phase1` step 6 fails | data didn't survive a restart — check the PVCs are `Bound` and backed by `local-path` |
+
+---
+
+## Phase 2 — Edge
+
+Adds **Kong API Gateway** as the single public HTTP entry point, plus a minimal
+**ping service** (backend) and a **React frontend** served through Kong. This
+proves the full chain: Docker build → push to registry → k8s deploy → Kong
+routes requests end-to-end. No auth yet (Phase 3), no TLS yet (Phase 5) — HTTP
+only.
+
+Requires Phase 0 passed (`make verify` → `PHASE 0 OK`). Phase 1 is not strictly
+required (Kong/ping/frontend don't use MongoDB/Redis yet), but recommended to
+have the full stack.
+
+### 1. Set the registry URL
+
+Edit `.env` and set **`REGISTRY_URL`** in the Phase 2 block. This is where
+your built images are pushed (until Phase 5 brings up the in-cluster registry).
+
+```bash
+# Examples:
+REGISTRY_URL=docker.io/youruser        # Docker Hub
+REGISTRY_URL=ghcr.io/youruser          # GitHub Container Registry
+```
+
+**Then authenticate Docker** on the control-plane host:
+
+```bash
+docker login                                      # Docker Hub
+# or
+docker login ghcr.io                              # GitHub (needs a PAT with write:packages)
+```
+
+If using a **private** registry, create a pull secret (Phase 5 automates this):
+
+```bash
+kubectl -n app create secret docker-registry registry-credentials \
+  --docker-server=<registry> \
+  --docker-username=<user> \
+  --docker-password=<token>
+```
+
+### 2. Build and deploy
+
+```bash
+make phase2
+```
+
+**Does, in order:**
+
+| Sub-step | What happens |
+|---|---|
+| `make edge` → `build-push.sh` | builds `ping` and `frontend` Docker images (multi-stage), tags with git SHA + `latest`, pushes both to `REGISTRY_URL` |
+| `make edge` → Kong | applies `k8s/platform/kong/*` — ConfigMap (declarative routes), Deployment (2 replicas, DB-less mode), proxy Service (NodePort 30080), admin Service (ClusterIP only) |
+| `make edge` → ping | applies `k8s/app/ping/*` — Deployment (2 replicas), Service (ClusterIP) |
+| `make edge` → frontend | applies `k8s/app/frontend/*` — Deployment (2 replicas, NGINX serving the built React SPA), Service (ClusterIP) |
+| `make verify-phase2` | runs end-to-end checks (below) |
+
+**Expect** the run to end with:
+
+```
+[1/5] Checking Kong deployment...              OK Kong deployment ready (2/2)
+[2/5] Checking ping and frontend deployments...OK Ping and frontend deployments ready (2/2 each)
+[3/5] Checking Kong proxy Service...           OK Kong proxy endpoint: http://<node-ip>:30080
+[4/5] Testing end-to-end HTTP routing...       OK /api/ping returns ok
+                                                OK Frontend (/) returns HTML
+[5/5] Verifying Kong Admin API is ClusterIP... OK Kong Admin API is accessible from inside the cluster
+
+PHASE 2 OK
+
+Access your platform:
+  Frontend: http://<node-ip>:30080/
+  Ping API: http://<node-ip>:30080/api/ping
+```
+
+**Note:** The node IP shown is the first **Ready** node (skips down nodes).
+
+### 3. Access the platform
+
+**From your browser** (if the control plane has a public IP or is reachable):
+
+```
+http://<control-plane-public-ip>:30080/
+```
+
+You should see the React frontend ("Backbone - Phase 2") with a green message:
+`Backend status: ok (pong)`. This proves Kong routed `/` to the frontend and
+the frontend's fetch to `/api/ping` worked through Kong.
+
+**From the command line:**
+
+```bash
+# Get the public endpoint
+ENDPOINT=$(kubectl -n platform get svc kong-proxy -o jsonpath='{.spec.ports[0].nodePort}')
+NODE_IP=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True")) | .status.addresses[] | select(.type=="InternalIP") | .address' | head -1)
+
+# Test the ping API
+curl http://${NODE_IP}:${ENDPOINT}/api/ping
+# {"status":"ok","timestamp":...,"message":"pong"}
+
+# Test the frontend
+curl http://${NODE_IP}:${ENDPOINT}/
+# <html>...</html> (React SPA)
+```
+
+### Kong control wrapper
+
+```bash
+./scripts/kongctl.sh health    # Kong health status
+./scripts/kongctl.sh routes    # List configured routes
+./scripts/kongctl.sh reload    # Instructions for reloading declarative config
+```
+
+### Rebuild and redeploy
+
+After changing code in `services/ping/` or `services/frontend/`:
+
+```bash
+make build-push      # Rebuild images and push
+kubectl -n app rollout restart deployment/ping deployment/frontend
+```
+
+After changing Kong config (`k8s/platform/kong/kong-configmap.yaml`):
+
+```bash
+kubectl apply -f k8s/platform/kong/kong-configmap.yaml
+kubectl -n platform rollout restart deployment/kong
+```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `build-push.sh`: `repository name must be lowercase` | `REGISTRY_URL` in `.env` must be all lowercase |
+| `docker push` fails with `unauthorized` | run `docker login` (or `docker login ghcr.io` for GitHub) |
+| Kong pods `OOMKilled` or `CrashLoopBackOff` | increase memory limit in `k8s/platform/kong/deployment.yaml` to `1Gi` or higher |
+| `make verify-phase2` hangs on "Testing /api/ping" | a node is down — script only uses Ready nodes, but may be slow; check `kubectl get nodes` |
+| Frontend loads but shows error fetching `/api/ping` | check Kong routes with `./scripts/kongctl.sh routes`; check ping pods are Running |
+| `ImagePullBackOff` on ping or frontend | `REGISTRY_URL` is wrong, or images weren't pushed, or (private registry) the `registry-credentials` secret is missing |
+
+---

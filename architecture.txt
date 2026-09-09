@@ -1120,10 +1120,32 @@
       - README gains a "Phase 2 - Edge" section: setting REGISTRY_URL, `make phase2`, expected output,
         and how to access the frontend and API from outside the cluster.
 
+- Phase 2 - what is accomplished
+  The public HTTP gateway. `make phase2` on a Phase 0 cluster delivers:
+  1. Kong API Gateway - single public entry point (NodePort 30080) in DB-less/declarative mode. Routes
+     `/` to the frontend and `/api/*` to backend services. Admin API is ClusterIP-only (internal).
+  2. Ping service - minimal Express backend (`GET /api/ping` returns `{"status":"ok"}`), 2 replicas in
+     `app` namespace. Proves the Docker build → registry → k8s → Kong → service chain works.
+  3. React frontend - Vite-built SPA served by NGINX, 2 replicas in `app` namespace. On mount, fetches
+     `/api/ping` through Kong to prove end-to-end routing.
+  4. Build pipeline - `build-push.sh` builds multi-stage Docker images (Node build → minimal runtime),
+     tags with git SHA + `latest`, pushes to `REGISTRY_URL` (Docker Hub or GitHub Container Registry).
+  5. Kong control wrapper - `kongctl.sh` provides health checks, route listing, and reload instructions
+     for the declarative config.
+  6. Verification gate - `make verify-phase2` tests Kong deployment, service deployments, end-to-end
+     HTTP routing from outside the cluster, and Admin API security -> prints "PHASE 2 OK".
+  Plus Makefile targets (`make phase2`, `make build-push`, `make edge`), .env Phase 2 block (REGISTRY_URL),
+  and updated README with full Phase 2 operator guide.
+  NOT included (by design): authentication (Phase 3), TLS/HTTPS (Phase 5), in-cluster registry (Phase 5),
+  observability (Phase 5), CI/CD (Phase 5).
+  Status: DONE. Verified on a Phase 1 cluster (1 control plane + 1 worker, with the worker down during
+  verification - script filters for Ready nodes only). `make verify-phase2` -> "PHASE 2 OK".
+  Tagged `phase-2-complete`.
+
 - Files (Phase 2 - Edge)
   Format: file_name | file_path | description | depends_on[]
   Kong runs in `platform` ns (declarative/DB-less). ping-service and frontend run in `app` ns.
-  Images are built and pushed to the Phase 0 registry, then deployed.
+  Images are built and pushed to REGISTRY_URL, then deployed.
 
   - Kong gateway
     - kong-config.yaml | /k8s/platform/kong/kong-configmap.yaml
