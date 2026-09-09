@@ -471,6 +471,8 @@ kubectl -n platform rollout restart deployment/kong
 
 Adds **JWT-based authentication** via a dedicated auth service. Users register and login to get RS256-signed access tokens (15 min) and refresh tokens (7 days). The auth service stores users in MongoDB and refresh tokens in Redis. Protected routes (like `/api/ping`) now require a valid JWT. The frontend gains login/register forms with automatic token refresh.
 
+**Architecture note:** Kong routes requests without authentication at the gateway level. Backend services verify JWT tokens themselves using shared middleware (`services/common/authContext.js`) for maximum flexibility and service autonomy.
+
 Requires Phase 0, Phase 1, and Phase 2 complete (`make verify`, `make verify-phase1`, `make verify-phase2` all pass).
 
 ### 1. Configure JWT settings
@@ -495,7 +497,7 @@ make phase3
 
 | Sub-step | What happens |
 |---|---|
-| `make auth` → `jwt-keys.sh` | Generates RS256 keypair if not present, creates `jwt-keypair` secret (app ns) and `jwt-public-key` secret (platform ns) |
+| `make auth` → `jwt-keys.sh` | Generates RS256 keypair if not present, creates `jwt-keypair` secret (app ns) for auth service signing |
 | `make auth` → `bootstrap-auth.sh` | Creates `auth-config` ConfigMap, updates Kong with auth routes, builds and pushes auth service image, deploys auth service, rebuilds ping (with auth middleware) and frontend (with login/register UI) |
 | `make verify-phase3` | Runs 8 end-to-end checks (below) |
 
@@ -552,8 +554,8 @@ To add auth to a new backend service:
 
 1. **Copy the shared auth middleware:**
    ```bash
-   # In your service's Dockerfile:
-   COPY --chown=appuser:appgroup ../common ./src/common
+   # In your service's Dockerfile (assuming repo root build context):
+   COPY --chown=appuser:appgroup services/common ./src/common
    ```
 
 2. **Add jsonwebtoken dependency:**
