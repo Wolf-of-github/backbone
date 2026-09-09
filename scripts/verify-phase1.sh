@@ -82,6 +82,9 @@ printf '%s\n' "$out" | grep -qx hello    || fail "Redis SET/GET round-trip faile
 ok "Redis requires AUTH; SET/GET/DEL round-trip works"
 
 # 5. MongoDB round-trip as the app user + least-privilege holds.
+#    Note: `listDatabases` is NOT a valid probe - MongoDB silently returns an
+#    empty list (authorizedDatabases fallback) rather than erroring. Use a write
+#    to a DB the user has no role on, and a user-admin op; both must be denied.
 log "[5/6] MongoDB app-user round-trip + least-privilege"
 out="$(run_in_pod mongo:7.0 <<'EOF'
 set -e
@@ -89,17 +92,26 @@ run() { mongosh "$MONGO_URI" --quiet --eval "$1"; }
 run "db.verify.insertOne({ k: '$RUN' })" >/dev/null
 run "print(db.verify.findOne({ k: '$RUN' }).k)"
 run "db.verify.drop()" >/dev/null
-# an admin op MUST be denied for the least-privilege user
-if run "db.adminCommand({ listDatabases: 1 })" 2>&1 | grep -qi "not authorized\|unauthorized"; then
-  echo LP_OK
-else
-  echo LP_BAD
-fi
+
+# a) authenticated as the app user, scoped to the app DB?
+run "const a = db.runCommand({connectionStatus:1}).authInfo.authenticatedUserRoles;
+     if (a.length === 1 && a[0].role === 'readWrite' && a[0].db === '$MONGO_APP_DB') print('AUTH_OK');
+     else print('AUTH_BAD ' + JSON.stringify(a));"
+
+# b) writing to another database MUST be denied
+run "try { db.getSiblingDB('admin').x.insertOne({y:1}); print('WRITE_BAD'); }
+     catch (e) { print(e.codeName === 'Unauthorized' ? 'WRITE_DENIED_OK' : 'WRITE_ERR ' + e.codeName); }"
+
+# c) a user-admin op MUST be denied
+run "try { db.getSiblingDB('$MONGO_APP_DB').createUser({user:'x$RUN',pwd:'x',roles:[]}); print('ADMIN_BAD'); }
+     catch (e) { print(e.codeName === 'Unauthorized' ? 'ADMIN_DENIED_OK' : 'ADMIN_ERR ' + e.codeName); }"
 EOF
 )"
-printf '%s\n' "$out" | grep -qx "$RUN" || fail "MongoDB app-user insert/read/drop failed"
-printf '%s\n' "$out" | grep -q LP_OK   || fail "MongoDB app user is NOT least-privilege (admin op allowed)"
-ok "app user does I/O on ${MONGO_APP_DB}; admin ops denied"
+printf '%s\n' "$out" | grep -qx "$RUN"           || fail "MongoDB app-user insert/read/drop failed"
+printf '%s\n' "$out" | grep -q AUTH_OK           || fail "app user not authenticated as readWrite@${MONGO_APP_DB}: $out"
+printf '%s\n' "$out" | grep -q WRITE_DENIED_OK   || fail "app user could write outside ${MONGO_APP_DB} (not least-privilege): $out"
+printf '%s\n' "$out" | grep -q ADMIN_DENIED_OK   || fail "app user could run a user-admin op (not least-privilege): $out"
+ok "app user does I/O on ${MONGO_APP_DB}; cross-DB writes and admin ops denied"
 
 # 6. Persistence across a pod delete.
 log "[6/6] data survives a pod restart"
