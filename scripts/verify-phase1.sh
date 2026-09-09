@@ -33,6 +33,7 @@ run_in_pod() {
     --stdin --rm --quiet --pod-running-timeout=120s \
     --env="REDIS_PASSWORD=$REDIS_PASSWORD" \
     --env="MONGO_URI=$MONGO_URI" \
+    --env="MONGO_APP_DB=$MONGO_APP_DB" \
     --env="RUN=$RUN" \
     --command -- sh -s
 }
@@ -102,9 +103,9 @@ run "const a = db.runCommand({connectionStatus:1}).authInfo.authenticatedUserRol
 run "try { db.getSiblingDB('admin').x.insertOne({y:1}); print('WRITE_BAD'); }
      catch (e) { print(e.codeName === 'Unauthorized' ? 'WRITE_DENIED_OK' : 'WRITE_ERR ' + e.codeName); }"
 
-# c) a user-admin op MUST be denied
-run "try { db.getSiblingDB('$MONGO_APP_DB').createUser({user:'x$RUN',pwd:'x',roles:[]}); print('ADMIN_BAD'); }
-     catch (e) { print(e.codeName === 'Unauthorized' ? 'ADMIN_DENIED_OK' : 'ADMIN_ERR ' + e.codeName); }"
+# c) a user-admin op MUST be denied (any throw = denied; success = privilege escalation)
+run "try { db.getSiblingDB('$MONGO_APP_DB').createUser({user:'x$RUN',pwd:'xxxxxxxx',roles:[]}); print('ADMIN_BAD'); }
+     catch (e) { print(/not authorized|unauthorized/i.test(e.message) ? 'ADMIN_DENIED_OK' : 'ADMIN_ERR ' + e.message); }"
 EOF
 )"
 printf '%s\n' "$out" | grep -qx "$RUN"           || fail "MongoDB app-user insert/read/drop failed"
