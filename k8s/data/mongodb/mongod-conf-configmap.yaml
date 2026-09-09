@@ -1,0 +1,29 @@
+# mongod.conf for the Phase 1 MongoDB StatefulSet.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# Single instance, auth on. The replica-set line is commented until Phase 6
+# (Backup/DR adds a 3-member replica set + keyfile internal auth).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongod-conf
+  namespace: data
+  labels:
+    app.kubernetes.io/name: mongodb
+    backbone.dev/tier: data
+data:
+  mongod.conf: |
+    net:
+      bindIp: 0.0.0.0
+      port: 27017
+    storage:
+      dbPath: /data/db
+      wiredTiger:
+        engineConfig:
+          # Small default so Mongo fits a 1-2 GB control-plane node. Raise on
+          # bigger hardware (rule of thumb: ~50% of (RAM - 1 GB)).
+          cacheSizeGB: 0.25
+    security:
+      authorization: enabled
+    # replication:
+    #   replSetName: rs0        # Phase 6

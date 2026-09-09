@@ -1,0 +1,80 @@
+# Single-replica Redis StatefulSet (Phase 1). No HA / Sentinel yet (Phase 6).
+# depends_on: [k8s/base/namespaces.yaml, k8s/base/storageclass.yaml,
+#              scripts/data-secrets.sh, k8s/data/redis/conf-configmap.yaml]
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: data
+  labels:
+    app.kubernetes.io/name: redis
+    backbone.dev/tier: data
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        backbone.dev/tier: data
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999          # `redis` user in the official image
+        runAsGroup: 999
+        fsGroup: 999            # make the PVC group-writable for that user
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          args:
+            - /etc/redis/redis.conf
+            - --requirepass
+            - $(REDIS_PASSWORD)
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-password
+                  key: password
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/redis
+              readOnly: true
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'redis-cli -a "$REDIS_PASSWORD" ping | grep -q PONG']
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: conf
+          configMap:
+            name: redis-conf
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

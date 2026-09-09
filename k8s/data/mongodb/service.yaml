@@ -1,0 +1,18 @@
+# Headless Service for stable in-cluster DNS: mongodb.data.svc.cluster.local
+# depends_on: [k8s/data/mongodb/statefulset.yaml]
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: data
+  labels:
+    app.kubernetes.io/name: mongodb
+    backbone.dev/tier: data
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: mongodb
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: mongo

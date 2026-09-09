@@ -212,3 +212,94 @@ join token. Workers must be uninstalled on each worker.
 | `make node-join`: `Permission denied (publickey)` | control plane can't SSH the worker — fix `~/.ssh/config` or set `SSH_KEY` in `.env` |
 | need the join token again | on the control plane: `sudo cat /var/lib/rancher/k3s/server/node-token` |
 | server won't start | `sudo journalctl -u k3s -f`; confirm `K3S_SERVER_ADDR` resolves and `:6443` is free |
+
+---
+
+## Phase 1 — Data layer
+
+Brings up **MongoDB** and **Redis** — each a single-replica StatefulSet in the
+`data` namespace, on the `local-path` default StorageClass from Phase 0. This is
+what auth (Phase 3) and the async workers (Phase 4) build on. No replica sets /
+HA yet (Phase 6), and nothing is exposed outside the cluster (Kong is Phase 2) —
+you reach these only from pods inside the cluster.
+
+Requires a cluster that already passed Phase 0 (`make verify` → `PHASE 0 OK`).
+
+### 1. Set the data credentials
+
+Edit `.env` and fill the **Phase 1 — Data layer** block:
+
+| Variable | Set to |
+|---|---|
+| `MONGO_ROOT_USER` | `root` (default is fine) |
+| `MONGO_ROOT_PASSWORD` | `openssl rand -base64 24` |
+| `MONGO_APP_USER` | `backbone_app` (default is fine) |
+| `MONGO_APP_PASSWORD` | `openssl rand -base64 24` |
+| `MONGO_APP_DB` | `backbone` (default is fine) |
+| `REDIS_PASSWORD` | `openssl rand -base64 24` |
+
+**Record the three passwords somewhere safe** — `data-secrets.sh` does not
+generate or print them, and losing them means losing access to the data.
+
+### 2. Bring up the data layer
+
+```bash
+make phase1
+```
+
+**Does, in order:**
+
+| Sub-step | What happens |
+|---|---|
+| `make data` → `data-secrets.sh` | creates Secrets `mongodb-credentials` (root + least-privilege app user) and `redis-password` in `data`, from `.env` |
+| `make data` → Redis | applies `k8s/data/redis/*`, waits for `statefulset/redis` |
+| `make data` → MongoDB | applies `k8s/data/mongodb/*`, waits for `statefulset/mongodb` |
+| `make data` → init Job | runs `mongodb-init` — creates the app DB + `readWrite`-only app user |
+| `make verify-phase1` | runs the acceptance checks (below) |
+
+**Expect** the run to end with:
+
+```
+[1/6] StatefulSets Ready          OK redis and mongodb StatefulSets Ready (1/1)
+[2/6] secrets                     OK mongodb-credentials (5 keys) and redis-password (1 key) present
+[3/6] PVCs Bound                  OK data-redis-0 and data-mongodb-0 Bound
+[4/6] Redis auth + round-trip     OK Redis requires AUTH; SET/GET/DEL round-trip works
+[5/6] MongoDB app-user round-trip OK app user does I/O on backbone; admin ops denied
+[6/6] data survives a pod restart OK Redis and MongoDB data survived deleting their pods
+
+PHASE 1 OK
+```
+
+`make verify` (the Phase 0 gate) still passes — Phase 1 does not touch the substrate.
+
+### 3. Connect from inside the cluster
+
+```bash
+# Redis
+kubectl -n data run redis-cli --rm -it --restart=Never --image=redis:7.2-alpine -- \
+  redis-cli -h redis.data.svc -a "$REDIS_PASSWORD"
+
+# MongoDB (as the least-privilege app user)
+kubectl -n data run mongosh --rm -it --restart=Never --image=mongo:7.0 -- \
+  mongosh "mongodb://$MONGO_APP_USER:$MONGO_APP_PASSWORD@mongodb.data.svc/$MONGO_APP_DB"
+```
+
+Service DNS: `redis.data.svc.cluster.local:6379`, `mongodb.data.svc.cluster.local:27017`.
+
+### Rotate a credential
+
+```bash
+$EDITOR .env                                    # change the value
+make secrets-data                               # update the Secret object
+kubectl -n data rollout restart statefulset/redis   # or mongodb — pods reload on restart
+```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `data-secrets.sh`: `.env is missing required values` | fill every Phase 1 var in `.env` — none may be blank |
+| pod stuck `Pending` | `kubectl -n data describe pod <name>` — usually the default StorageClass is missing; re-run `make base` |
+| auth failures after a rotation | the Secret changed but the pod didn't restart — `kubectl -n data rollout restart statefulset/<name>` |
+| `mongodb-init` Job failed | `kubectl -n data logs job/mongodb-init`; safe to re-run `make data` |
+| `make verify-phase1` step 6 fails | data didn't survive a restart — check the PVCs are `Bound` and backed by `local-path` |
