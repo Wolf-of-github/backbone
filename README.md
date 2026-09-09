@@ -46,11 +46,13 @@ address workers will use to reach this machine's API server:
 | single node | `127.0.0.1` (or the private IP) | — |
 | **all nodes in one VPC / LAN** (e.g. several EC2s in one security group) | this machine's **private** IP | — |
 | nodes on different networks, this machine **has** a public IP | that public IP / DNS name | — |
-| nodes on different networks, this machine has **no** public IP (home box, NAT) | this machine's Tailscale IP (`tailscale ip -4`) | `TAILSCALE=true`, `WIREGUARD=false` |
+| nodes on different networks, this machine has **no** public IP (home box, NAT) | this machine's Tailscale IP (`tailscale ip -4`) | `TAILSCALE=true` (keep `WIREGUARD=true`) |
 
 Defaults (`TAILSCALE=false`, `WIREGUARD=true`) are right for the first three
 rows. For the Tailscale row, `tailscale` must be installed and `sudo tailscale up`
-already run on this machine.
+already run on this machine — and keep `WIREGUARD=true`: the k3s scripts then
+pin the node to `tailscale0` (`--node-ip` / `--flannel-iface`) and run the pod
+overlay as WireGuard over the tunnel. (Plain VXLAN over Tailscale is unreliable.)
 
 ---
 
@@ -155,7 +157,7 @@ make verify
 ```bash
 K3S_URL=https://<server-address>:6443 \
 K3S_TOKEN=<value from the server's .secrets/cluster-join.env> \
-TAILSCALE=true WIREGUARD=false \        # only if the cluster is Tailscale-based
+TAILSCALE=true \                        # only if the cluster is Tailscale-based
 ./scripts/node-join.sh
 ```
 
@@ -169,10 +171,29 @@ Open **between nodes** (e.g. one cloud security group referencing itself):
 |---|---|
 | `6443/tcp` | Kubernetes API — workers → control plane |
 | `10250/tcp` | kubelet — all nodes ↔ all nodes |
-| `51820/udp` | pod network (WireGuard) — `WIREGUARD=true` |
+| `51820/udp` | pod network (WireGuard) — `WIREGUARD=true` (the default) |
 | `8472/udp` | pod network (VXLAN) — `WIREGUARD=false` |
 
-Over Tailscale these ride the tunnel; no cloud firewall rules needed for them.
+You need **exactly one** of the two pod-network ports, matching `WIREGUARD`.
+Open neither and cross-node pods + in-cluster DNS silently time out (100% packet
+loss, no error) — this is the most common bring-up failure.
+
+**Over Tailscale you still need the pod-network port.** Tailscale usually
+negotiates a *direct* connection between cloud VMs, so that UDP rides the nodes'
+public IPs and hits the cloud security group anyway. Allow `51820/udp` (or
+`8472/udp`) from the tailnet CIDR `100.64.0.0/10`. Only `6443` / `10250` reliably
+ride the tunnel unaided.
+
+After a join, sanity-check the overlay by hand:
+
+```bash
+kubectl run a --image=nicolaka/netshoot --restart=Never \
+  --overrides='{"spec":{"nodeName":"<the-worker-node>"}}' -it --rm -- \
+  ping -c3 <IP-of-any-pod-on-the-control-plane>
+```
+
+0% loss = overlay healthy. Timeouts = the port above isn't open, or (Tailscale)
+the node didn't pin to `tailscale0`.
 
 ---
 
@@ -264,7 +285,7 @@ make phase1
 [2/6] secrets                     OK mongodb-credentials (5 keys) and redis-password (1 key) present
 [3/6] PVCs Bound                  OK data-redis-0 and data-mongodb-0 Bound
 [4/6] Redis auth + round-trip     OK Redis requires AUTH; SET/GET/DEL round-trip works
-[5/6] MongoDB app-user round-trip OK app user does I/O on backbone; admin ops denied
+[5/6] MongoDB app-user round-trip OK app user does I/O on backbone; cross-DB writes and admin ops denied
 [6/6] data survives a pod restart OK Redis and MongoDB data survived deleting their pods
 
 PHASE 1 OK

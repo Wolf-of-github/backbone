@@ -191,7 +191,10 @@
         Prereqs on a joining worker: Linux + `curl` + `sudo` ONLY (no Docker, no kubectl).
       - `scripts/cluster-up.sh` installs k3s server with `--cluster-init`, `--disable=traefik`,
         `--flannel-backend=wireguard-native` when WIREGUARD=true, `--tls-san`/`--node-external-ip`/role
-        label from .env. Caches the join token to `.secrets/cluster-join.env` (gitignored).
+        label from .env. When TAILSCALE=true it also pins `--node-ip=<tailscale ip -4>` and
+        `--flannel-iface=tailscale0` (without these k3s binds the default-route NIC - e.g. LAN wifi -
+        and peers on another network cannot reach it; node-join.sh does the same on the worker).
+        Caches the join token to `.secrets/cluster-join.env` (gitignored).
       - No in-cluster registry in Phase 0 - workers pull from public registries until Phase 5 stands up
         the real one (authenticated, behind Kong + TLS).
       - Why not k3d/kind ("k3s in Docker") even for a single machine: they run on one Docker daemon =
@@ -305,6 +308,13 @@
       - Every file in "Files (Phase 0 - Substrate)" exists with real content (no STUB markers).
       - On a Linux server: `make phase0` -> "PHASE 0 OK" and `make` exits 0; `make down` uninstalls it.
       - A second Linux box joins with one command, appears Ready, and `make verify` passes multi-node.
+      - Cross-node pod traffic actually works: a pod on the worker can reach a pod/Service on the
+        server by ClusterIP/DNS (and vice versa). NOTE: verify-phase0.sh's step 5 only runs one pod
+        per node in isolation - it does NOT catch a broken overlay. Confirm by hand after a join:
+        `kubectl run a --image=nicolaka/netshoot --overrides='{"spec":{"nodeName":"<worker>"}}' -it
+        --rm -- ping -c3 <a-pod-IP-on-the-server>`. If it times out: the overlay UDP port
+        (51820 or 8472) is not open between nodes, or - with TAILSCALE=true - `--node-ip` /
+        `--flannel-iface=tailscale0` were not applied. (Phase 1 bring-up hit exactly this.)
       - No .env, ./kubeconfig, or secret material (incl. the join token) committed; scripts pass
         `bash -n` (shellcheck where available); k8s/base passes `kubectl apply --dry-run=server`.
       - README covers the flow and lets a new person reproduce it unaided.
@@ -698,14 +708,16 @@
       | Require Linux + curl + sudo; require_vars K3S_VERSION CLUSTER_NAME K3S_SERVER_ADDR;
         normalise K3S_VERSION; install k3s server (`--cluster-init --tls-san=<addr> --disable=traefik`,
         `--flannel-backend=wireguard-native` when WIREGUARD=true, `--node-external-ip`, role node-label,
-        `--write-kubeconfig-mode=0644`); write ./kubeconfig (server URL = K3S_SERVER_ADDR, 0600);
+        `--node-ip`+`--flannel-iface=tailscale0` when TAILSCALE=true, `--write-kubeconfig-mode=0644`);
+        write ./kubeconfig (server URL = K3S_SERVER_ADDR, 0600);
         cache .secrets/cluster-join.env (K3S_URL + node-token, umask 077); `kubectl wait` node Ready;
         print both node-join invocations + node-to-node ports. Idempotent.
       | depends_on: [.env.example, scripts/lib.sh]
     - node-join.sh | /scripts/node-join.sh
       | Join a machine as a k3s AGENT. Local mode (on the worker): K3S_URL + K3S_TOKEN from env or
-        .secrets/cluster-join.env, then `curl get.k3s.io | ... INSTALL_K3S_EXEC="agent ..." sh -`; prints
-        required ports. Remote mode (`node-join.sh user@host` on the server): ssh this script to the
+        .secrets/cluster-join.env, then `curl get.k3s.io | ... INSTALL_K3S_EXEC="agent ..." sh -`
+        (adds `--node-ip`+`--flannel-iface=tailscale0` when TAILSCALE=true, same as cluster-up.sh);
+        prints required ports. Remote mode (`node-join.sh user@host` on the server): ssh this script to the
         target with the cached creds and run it there.
       | depends_on: [scripts/cluster-up.sh, scripts/lib.sh]
     - cluster-down.sh | /scripts/cluster-down.sh
