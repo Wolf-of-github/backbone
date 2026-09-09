@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 load_env
 need kubectl
 need curl
+need jq
 
 fail() { die "verify-phase2: $*"; }
 
@@ -47,9 +48,8 @@ KONG_SVC_TYPE=$(kubectl -n platform get svc kong-proxy -o jsonpath='{.spec.type}
 
 if [ "$KONG_SVC_TYPE" = "NodePort" ]; then
   NODE_PORT=$(kubectl -n platform get svc kong-proxy -o jsonpath='{.spec.ports[0].nodePort}')
-  # Get only Ready nodes
-  READY_NODES=$(kubectl get nodes -o jsonpath='{.items[?(@.status.conditions[?(@.type=="Ready" && @.status=="True")])].status.addresses[?(@.type=="InternalIP")].address}')
-  NODE_IP=$(echo $READY_NODES | awk '{print $1}')
+  # Get only Ready nodes (filter by Ready status)
+  NODE_IP=$(kubectl get nodes -o json | jq -r '.items[] | select(.status.conditions[] | select(.type=="Ready" and .status=="True")) | .status.addresses[] | select(.type=="InternalIP") | .address' | head -1)
   [ -z "$NODE_IP" ] && fail "No Ready nodes found"
   ENDPOINT="http://${NODE_IP}:${NODE_PORT}"
 else
