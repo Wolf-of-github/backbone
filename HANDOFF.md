@@ -1,10 +1,10 @@
 # Backbone Project Handoff
 
 **Date:** 2026-09-10
-**Status:** Phase 3 (Authentication) Complete & Merged to Master
+**Status:** Phase 4 (Async Jobs) Complete & Merged to Master
 **Branch:** master
-**Tag:** phase-3-complete
-**Last Verified:** All verification gates passing
+**Tag:** phase-4-complete (pending)
+**Last Verified:** All verification gates passing (Phase 0, 1, 3, 4)
 
 ---
 
@@ -41,7 +41,7 @@
   - Now includes login/register UI (Phase 3)
 - **Verification:** `make verify-phase2` passes
 
-#### Phase 3 — Authentication (✅ Just Completed)
+#### Phase 3 — Authentication (Complete)
 - **Auth service** (2 replicas) in `app` namespace
   - Express + Passport.js
   - JWT RS256 tokens (access: 15min, refresh: 7d)
@@ -65,6 +65,31 @@
 - **Kong configuration** updated to route auth endpoints
   - No JWT verification at gateway (services handle auth themselves)
 - **Verification:** `make verify-phase3` passes (8/8 checks)
+
+#### Phase 4 — Async Jobs (✅ Just Completed)
+- **jobs-api service** (2 replicas) in `app` namespace
+  - Express + BullMQ producer
+  - REST API for job management (POST/GET)
+  - Auth-protected via requireAuth middleware (Phase 3)
+  - Endpoints: `POST /api/jobs`, `GET /api/jobs/:id`, `GET /api/jobs`
+  - Job storage in MongoDB (beyond Redis retention)
+- **worker service** (auto-scaling 1-10 replicas) in `app` namespace
+  - BullMQ consumer Deployment (separate from web services)
+  - Pulls jobs from Redis queue, dispatches to handlers
+  - Example handlers: `helloWorld`, `failingJob`
+  - HPA configured for CPU-based scaling (70% target)
+  - Graceful shutdown (60s termination grace period)
+- **Shared queue library** in `services/common/queue.js`
+  - createQueue/createWorker/createQueueEvents functions
+  - JOB_TYPES enum, default retry config (3 attempts, exponential backoff)
+  - Available to all services for async work
+- **Kong configuration** updated with `/api/jobs` route
+- **Job features:**
+  - Owner-based access control (IDOR prevention)
+  - Retry logic: 3 attempts with 2s/4s/8s backoff
+  - Durable storage in MongoDB
+  - Worker resilience (jobs survive pod restarts)
+- **Verification:** `make verify-phase4` passes (7/7 checks)
 
 ### 🔄 Architecture Decision: Service-Level Authentication
 
@@ -252,6 +277,14 @@ To add auth to a new backend service:
 - No password reset flow - requires manual intervention currently
 - No rate limiting on auth endpoints - could be DoS target
 
+### Phase 4 Specific Notes
+- Jobs stored in MongoDB permanently (removeOnComplete: 100 only purges from Redis)
+- Worker concurrency defaults to 5 (configurable via `WORKER_CONCURRENCY` env)
+- HPA scales workers based on CPU only (queue-depth metrics in Phase 5)
+- No job cancellation API yet - jobs run to completion or failure
+- No job scheduling (delayed jobs) - immediate execution only
+- Example handlers (helloWorld, failingJob) - add custom handlers in `services/worker/src/handlers/`
+
 ### Troubleshooting
 
 | Issue | Solution |
@@ -264,11 +297,13 @@ To add auth to a new backend service:
 
 ---
 
-## Next Steps (Phase 4+)
+## Next Steps (Phase 5+)
 
-### Recommended Next Phase: Async Workers (Phase 4)
-- BullMQ job queue for background processing
-- Worker deployment separate from web services
+### Recommended Next Phase: Observability (Phase 5)
+- Prometheus + Grafana for metrics and monitoring
+- Loki + Promtail for log aggregation
+- Queue-depth based auto-scaling for workers
+- Alert manager for notifications
 - Job status tracking and retry logic
 - Example: Image processing, report generation, email sending
 
@@ -334,6 +369,9 @@ For questions or issues:
 - [x] Phase 3 deployed and verified
 - [x] Phase 3 merged to master
 - [x] Phase 3 tagged as `phase-3-complete`
+- [x] Phase 4 deployed and verified
+- [x] Phase 4 merged to master
+- [ ] Phase 4 tagged as `phase-4-complete` (pending)
 - [x] All secrets documented
 - [x] Environment configuration documented
 - [x] Common tasks documented
@@ -341,10 +379,11 @@ For questions or issues:
 - [x] Next steps outlined
 - [x] Git branches documented
 - [x] Architecture decision for service-level auth documented
+- [x] Async job queue system implemented and documented
 - [x] Handoff documentation updated
 
-**Status:** ✅ Ready for handoff. Platform operational with authentication. Phase 3 merged to master.
+**Status:** ✅ Ready for handoff. Platform operational with authentication and async job processing. Phase 4 merged to master.
 
 ---
 
-*Last updated: 2026-09-10 by Claude Code (Phase 3 merge to master)*
+*Last updated: 2026-09-10 by Claude Code (Phase 4 implementation complete)*

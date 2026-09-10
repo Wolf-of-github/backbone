@@ -657,8 +657,9 @@
   - Phase 3 - Identity ✅ COMPLETE
     - Auth service (Passport.js + JWT) issues tokens; backend services verify tokens via shared middleware
     - Test IDOR / deny-by-default here
-  - Phase 4 - Async work
-    - BullMQ workers (separate Deployment, pulls from Redis) - after real jobs exist
+  - Phase 4 - Async work ✅ COMPLETE
+    - BullMQ workers (separate Deployment, pulls from Redis) with jobs-api for job management
+    - Auto-scaling workers (1-10 replicas), retry logic, IDOR prevention, graceful shutdown
   - Phase 5 - Operate
     - CI/CD (Gitea + Drone) - replaces manual push/apply; deliberately after manual path proven
     - Observability (PLG stack) - no hard dependents; can slot earlier for bring-up visibility
@@ -1868,6 +1869,38 @@
         `bash -n` (shellcheck where available); k8s/app/jobs-api/ and k8s/app/worker/ pass `kubectl apply --dry-run=server`.
       - README gains a "Phase 4 - Async Work" section: BullMQ setup, `make phase4`, expected output,
         creating jobs via API, checking job status, adding new job types (handlers/ directory).
+
+- Phase 4 - what is accomplished
+  Asynchronous background job processing using BullMQ (backed by Redis from Phase 1). `make phase4` on a Phase 3 cluster delivers:
+  1. jobs-api service - Express + BullMQ producer (POST /api/jobs to create, GET /api/jobs/:id for status,
+     GET /api/jobs to list), auth-protected via requireAuth from Phase 3, 2 replicas in `app` namespace.
+     Jobs stored in MongoDB (jobId, ownerId, type, status, data, result, timestamps) beyond Redis retention.
+  2. worker service - BullMQ consumer Deployment (separate from web services), pulls jobs from Redis queue,
+     dispatches by job.name to handlers/ directory (helloWorld, failingJob example handlers included),
+     updates job status in MongoDB, auto-scales 1-10 replicas via HPA (CPU 70%), graceful shutdown
+     (60s terminationGracePeriod drains in-flight jobs).
+  3. Shared queue library - services/common/queue.js provides createQueue/createWorker/createQueueEvents,
+     JOB_TYPES enum, default retry config (3 attempts, exponential backoff 2s/4s/8s). Available to all
+     services for async work.
+  4. Kong routing - declarative config adds /api/jobs route to jobs-api service (auth handled by jobs-api
+     itself, not Kong). No rate-limiting plugin yet (Phase 5).
+  5. Job ownership - jobs tied to req.user.id (from Phase 3 JWT), IDOR prevention (user A cannot read
+     user B's jobs via GET /api/jobs/:id → 403), verified in verify-phase4.sh.
+  6. Retry logic - failed jobs retry 3 times with exponential backoff (2s, 4s, 8s) then status → failed.
+     BullMQ handles retry automatically. verify-phase4.sh tests this with failing-job handler.
+  7. Worker resilience - killing worker pods mid-job does not lose jobs (another worker or restarted pod
+     picks it up). Verified in verify-phase4.sh [6/7].
+  8. Verification gate - `make verify-phase4` tests 7 scenarios: deployments healthy, job creation,
+     completion polling, retry logic, IDOR prevention, worker resilience, job listing → prints "PHASE 4 OK".
+  Plus Makefile targets (`make phase4`, `make jobs`, `make verify-phase4`), README Phase 4 section
+  (usage examples, adding custom job types, troubleshooting), updated Kong config.
+  NOT included (by design): Queue-depth based auto-scaling (Phase 5 observability adds custom metrics),
+  rate-limiting on job creation (Phase 5), job priority UI (future), job progress updates (handler can
+  report progress but no UI yet).
+  Status: ✅ COMPLETE (2026-09-10). Deployed and verified on master branch.
+  Note: Redis maxmemory-policy from Phase 1 is `noeviction` to ensure BullMQ jobs are never evicted.
+  Jobs stored in MongoDB provide durability beyond Redis; BullMQ purges completed jobs after
+  removeOnComplete: 100 limit.
 
 - Files (Phase 4 - Async work)
   Format: file_name | file_path | description | depends_on[]
