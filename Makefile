@@ -12,7 +12,8 @@ export KUBECONFIG
 .PHONY: help cluster base secrets verify phase0 down lint node-join \
         secrets-data data verify-phase1 phase1 \
         build-push edge verify-phase2 phase2 \
-        jwt-keys auth verify-phase3 phase3
+        jwt-keys auth verify-phase3 phase3 \
+        jobs verify-phase4 phase4
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
@@ -45,6 +46,11 @@ help:
 	@echo "  make jwt-keys                     - generate JWT RS256 keypair"
 	@echo "  make auth                         - bootstrap auth service + update Kong/ping/frontend"
 	@echo "  make verify-phase3                - run the Phase 3 acceptance gate"
+	@echo ""
+	@echo "  Phase 4 - Async Jobs (requires Phase 0-3 complete)"
+	@echo "  make phase4                       - jobs -> verify-phase4"
+	@echo "  make jobs                         - bootstrap jobs-api + worker services"
+	@echo "  make verify-phase4                - run the Phase 4 acceptance gate"
 	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
 
@@ -105,11 +111,20 @@ verify-phase3: _need-kubeconfig
 
 phase3: auth verify-phase3
 
+# --- Phase 4: Async Jobs --------------------------------------------------------
+jobs: _need-kubeconfig
+	./scripts/bootstrap-jobs.sh
+
+verify-phase4: _need-kubeconfig
+	./scripts/verify-phase4.sh
+
+phase4: jobs verify-phase4
+
 down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \

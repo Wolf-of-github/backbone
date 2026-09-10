@@ -1,2 +1,35 @@
-get nodes => kubectl get nodes
-get pods =>  kubectl -n data get pods -o wide
+
+  # Check if cluster is running
+  kubectl get nodes
+
+  # Phase 0 - Substrate verification
+  make verify
+
+  # Phase 1 - Data layer verification
+  make verify-phase1
+
+  # Phase 2 - Edge verification
+  make verify-phase2
+
+  # Phase 3 - Auth verification
+  make verify-phase3
+
+  # If any phase fails, check pod status
+  kubectl get pods -A
+
+  # Check specific namespace logs if needed
+  kubectl -n data get pods
+  kubectl -n platform get pods
+  kubectl -n app get pods
+
+  # To see logs from failing pods
+  kubectl -n data logs <pod-name>
+  kubectl -n platform logs <pod-name>
+  kubectl -n app logs <pod-name>
+
+  # Check services
+  kubectl get svc -A
+
+  # Check secrets
+  kubectl -n data get secrets
+  kubectl -n app get secrets

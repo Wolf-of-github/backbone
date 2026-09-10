@@ -619,3 +619,220 @@ All existing tokens will be invalidated.
 | All tokens rejected after restart | JWT keys changed — run `make jwt-keys` to regenerate from `.secrets/jwt/` |
 
 ---
+
+## Phase 4 — Async Jobs
+
+Adds asynchronous background job processing using **BullMQ** (backed by Redis from Phase 1). Two new services: **jobs-api** for creating and monitoring jobs (auth-protected), and **worker** for processing jobs from the queue. Jobs are stored durably in MongoDB beyond Redis retention. This proves the full async pattern: API enqueues → Redis queue → worker processes → writes result to Mongo → API can fetch status/result.
+
+Requires Phase 0, Phase 1, and Phase 3 complete (`make verify`, `make verify-phase1`, `make verify-phase3` all pass).
+
+### 1. Deploy Phase 4
+
+```bash
+make phase4
+```
+
+**Does, in order:**
+
+| Sub-step | What happens |
+|---|---|
+| `make jobs` → `bootstrap-jobs.sh` | Builds + pushes jobs-api and worker Docker images (multi-stage), applies jobs-api deployment + service, worker deployment + HPA, updates Kong config with `/api/jobs` route, restarts Kong |
+| `make verify-phase4` → `verify-phase4.sh` | Runs 7 end-to-end tests (below) |
+
+**Expect** the run to end with:
+
+```
+[1/7] Deployments and services       OK jobs-api (2/2) and worker (>=1 replicas) ready, HPA configured
+[2/7] End-to-end job creation        OK Job created: <job-id>
+[3/7] Job completion polling          OK Job completed successfully with correct result
+[4/7] Failing job retry               OK Failing job retried and failed as expected
+[5/7] Job ownership (IDOR prevention) OK IDOR prevention works
+[6/7] Worker resilience               OK Worker resilience verified
+[7/7] List jobs                       OK Job listing works
+
+PHASE 4 OK
+```
+
+`PHASE 4 OK` **and** the command exiting `0` means success.
+
+---
+
+### 2. Use the Job Queue
+
+**Endpoints** (all require `Authorization: Bearer <token>` from Phase 3):
+
+- `POST /api/jobs` - Create a new background job
+- `GET /api/jobs/:id` - Get job status, progress, and result
+- `GET /api/jobs` - List your jobs (sorted by creation time)
+
+**Available job types:**
+
+- `hello-world` - Simple async task (sleeps 2s, returns greeting)
+- `failing-job` - Always fails (for testing retry logic)
+
+**Example: Create a job**
+
+```bash
+# Get access token (Phase 3 auth)
+TOKEN=$(curl -s -X POST http://<node-ip>:30080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"password"}' | jq -r '.accessToken')
+
+# Create a hello-world job
+curl -X POST http://<node-ip>:30080/api/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"hello-world","data":{"name":"World"}}'
+
+# Response: {"jobId":"<uuid>","status":"pending","type":"hello-world","createdAt":"..."}
+```
+
+**Example: Check job status**
+
+```bash
+curl http://<node-ip>:30080/api/jobs/<job-id> \
+  -H "Authorization: Bearer $TOKEN"
+
+# Response when completed:
+# {
+#   "jobId": "<uuid>",
+#   "type": "hello-world",
+#   "status": "completed",
+#   "result": {
+#     "greeting": "Hello, World!",
+#     "processedAt": "...",
+#     "jobId": "<uuid>"
+#   },
+#   "progress": 0,
+#   "createdAt": "...",
+#   "completedAt": "..."
+# }
+```
+
+**Example: List your jobs**
+
+```bash
+curl http://<node-ip>:30080/api/jobs \
+  -H "Authorization: Bearer $TOKEN"
+
+# Response: {"jobs":[...],"count":5}
+```
+
+---
+
+### 3. Add Custom Job Types
+
+To add a new job type:
+
+1. **Add to job types enum** in `services/common/queue.js`:
+   ```javascript
+   const JOB_TYPES = {
+     HELLO_WORLD: 'hello-world',
+     FAILING_JOB: 'failing-job',
+     SEND_EMAIL: 'send-email',  // ← Add your job type
+   };
+   ```
+
+2. **Create a handler** in `services/worker/src/handlers/`:
+   ```javascript
+   // sendEmail.js
+   async function sendEmailHandler(job) {
+     const { to, subject, body } = job.data;
+
+     // Your job logic here
+     await sendEmailService(to, subject, body);
+
+     return { sent: true, to, timestamp: new Date() };
+   }
+
+   module.exports = sendEmailHandler;
+   ```
+
+3. **Register the handler** in `services/worker/src/index.js`:
+   ```javascript
+   const sendEmailHandler = require('./handlers/sendEmail');
+
+   const handlers = {
+     [JOB_TYPES.HELLO_WORLD]: helloWorldHandler,
+     [JOB_TYPES.FAILING_JOB]: failingJobHandler,
+     [JOB_TYPES.SEND_EMAIL]: sendEmailHandler,  // ← Register
+   };
+   ```
+
+4. **Rebuild and redeploy**:
+   ```bash
+   make jobs
+   ```
+
+---
+
+### 4. Architecture Details
+
+**Job Lifecycle:**
+1. User creates job via `POST /api/jobs` (authenticated)
+2. jobs-api creates MongoDB record + enqueues to BullMQ/Redis
+3. Worker pulls job from queue, updates status to `active`
+4. Worker executes handler, writes result to MongoDB
+5. Job status → `completed` (or `failed` after 3 retry attempts)
+6. User polls `GET /api/jobs/:id` to get result
+
+**Retry Logic:**
+- Failed jobs retry 3 times with exponential backoff (2s, 4s, 8s)
+- After 3 failures, status → `failed`
+- BullMQ automatically handles retries
+
+**Auto-Scaling:**
+- Worker pods scale 1-10 based on CPU utilization (70%)
+- HorizontalPodAutoscaler configured in `k8s/app/worker/hpa.yaml`
+- Phase 5 will add custom queue-depth metric
+
+**Security:**
+- Jobs tied to authenticated user (`req.user.id` from Phase 3)
+- IDOR prevention: users can only access their own jobs
+- Worker logs job owner but doesn't enforce auth (queue is internal)
+
+---
+
+### 5. Troubleshooting
+
+| Symptom | Solution |
+|---------|----------|
+| jobs-api pods stuck `Pending` | Check MongoDB/Redis secrets exist in `app` namespace: `kubectl -n app get secrets mongodb-credentials redis-password` |
+| POST /api/jobs returns 500 | Check jobs-api logs: `kubectl -n app logs -l app=jobs-api` |
+| Jobs stuck in `pending` | Check worker is running: `kubectl -n app get pods -l app=worker` |
+| Worker pod crashloops | Check logs: `kubectl -n app logs -l app=worker --tail=50` |
+| Jobs not completing | Check Redis connection from worker logs; verify Phase 1 Redis is healthy |
+| "Unknown job type" error | Handler not registered in `services/worker/src/index.js` |
+
+---
+
+### 6. Operations
+
+**View worker pods:**
+```bash
+kubectl -n app get pods -l app=worker
+```
+
+**Scale workers manually:**
+```bash
+kubectl -n app scale deployment worker --replicas=5
+```
+
+**View HPA status:**
+```bash
+kubectl -n app get hpa worker-hpa
+```
+
+**Restart services:**
+```bash
+kubectl -n app rollout restart deployment/jobs-api
+kubectl -n app rollout restart deployment/worker
+```
+
+**Monitor job queue (from inside cluster):**
+```bash
+kubectl -n data run redis-cli --rm -it --restart=Never --image=redis:7.2-alpine -- \
+  redis-cli -h redis.data.svc -a "$REDIS_PASSWORD" KEYS "bull:jobs:*"
+```
+
+---

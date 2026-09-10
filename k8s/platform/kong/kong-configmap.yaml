@@ -35,3 +35,11 @@ data:
             paths:
               - /api/ping
             strip_path: false
+
+      - name: jobs-api-service
+        url: http://jobs-api.app.svc:80
+        routes:
+          - name: jobs-api-route
+            paths:
+              - /api/jobs
+            strip_path: false
