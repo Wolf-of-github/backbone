@@ -1,0 +1,109 @@
+# deployment.yaml
+# Purpose: Alertmanager - routes fired alerts to the configured webhook.
+# depends_on: [k8s/base/namespaces.yaml, /ci/notify.sh]
+#
+# TEMPLATE: ${ALERTMANAGER_RECEIVERS} and ${ALERTMANAGER_ROUTE_RECEIVER} are
+# substituted by scripts/bootstrap-observability.sh, which picks a webhook
+# receiver when ALERT_WEBHOOK_URL is set and a null receiver when it is blank.
+# A blank webhook must NOT be a failure - alerts still collect in the UI.
+#
+# The config lives in a Secret rather than a ConfigMap because the webhook URL
+# is itself a credential (anyone holding a Slack/Discord webhook can post as it).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: observability
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+
+    route:
+      group_by: ['alertname', 'namespace']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: ${ALERTMANAGER_ROUTE_RECEIVER}
+
+    receivers:
+${ALERTMANAGER_RECEIVERS}
+
+    inhibit_rules:
+      # A down node produces a storm of downstream alerts; suppress them.
+      - source_matchers: [severity="critical", alertname="NodeDown"]
+        target_matchers: [severity="warning"]
+        equal: ['instance']
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: observability
+  labels:
+    app: alertmanager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager:v0.27.0
+        args:
+          - --config.file=/etc/alertmanager/alertmanager.yml
+          - --storage.path=/alertmanager
+        ports:
+        - name: http
+          containerPort: 9093
+        volumeMounts:
+        - name: config
+          mountPath: /etc/alertmanager
+          readOnly: true
+        - name: data
+          mountPath: /alertmanager
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9093
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+      volumes:
+      - name: config
+        configMap:
+          name: alertmanager-config
+      # Silences and notification state are not worth a PVC here; losing them on
+      # restart re-notifies at most once.
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: observability
+  labels:
+    app: alertmanager
+spec:
+  type: ClusterIP
+  selector:
+    app: alertmanager
+  ports:
+  - name: http
+    port: 9093
+    targetPort: 9093

@@ -5,7 +5,14 @@
 require('dotenv').config();
 const http = require('http');
 const mongoose = require('mongoose');
-const { createWorker, JOB_TYPES } = require('./common/queue');
+const { createWorker, createQueue, JOB_TYPES } = require('./common/queue');
+const {
+  register,
+  jobsProcessed,
+  jobsFailed,
+  jobDuration,
+  trackQueueDepth,
+} = require('./common/metrics');
 const Job = require('./models/job');
 
 // Import job handlers
@@ -55,6 +62,9 @@ async function processJob(job) {
     }
   );
 
+  // Phase 5B: time the handler itself, labelled by job type.
+  const endTimer = jobDuration.startTimer({ type: job.name });
+
   try {
     // Execute the handler
     const result = await handler(job);
@@ -70,10 +80,19 @@ async function processJob(job) {
       }
     );
 
+    endTimer();
+    jobsProcessed.inc({ type: job.name });
+
     console.log(`Job ${job.id} completed successfully`);
 
     return result;
   } catch (error) {
+    endTimer();
+    // Counts every failed ATTEMPT, including ones BullMQ will retry - the
+    // failure-rate alert is meant to catch a handler that is flapping, not
+    // only jobs that have exhausted all three attempts.
+    jobsFailed.inc({ type: job.name });
+
     console.error(`Job ${job.id} failed:`, error.message);
 
     // Update job status to failed
@@ -100,6 +119,13 @@ worker = createWorker('jobs', processJob, {
   concurrency,
 });
 
+// Phase 5B: publish queue depth (waiting/active/delayed/failed) as a gauge.
+// This is what the JobQueueBacklog alert reads, and what a future queue-depth
+// HPA would scale on. Polled, not event-driven - depth is a level, and a
+// missed event would leave the gauge permanently wrong.
+const metricsQueue = createQueue('jobs');
+const stopQueueTracking = trackQueueDepth(metricsQueue, { queueName: 'jobs' });
+
 worker.on('ready', () => {
   isRunning = true;
   console.log('Worker is ready and processing jobs');
@@ -109,8 +135,13 @@ worker.on('error', (err) => {
   console.error('Worker error:', err);
 });
 
-// Simple HTTP server for health checks
-const healthServer = http.createServer((req, res) => {
+// Simple HTTP server for health checks (and, since Phase 5B, /metrics).
+const healthServer = http.createServer(async (req, res) => {
+  if (req.url === '/metrics') {
+    res.writeHead(200, { 'Content-Type': register.contentType });
+    res.end(await register.metrics());
+    return;
+  }
   if (req.url === '/healthz') {
     const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
     const workerStatus = isRunning ? 'running' : 'stopped';
@@ -136,6 +167,11 @@ healthServer.listen(3000, () => {
 async function shutdown(signal) {
   console.log(`${signal} received, starting graceful shutdown...`);
   isRunning = false;
+
+  // Stop polling queue depth before tearing down the Redis connections, or the
+  // final poll races the close and logs a spurious error.
+  stopQueueTracking();
+  await metricsQueue.close();
 
   // Close the worker (drains in-flight jobs)
   if (worker) {

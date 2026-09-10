@@ -27,6 +27,11 @@ spec:
           value: "off"
         - name: KONG_DECLARATIVE_CONFIG
           value: /kong/declarative/kong.yaml
+        # HTTP only by default, so Phase 2 stands alone on a cluster that has
+        # never run Phase 5A. scripts/bootstrap-tls.sh patches this to
+        # "0.0.0.0:8000, 0.0.0.0:8443 ssl" and sets KONG_SSL_CERT/_KEY once the
+        # kong-tls-cert secret exists. Declaring an ssl listener with no cert
+        # present makes Kong refuse to start, so the order matters.
         - name: KONG_PROXY_LISTEN
           value: "0.0.0.0:8000"
         - name: KONG_ADMIN_LISTEN
@@ -37,12 +42,18 @@ spec:
         - name: proxy
           containerPort: 8000
           protocol: TCP
+        - name: proxy-ssl
+          containerPort: 8443
+          protocol: TCP
         - name: admin
           containerPort: 8001
           protocol: TCP
         volumeMounts:
         - name: kong-config
           mountPath: /kong/declarative
+          readOnly: true
+        - name: kong-tls
+          mountPath: /etc/secrets/kong-tls
           readOnly: true
         readinessProbe:
           httpGet:
@@ -67,3 +78,11 @@ spec:
       - name: kong-config
         configMap:
           name: kong-declarative-config
+      # optional: true so Phase 2 still comes up standalone on a cluster that has
+      # never run Phase 5A. Without it Kong would hang in ContainerCreating until
+      # cert-manager existed, making TLS a hard prerequisite for the gateway.
+      # Kong only reads KONG_SSL_CERT when a TLS listener is actually configured.
+      - name: kong-tls
+        secret:
+          secretName: kong-tls-cert
+          optional: true

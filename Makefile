@@ -13,7 +13,9 @@ export KUBECONFIG
         secrets-data data verify-phase1 phase1 \
         build-push edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
-        jobs verify-phase4 phase4
+        jobs verify-phase4 phase4 \
+        tls verify-phase5a obs verify-phase5b ci verify-phase5c \
+        verify-phase5 phase5
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
@@ -51,6 +53,16 @@ help:
 	@echo "  make phase4                       - jobs -> verify-phase4"
 	@echo "  make jobs                         - bootstrap jobs-api + worker services"
 	@echo "  make verify-phase4                - run the Phase 4 acceptance gate"
+	@echo ""
+	@echo "  Phase 5 - Operate (three tracks; each has its own gate)"
+	@echo "  make phase5                       - tls -> obs -> ci -> verify-phase5"
+	@echo "  make tls                          - 5A: HTTPS at Kong (works with NO domain)"
+	@echo "  make verify-phase5a               - run the Phase 5A gate"
+	@echo "  make obs                          - 5B: Prometheus + Loki + Grafana"
+	@echo "  make verify-phase5b               - run the Phase 5B gate"
+	@echo "  make ci                           - 5C: Gitea + Drone + in-cluster registry"
+	@echo "  make verify-phase5c               - run the Phase 5C gate"
+	@echo "  make verify-phase5                - run all three Phase 5 gates"
 	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
 
@@ -120,16 +132,45 @@ verify-phase4: _need-kubeconfig
 
 phase4: jobs verify-phase4
 
+# --- Phase 5: Operate ------------------------------------------------------
+# Three tracks, gated independently. Order matters: 5B's cert-expiry alert
+# consumes 5A, and 5C is served over 5A's TLS listener.
+tls: _need-kubeconfig
+	./scripts/bootstrap-tls.sh
+
+verify-phase5a: _need-kubeconfig
+	./scripts/verify-phase5a.sh
+
+obs: _need-kubeconfig
+	./scripts/bootstrap-observability.sh
+
+verify-phase5b: _need-kubeconfig
+	./scripts/verify-phase5b.sh
+
+ci: _need-kubeconfig
+	./scripts/bootstrap-ci.sh
+
+verify-phase5c: _need-kubeconfig
+	./scripts/verify-phase5c.sh
+
+verify-phase5: _need-kubeconfig
+	./scripts/verify-phase5.sh
+
+phase5: tls obs ci verify-phase5
+
 down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh ci/notify.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
-	  kubectl apply --dry-run=server -R -f k8s/platform/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/app/ ; \
+	  kubectl apply --dry-run=server -f k8s/platform/kong/ ; \
+	  echo "note: k8s/platform/cert-manager/, k8s/observability/ and k8s/ci/ are"; \
+	  echo "      templates (\$${VAR} placeholders) - they are dry-run from"; \
+	  echo "      .rendered/ by their bootstrap scripts, not from source."; \
 	else \
 	  echo "no ./kubeconfig - skipping manifest dry-run"; \
 	fi

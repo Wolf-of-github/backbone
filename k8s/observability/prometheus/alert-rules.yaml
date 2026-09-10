@@ -1,0 +1,93 @@
+# alert-rules.yaml
+# Purpose: The alerts that matter for this platform, as a plain Prometheus rule
+#          file (not a PrometheusRule CRD - there is no operator here).
+# depends_on: [configmap.yaml]
+#
+# Deliberately small. Every rule below corresponds to a failure this stack has
+# actually had, or to a resource that silently fills up. Alert fatigue makes
+# alerting worthless, so resist adding rules without a matching incident.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: observability
+data:
+  backbone.yaml: |
+    groups:
+      - name: backbone-cluster
+        rules:
+          - alert: NodeDown
+            expr: up{job="kubernetes-nodes"} == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Node {{ $labels.instance }} is unreachable"
+              description: "Its pods will be rescheduled onto the remaining nodes. If this is the control plane, the API is down."
+
+          - alert: PodCrashLooping
+            expr: rate(kube_pod_container_status_restarts_total[15m]) * 900 > 3
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.namespace }}/{{ $labels.pod }} is crash-looping"
+              description: "More than 3 restarts in 15 minutes."
+
+          - alert: PVCNearlyFull
+            expr: |
+              (kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes) > 0.85
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "PVC {{ $labels.persistentvolumeclaim }} is over 85% full"
+              description: "local-path volumes do not grow. Free space or resize before writes start failing."
+
+      - name: backbone-edge
+        rules:
+          - alert: KongHigh5xxRate
+            expr: |
+              sum(rate(kong_http_requests_total{code=~"5.."}[5m]))
+                / sum(rate(kong_http_requests_total[5m])) > 0.05
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Over 5% of requests through Kong are 5xx"
+
+          # Consumes Phase 5A. renewBefore on the Certificate is 15d, so this
+          # firing means automatic renewal has already failed at least once.
+          - alert: CertificateExpiringSoon
+            expr: |
+              (certmanager_certificate_expiration_timestamp_seconds - time()) / 86400 < 15
+            for: 1h
+            labels:
+              severity: critical
+            annotations:
+              summary: "TLS certificate {{ $labels.name }} expires in under 15 days"
+              description: "cert-manager renews at 15d. Check: kubectl -n platform describe certificate backbone-tls"
+
+      - name: backbone-async
+        rules:
+          # The BullMQ queue-depth gauge comes from services/common/metrics.js.
+          # This is the signal a future queue-depth HPA would scale on; for now
+          # it just pages a human.
+          - alert: JobQueueBacklog
+            expr: backbone_queue_depth > 100
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Job queue {{ $labels.queue }} has over 100 waiting jobs"
+              description: "Workers are not keeping up. Scale: kubectl -n app scale deploy/worker --replicas=N"
+
+          - alert: JobFailureRateHigh
+            expr: |
+              sum(rate(backbone_jobs_failed_total[15m]))
+                / sum(rate(backbone_jobs_processed_total[15m])) > 0.25
+            for: 15m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Over 25% of jobs are failing"

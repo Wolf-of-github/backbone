@@ -1,0 +1,85 @@
+# configmap.yaml
+# Purpose: Gitea app.ini - self-hosted git + the built-in container registry.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# TEMPLATE: ${GITEA_ROOT_URL} and ${GITEA_DOMAIN} substituted by
+# scripts/bootstrap-ci.sh.
+#
+# SQLite, not Postgres: this is a single-instance CI server for one platform.
+# Adding a database would mean another StatefulSet, another credential and
+# another backup target for no benefit at this scale.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gitea-config
+  namespace: ci
+data:
+  app.ini: |
+    APP_NAME = backbone CI
+    RUN_MODE = prod
+    RUN_USER = git
+
+    [server]
+    PROTOCOL         = http
+    DOMAIN           = ${GITEA_DOMAIN}
+    ROOT_URL         = ${GITEA_ROOT_URL}
+    HTTP_PORT        = 3000
+    # Paths and ports below are the ROOTLESS image's layout (/var/lib/gitea,
+    # unprivileged SSH on 2222). They must match statefulset.yaml's mounts and
+    # the Service's targetPort - the non-rootless image uses /data and :22.
+    SSH_PORT             = 22
+    SSH_LISTEN_PORT      = 2222
+    START_SSH_SERVER     = true
+    DISABLE_SSH          = false
+    APP_DATA_PATH        = /var/lib/gitea/data
+    # Gitea sits behind Kong, which terminates TLS. Gitea speaks plain HTTP.
+    OFFLINE_MODE     = true
+
+    [database]
+    DB_TYPE = sqlite3
+    PATH    = /var/lib/gitea/data/gitea.db
+
+    [repository]
+    ROOT             = /var/lib/gitea/git/repositories
+    DEFAULT_BRANCH   = main
+
+    [security]
+    INSTALL_LOCK  = true
+    # Long-lived so CI sessions do not expire mid-pipeline.
+    LOGIN_REMEMBER_DAYS = 7
+
+    [service]
+    # This is a private platform CI. Anyone who can reach it must not be able
+    # to create an account, and repositories must not be world-readable.
+    DISABLE_REGISTRATION              = true
+    REQUIRE_SIGNIN_VIEW               = true
+    REGISTER_EMAIL_CONFIRM            = false
+    ENABLE_NOTIFY_MAIL                = false
+    DEFAULT_KEEP_EMAIL_PRIVATE        = true
+    DEFAULT_ALLOW_CREATE_ORGANIZATION = true
+    DEFAULT_ENABLE_TIMETRACKING       = false
+
+    [packages]
+    # The container registry that Phase 5C cuts the platform over to.
+    ENABLED = true
+
+    [webhook]
+    # Gitea refuses webhooks to private addresses by default, which silently
+    # breaks the push -> Drone trigger inside a cluster. This allowlist is the
+    # single most common Gitea+Drone bring-up failure.
+    ALLOWED_HOST_LIST = *.ci.svc,*.svc,drone-server.ci.svc,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+    SKIP_TLS_VERIFY   = true
+
+    [actions]
+    # Drone is the CI runner here; Gitea's own Actions would be a second one.
+    ENABLED = false
+
+    [log]
+    MODE  = console
+    LEVEL = info
+
+    [cron.archive_cleanup]
+    ENABLED = true
+
+    [oauth2]
+    ENABLED = true

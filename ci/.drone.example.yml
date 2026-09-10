@@ -1,0 +1,129 @@
+# .drone.example.yml
+# Purpose: Reference pipeline. Copy to a service repo as .drone.yml and adjust
+#          the `service` substitutions.
+# depends_on: [scripts/build-push.sh, scripts/deploy-key.sh]
+#
+# Flow: test -> build+push image -> deploy -> wait rollout -> rollback on failure -> notify.
+#
+# Required Drone secrets (see scripts/deploy-key.sh and scripts/registry-secret.sh):
+#   kubeconfig       - the least-privilege ci-deployer kubeconfig
+#   registry_user    - Gitea username
+#   registry_token   - Gitea deploy token
+#   webhook_url      - optional; notifications are skipped when unset
+---
+kind: pipeline
+type: kubernetes
+name: default
+
+# Build steps run as pods in `ci`, scheduled across every worker node.
+metadata:
+  namespace: ci
+
+steps:
+  - name: test
+    image: node:20-alpine
+    commands:
+      - npm ci
+      - npm test
+
+  # Kaniko builds the image inside the cluster - no Docker daemon, no
+  # privileged container, which a docker-in-docker step would require.
+  - name: build-and-push
+    image: gcr.io/kaniko-project/executor:v1.23.2-debug
+    environment:
+      REGISTRY_USER:
+        from_secret: registry_user
+      REGISTRY_TOKEN:
+        from_secret: registry_token
+    commands:
+      - export REGISTRY=gitea-http.ci.svc:3000
+      - mkdir -p /kaniko/.docker
+      # Credentials via env, never interpolated into the command string.
+      - |
+        printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
+          "$REGISTRY" "$REGISTRY_USER" "$REGISTRY_TOKEN" > /kaniko/.docker/config.json
+      - |
+        /kaniko/executor \
+          --context "$CI_WORKSPACE" \
+          --dockerfile services/${DRONE_REPO_NAME}/Dockerfile \
+          --destination "$REGISTRY/${REGISTRY_USER}/backbone-${DRONE_REPO_NAME}:${DRONE_COMMIT_SHA:0:8}" \
+          --destination "$REGISTRY/${REGISTRY_USER}/backbone-${DRONE_REPO_NAME}:latest" \
+          --insecure --skip-tls-verify \
+          --cache=true
+    when:
+      branch: [main, master]
+
+  - name: deploy
+    image: bitnami/kubectl:1.30
+    environment:
+      KUBECONFIG_CONTENT:
+        from_secret: kubeconfig
+      REGISTRY_USER:
+        from_secret: registry_user
+    commands:
+      - export KUBECONFIG=/tmp/kubeconfig
+      - echo "$KUBECONFIG_CONTENT" > $KUBECONFIG
+      - chmod 600 $KUBECONFIG
+      # Record the current image so the rollback step can restore it. `kubectl
+      # rollout undo` would be simpler but reverts to whatever the previous
+      # ReplicaSet was, which is not necessarily the last GOOD build.
+      - |
+        PREVIOUS=$(kubectl -n app get deploy ${DRONE_REPO_NAME} \
+          -o jsonpath='{.spec.template.spec.containers[0].image}')
+        echo "$PREVIOUS" > /tmp/previous-image
+        echo "current image: $PREVIOUS"
+      - |
+        kubectl -n app set image deploy/${DRONE_REPO_NAME} \
+          ${DRONE_REPO_NAME}=gitea-http.ci.svc:3000/${REGISTRY_USER}/backbone-${DRONE_REPO_NAME}:${DRONE_COMMIT_SHA:0:8}
+    when:
+      branch: [main, master]
+
+  - name: wait-for-rollout
+    image: bitnami/kubectl:1.30
+    environment:
+      KUBECONFIG_CONTENT:
+        from_secret: kubeconfig
+    commands:
+      - export KUBECONFIG=/tmp/kubeconfig
+      - echo "$KUBECONFIG_CONTENT" > $KUBECONFIG
+      - chmod 600 $KUBECONFIG
+      # Fails the step if the new pods never pass their readiness probe, which
+      # is what triggers the rollback below.
+      - kubectl -n app rollout status deploy/${DRONE_REPO_NAME} --timeout=180s
+    when:
+      branch: [main, master]
+
+  - name: rollback
+    image: bitnami/kubectl:1.30
+    environment:
+      KUBECONFIG_CONTENT:
+        from_secret: kubeconfig
+    commands:
+      - export KUBECONFIG=/tmp/kubeconfig
+      - echo "$KUBECONFIG_CONTENT" > $KUBECONFIG
+      - chmod 600 $KUBECONFIG
+      - |
+        PREVIOUS=$(cat /tmp/previous-image)
+        echo "rolling back to $PREVIOUS"
+        kubectl -n app set image deploy/${DRONE_REPO_NAME} \
+          ${DRONE_REPO_NAME}="$PREVIOUS"
+        kubectl -n app rollout status deploy/${DRONE_REPO_NAME} --timeout=180s
+    when:
+      status: [failure]
+
+  - name: notify
+    image: curlimages/curl:8.10.1
+    environment:
+      WEBHOOK_URL:
+        from_secret: webhook_url
+    commands:
+      - |
+        if [ -z "$WEBHOOK_URL" ]; then
+          echo "no webhook configured - skipping notification"
+          exit 0
+        fi
+        curl -s -X POST -H 'Content-Type: application/json' \
+          -d "{\"text\":\"[${DRONE_BUILD_STATUS}] ${DRONE_REPO_NAME} #${DRONE_BUILD_NUMBER} on ${DRONE_BRANCH} by ${DRONE_COMMIT_AUTHOR}\"}" \
+          "$WEBHOOK_URL"
+    when:
+      status: [success, failure]

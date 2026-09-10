@@ -10,7 +10,13 @@ const { configurePassport } = require('./passport');
 const tokenStore = require('./tokenStore');
 const authRoutes = require('./routes/auth');
 
+const { instrumentHttp } = require('./common/metrics');
+
 const app = express();
+
+// Phase 5B: request timing + GET /metrics. Before the routes so the middleware
+// sees every request.
+instrumentHttp(app, { serviceName: 'auth' });
 const PORT = process.env.PORT || 3000;
 
 // Middleware

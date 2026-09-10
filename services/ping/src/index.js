@@ -4,8 +4,13 @@
 
 const express = require('express');
 const { requireAuth } = require('./common/authContext');
+const { instrumentHttp } = require('./common/metrics');
 
 const app = express();
+
+// Phase 5B: request timing + GET /metrics. Registered before the routes so the
+// middleware sees every request.
+instrumentHttp(app, { serviceName: 'ping' });
 const PORT = process.env.PORT || 3000;
 
 // Health check endpoint for k8s probes (no auth required)

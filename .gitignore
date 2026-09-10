@@ -17,11 +17,18 @@
 htpasswd
 *.htpasswd
 
+# Node dependencies (every service under /services)
+node_modules/
+
 # Build / scratch output
 /build/
 /dist/
 *.tmp
 *.log
+
+# Phase 5: manifests rendered from templates by bootstrap scripts (DOMAIN/TLS_MODE
+# substituted in). Generated on every run - the templates are the source of truth.
+/.rendered/
 
 # OS cruft
 .DS_Store

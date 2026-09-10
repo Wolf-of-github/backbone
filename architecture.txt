@@ -660,10 +660,18 @@
   - Phase 4 - Async work ✅ COMPLETE
     - BullMQ workers (separate Deployment, pulls from Redis) with jobs-api for job management
     - Auto-scaling workers (1-10 replicas), retry logic, IDOR prevention, graceful shutdown
-  - Phase 5 - Operate
-    - CI/CD (Gitea + Drone) - replaces manual push/apply; deliberately after manual path proven
-    - Observability (PLG stack) - no hard dependents; can slot earlier for bring-up visibility
-    - cert-manager + Let's Encrypt - needs real domain + Kong terminating traffic
+  - Phase 5 - Operate  (three sub-gated tracks, built 5A -> 5B -> 5C; `make phase5` chains them)
+    - 5A TLS: cert-manager + Kong HTTPS listener (`make tls`; gate: verify-phase5a.sh -> "PHASE 5A OK")
+      First, because Phase 3 JWTs currently ride plain HTTP. Does NOT need a real domain: TLS_MODE
+      defaults to `selfsigned` and works on the NodePort IP; adding a domain later is an .env edit
+      plus `make tls`, with the cert secret name fixed so no other wiring changes.
+    - 5B Observability: PLG stack + services/common/metrics.js (`make obs`; gate -> "PHASE 5B OK")
+      Second, so CI/CD is built with metrics and logs already available to debug it. Delivers the
+      BullMQ queue-depth metric Phase 4's HPA anticipated (wiring the HPA to it is a later phase).
+    - 5C CI/CD + registry: Gitea + Drone + the in-cluster container registry (`make ci`; -> "PHASE 5C OK")
+      Last, and the only track that mutates earlier phases: it cuts all six service Deployments off
+      the public REGISTRY_URL onto the Gitea registry, discharging the "deferred to Phase 5" promise
+      made in the Phase 0 and Phase 2 notes. REGISTRY_MODE=external is the tested rollback.
   - Phase 6 - Resilience & lifecycle
     - Backup/DR (mongodump CronJob, Redis AOF, then replica set + multi-node k3s)
     - Maintenance page (static 503 + maintenance CLI + ConfigMap state) - needs Kong Admin API + CI/CD
@@ -760,6 +768,9 @@
     config/k3d-cluster.yaml, k8s/platform/registry/{deployment,pvc,service}.yaml, the MULTI_NODE switch.
     The whole /config directory is gone. The authenticated in-cluster registry is deferred to Phase 5
     (behind Kong + TLS).
+    UPDATE (Phase 5C, implemented): `scripts/registry-secret.sh` is REINSTATED with a different
+    implementation - it mints a Gitea deploy token against the built-in Gitea container registry
+    rather than provisioning a standalone registry. The rest of this DROPPED list stands.
 
 - Phase 0 - what is accomplished
   The substrate everything else runs on. `make phase0` on a Linux host delivers:
@@ -875,7 +886,9 @@
       registry is deferred to Phase 5. Multi-stage Docker builds for ping and frontend (Node build ->
       minimal runtime). Kong exposes two routes: / -> frontend, /api/* -> backend services. A thin
       kongctl.sh wrapper around the Admin API provides reload/inspect operations for later phases.
-    - Image registry strategy (Phase 2 only): until Phase 5 stands up the in-cluster registry, images
+    - Image registry strategy (Phase 2 only; SUPERSEDED by Phase 5C, which stood up the Gitea
+      registry and added REGISTRY_MODE - set it to `incluster` to cut over, `external` to roll back):
+      until Phase 5 stands up the in-cluster registry, images
       are pushed to a public registry (Docker Hub or GitHub Container Registry). .env gains
       `REGISTRY_URL` (e.g., `docker.io/youruser` or `ghcr.io/youruser`), and build-push.sh tags with
       both the git SHA and `latest`. No imagePullSecret needed if the registry is public; if private,
@@ -1967,10 +1980,491 @@
       | Through public Kong with a valid JWT: POST /api/jobs returns an id; poll GET /api/jobs/:id to completed with a result; a failing job type retries then lands failed; killing a worker pod mid-job reschedules it; another user cannot read the job (IDOR).
       | depends_on: [bootstrap-jobs.sh]
 
+- Phase 5 - Operate: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Scope: make the platform operable rather than merely running. Three tracks, built in this order:
+      5A TLS (cert-manager + Let's Encrypt, HTTPS at Kong), 5B Observability (PLG stack + per-service
+      metrics), 5C CI/CD (Gitea + Drone + the in-cluster container registry, and the cutover of all six
+      service Deployments off the public registry onto it). Each track has its own bootstrap script,
+      its own Makefile target, and its own sub-gate; `make phase5` chains all three.
+    - Ordering rationale: TLS is the smallest track and closes the largest open hole - Phase 3 JWTs
+      currently ride plain HTTP on :30080. Observability comes second so the CI/CD track is built with
+      metrics and logs already available to debug it (and it delivers the queue-depth metric Phase 4's
+      HPA was written to consume). CI/CD is last because it depends on both: pipelines publish build
+      metrics to 5B, and the Gitea registry is served over the 5A TLS listener.
+    - Sub-gates: each track ends in its own verification script and can be stopped after cleanly.
+        make tls -> scripts/verify-phase5a.sh -> "PHASE 5A OK"
+        make obs -> scripts/verify-phase5b.sh -> "PHASE 5B OK"
+        make ci  -> scripts/verify-phase5c.sh -> "PHASE 5C OK"
+        make phase5 = tls obs ci verify-phase5   (verify-phase5.sh re-runs all three -> "PHASE 5 OK")
+      This is a deliberate departure from Phases 0-4 (one gate each). Phase 5 is roughly forty files
+      across three unrelated subsystems; a single all-or-nothing gate would make a partial failure
+      undiagnosable and would block TLS behind a broken Drone runner.
+
+    - Runtime decision: TLS - cert-manager installed from its pinned static manifest (no Helm, matching
+      the no-Helm rule from Phase 1), HTTP-01 solver routed through the existing Kong proxy. Observability
+      - PLG deployed as plain manifests (no kube-prometheus-stack operator, same rule); Loki single-binary
+      with filesystem storage on local-path; Promtail as a DaemonSet so every joined node ships logs
+      without per-node configuration. CI/CD - Gitea with its built-in container registry (one component
+      instead of Gitea + a separate Docker registry), Drone with the Kubernetes runner so build steps
+      are pods scheduled onto the existing worker fleet.
+    - Namespaces: uncomment `observability` and `ci` in k8s/base/namespaces.yaml (Phase 0 Step 3 left
+      them commented for exactly this phase). cert-manager creates its own `cert-manager` ns.
+      `make base` must be re-run before 5B/5C, and verify-phase0.sh's namespace check extended to
+      accept the two new namespaces without requiring them (they are absent on a Phase 0-4 cluster).
+
+    - DOMAIN IS OPTIONAL AND PLUG-AND-PLAY (the governing constraint on Track A)
+      The whole phase must come up, pass its gates, and stay useful on a cluster with no domain at all,
+      and acquiring a domain later must be a config edit plus one command - never a rebuild, never a
+      manifest edit, never a re-issue of anything but the certificate. Concretely:
+      - `.env` gains TLS_MODE with three values. Every manifest and script branches on this one variable
+        and nothing else:
+          TLS_MODE=selfsigned   (default) cert-manager SelfSigned ClusterIssuer mints a cert for the
+                                node IP + `backbone.local`. HTTPS works immediately on the NodePort;
+                                browsers warn. No DNS, no internet egress to ACME, no rate limits.
+          TLS_MODE=staging      ACME staging ClusterIssuer. Requires DOMAIN set and resolving. Untrusted
+                                chain, but exercises the real HTTP-01 path against a rate-limit-free
+                                endpoint. This is the rehearsal step, not a destination.
+          TLS_MODE=production   ACME production ClusterIssuer. Requires DOMAIN set and resolving.
+      - The Certificate object's dnsNames are templated from DOMAIN by bootstrap-tls.sh, and its
+        `secretName` is the SAME (`kong-tls-cert`) in all three modes. Kong's TLS listener therefore
+        references one fixed secret name and never changes when the mode changes - swapping issuers
+        rewrites the contents of that secret, not the wiring around it.
+      - Adding a domain later is exactly: set DOMAIN + TLS_MODE=staging in .env -> `make tls` -> confirm
+        -> set TLS_MODE=production -> `make tls`. cert-manager reissues into the same secret; Kong picks
+        it up. No pod rebuild, no manifest change, no other phase touched.
+      - Every Kong route added in 5B/5C (grafana, git) is defined as a PATH on the existing proxy
+        (`/grafana`, `/git`) with the host-based form (`grafana.<domain>`) written alongside it and
+        activated by bootstrap scripts only when DOMAIN is a real resolvable name. A domainless cluster
+        gets working URLs; a domained one gets pretty ones. No route is domain-only.
+      - verify-phase5a.sh asserts the correct behaviour FOR THE CURRENT MODE (selfsigned: cert present
+        and served, chain untrusted-but-valid; production: chain trusted and issuer is Let's Encrypt).
+        It must never fail a domainless cluster for lacking a domain.
+
+    - REGISTRY CUTOVER (the governing constraint on Track C)
+      Phases 0 and 2 both promise "the authenticated in-cluster registry is deferred to Phase 5". This
+      phase discharges that promise rather than deferring it again.
+      - Gitea's built-in container registry becomes the image source of record, reachable in-cluster at
+        `gitea-http.ci.svc:3000` and externally through Kong at `<domain-or-nodeip>/git`.
+      - `.env` REGISTRY_URL keeps its meaning but gains a companion REGISTRY_MODE=external|incluster.
+        build-push.sh and every Deployment's image reference resolve through one helper in lib.sh
+        (`registry_prefix()`), so the cutover is one variable, not six manifest edits.
+      - scripts/registry-secret.sh creates the `registry-credentials` docker-registry Secret in `app`
+        (and `ci`) from a Gitea deploy token. NOTE: this filename was explicitly listed as DROPPED in
+        the Phase 0 manifest ("superseded"); it is deliberately reinstated here, with a different
+        implementation (Gitea token, not a standalone registry). Update the Phase 0 DROPPED note to say
+        so, or the two sections contradict each other.
+      - Cutover is staged and reversible: stand the registry up, push one service to it, flip that one
+        service, verify, then flip the rest. REGISTRY_MODE=external rolls the whole thing back.
+      - This is the one part of Phase 5 that MUTATES Phases 2-4 artifacts (six Deployments' image
+        fields + imagePullSecrets). Everything else in Phase 5 is additive. Treat it accordingly:
+        it is the last step of the last track, behind its own verify.
+
+    - Guiding rules (same as Phases 0-4)
+      - Bottom-up by depends_on: never create a file before the files it depends on are in place.
+      - Two passes per file: (1) instantiate with a header comment (purpose + depends_on, body a STUB
+        marker); (2) implement - real content, remove the STUB marker.
+      - Nothing is "done" until the track's own gate prints "PHASE 5x OK", and `make phase5` exits 0
+        printing "PHASE 5 OK", on a cluster that has passed Phase 4.
+      - No Helm, no operators - plain manifests + shell, consistent with Phases 0-4.
+      - Security: Grafana admin password and the Gitea admin/deploy tokens come from .env via the
+        create-secrets.sh convention and are never echoed; the Kong Admin API stays ClusterIP-only;
+        Prometheus, Alertmanager, Loki and the Drone runner get no public route at all (Grafana is the
+        only observability surface Kong exposes, and it requires login - anonymous access off).
+      - Phases 0-4 must still be green afterwards: `make verify`, `make verify-phase1`,
+        `make verify-phase3`, `make verify-phase4` all keep passing. (`make verify-phase2` already
+        fails on /api/ping since Phase 3 made it auth-protected - pre-existing and documented, not a
+        Phase 5 regression. Phase 5 additionally changes the scheme to https, so verify-phase2 must be
+        updated to follow the redirect or be formally retired; decide which, do not leave it rotting.)
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories:
+        /k8s/platform/cert-manager
+        /k8s/observability/{prometheus,alertmanager,loki,promtail,grafana,grafana/dashboards}
+        /k8s/ci/{gitea,drone}
+        /ci
+      - Instantiate headered stubs (full list + descriptions in "Files (Phase 5 - Operate)" below):
+        Track A: /scripts/{cert-manager-install.sh,bootstrap-tls.sh,verify-phase5a.sh},
+                 /k8s/platform/cert-manager/{clusterissuer-selfsigned,clusterissuer-staging,
+                   clusterissuer-prod,certificate}.yaml,
+                 /k8s/platform/kong/tls.yaml
+        Track B: /scripts/{bootstrap-observability.sh,verify-phase5b.sh},
+                 /k8s/observability/prometheus/{configmap,rbac,deployment,alert-rules}.yaml,
+                 /k8s/observability/alertmanager/deployment.yaml,
+                 /k8s/observability/loki/{configmap,statefulset}.yaml,
+                 /k8s/observability/promtail/daemonset.yaml,
+                 /k8s/observability/grafana/{configmap,deployment}.yaml,
+                 /k8s/observability/grafana/dashboards/,
+                 /services/common/metrics.js, /docs/metrics-scraping.md
+        Track C: /scripts/{gitea-secrets.sh,registry-secret.sh,deploy-key.sh,migrate.sh,
+                   bootstrap-ci.sh,verify-phase5c.sh},
+                 /k8s/ci/gitea/{configmap,statefulset,service}.yaml,
+                 /k8s/ci/drone/{rbac,server-deployment,runner-deployment}.yaml,
+                 /ci/{.drone.example.yml,notify.sh}
+        Shared:  /scripts/verify-phase5.sh
+      - `chmod +x` the new /scripts/*.sh and /ci/notify.sh.
+      - Uncomment `observability` and `ci` in /k8s/base/namespaces.yaml.
+
+    - Step 1 - .env additions (no cluster needed)
+      - .env.example gains a "Phase 5 - Operate" block. Defaults must produce a working domainless
+        cluster, so every value below is either prefilled or explicitly optional:
+          # --- 5A TLS ---
+          TLS_MODE=selfsigned              # selfsigned | staging | production
+          ACME_EMAIL=                      # required only when TLS_MODE=staging|production
+          KONG_HTTPS_NODEPORT=30443        # HTTPS NodePort (HTTP stays 30080, redirects here)
+          # --- 5B Observability ---
+          GRAFANA_ADMIN_USER=admin
+          GRAFANA_ADMIN_PASSWORD=          # openssl rand -base64 24 - required before `make obs`
+          PROM_RETENTION=15d
+          LOKI_RETENTION=168h
+          ALERT_WEBHOOK_URL=               # optional; blank = alerts fire to Alertmanager UI only
+          # --- 5C CI/CD ---
+          REGISTRY_MODE=external           # external | incluster
+          GITEA_ADMIN_USER=gitea_admin
+          GITEA_ADMIN_PASSWORD=            # required before `make ci`
+          GITEA_ADMIN_EMAIL=
+          DRONE_RPC_SECRET=                # openssl rand -hex 32 - shared server<->runner
+        DOMAIN already exists in .env.example (Phase 0 block, default `backbone.local`) - do NOT add a
+        second one. Amend its comment to state that it is optional, that `backbone.local` means "no real
+        domain", and that TLS_MODE must stay `selfsigned` until it is a real resolvable name.
+      - docs/secrets.md: add rows for `kong-tls-cert` (platform, created by cert-manager),
+        `grafana-admin` (observability), `gitea-admin` + `drone-rpc-secret` (ci), and
+        `registry-credentials` (app + ci, created by registry-secret.sh).
+      - Verify: `grep` confirms each new key exists in .env.example; secret-bearing ones are blank.
+
+    == TRACK A - TLS (5A) ==
+
+    - Step 2 - cert-manager install (scripts/cert-manager-install.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl curl`.
+      - Apply the pinned static manifest (pin the version in the script, e.g. v1.16.x - do not track
+        `latest`): `kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/
+        <ver>/cert-manager.yaml`.
+      - Wait for all three Deployments (cert-manager, cert-manager-webhook, cert-manager-cainjector)
+        Available, then poll the webhook until it actually admits a resource - the Deployment going
+        Ready precedes the webhook serving, and applying a ClusterIssuer too early fails with a TLS
+        handshake error. Poll by dry-run-applying a throwaway Issuer until it succeeds (up to ~90s).
+      - Idempotent: re-applying the manifest is a no-op; skip if the CRDs and pods are already healthy.
+      - Verify: `kubectl get pods -n cert-manager` all Running; `kubectl get crd | grep cert-manager`
+        shows the six CRDs.
+
+    - Step 3 - ClusterIssuers (k8s/platform/cert-manager/clusterissuer-*.yaml)
+      - clusterissuer-selfsigned.yaml: `SelfSigned` ClusterIssuer named `backbone-selfsigned`. No email,
+        no ACME, no network. This is the default path and must work on an air-gapped cluster.
+      - clusterissuer-staging.yaml: ACME ClusterIssuer `backbone-staging`, server
+        `https://acme-staging-v02.api.letsencrypt.org/directory`, email from ACME_EMAIL, privateKeySecretRef
+        `letsencrypt-staging-key`, one HTTP-01 solver.
+      - clusterissuer-prod.yaml: same shape, `backbone-prod`, production ACME directory,
+        privateKeySecretRef `letsencrypt-prod-key`.
+      - HTTP-01 solver detail (the part that actually breaks): cert-manager creates a temporary Pod +
+        Service + Ingress-or-route to answer `/.well-known/acme-challenge/<token>`. Kong is DB-less and
+        does not read Ingress objects, so the challenge MUST be routed by an explicit declarative Kong
+        route added in Step 4 - the solver's Service is the upstream. Without it, HTTP-01 fails with a
+        404 from Kong and cert-manager retries until the ACME order times out. This is the single most
+        likely failure in Track A; call it out in the script's own error message.
+      - All three files ship in the repo; bootstrap-tls.sh applies only the one matching TLS_MODE.
+      - Verify: `kubectl apply --dry-run=server` passes on all three; after apply,
+        `kubectl get clusterissuer` shows the selected one with Ready=True.
+
+    - Step 4 - Certificate + Kong TLS listener (certificate.yaml, k8s/platform/kong/tls.yaml)
+      - certificate.yaml: Certificate `backbone-tls` in `platform` ns, `secretName: kong-tls-cert`
+        (FIXED - identical in all three modes, this is what makes the domain swap plug-and-play),
+        issuerRef templated by bootstrap-tls.sh from TLS_MODE. dnsNames:
+          selfsigned -> [backbone.local, <node-ip>]  (plus ipAddresses: [<node-ip>])
+          staging/prod -> [<DOMAIN>, git.<DOMAIN>, grafana.<DOMAIN>]
+      - k8s/platform/kong/tls.yaml: the additions Kong needs, merged into the existing
+        kong-configmap.yaml declarative config rather than shipped as a rival config (Kong DB-less
+        loads exactly one kong.yaml - two files would silently mean one wins):
+          - a `certificates:` entry reading the mounted kong-tls-cert secret
+          - HTTP->HTTPS redirect on every route EXCEPT `/.well-known/acme-challenge` (see Step 3) and
+            `/healthz`
+          - the acme-challenge route -> cert-manager's solver Service
+      - Update k8s/platform/kong/deployment.yaml: mount `kong-tls-cert` at /etc/secrets/kong-tls,
+        add KONG_PROXY_LISTEN `0.0.0.0:8443 ssl`, point KONG_SSL_CERT / KONG_SSL_CERT_KEY at the mount.
+      - Update k8s/platform/kong/proxy-service.yaml: add port 443 -> 8443, nodePort KONG_HTTPS_NODEPORT.
+      - Kong does NOT hot-reload a changed secret: bootstrap-tls.sh must rollout-restart the Kong
+        Deployment after the Certificate becomes Ready, and again after any issuer swap.
+      - Verify: `curl -k https://<endpoint>:30443/api/ping` returns ok; `curl -I http://<endpoint>:30080/`
+        returns 301 to https.
+
+    - Step 5 - Orchestration (scripts/bootstrap-tls.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl curl openssl`.
+      - Validate the mode/domain combination up front and fail with an actionable message:
+        TLS_MODE=staging|production requires DOMAIN set to something other than `backbone.local` AND
+        ACME_EMAIL non-blank; die naming the exact .env lines to fix.
+      - Order: (1) cert-manager-install.sh; (2) apply the ClusterIssuer for TLS_MODE, wait Ready=True;
+        (3) render + apply certificate.yaml with the mode's dnsNames; (4) merge the TLS block into
+        kong-configmap.yaml, apply, update the Kong Deployment + proxy Service; (5) wait for the
+        Certificate to become Ready (up to ~180s for ACME - self-signed is instant); (6) rollout-restart
+        Kong and wait; (7) print the HTTPS endpoint and, when TLS_MODE=selfsigned, the one-liner to
+        upgrade to a real domain later.
+      - Idempotent, and specifically re-runnable ACROSS modes: running it again with a changed TLS_MODE
+        must converge (apply the new issuer, repoint the Certificate's issuerRef, let cert-manager
+        reissue into the same secret, restart Kong). This is the plug-and-play path - test it explicitly.
+      - Verify: on a domainless cluster `make tls` -> HTTPS live with a self-signed cert. Then set
+        DOMAIN + TLS_MODE=staging, re-run, and confirm the cert is reissued by the staging CA with no
+        other change.
+
+    - Step 6 - Track A gate (scripts/verify-phase5a.sh) -> "PHASE 5A OK"
+      - Numbered `[n/N]` logs, `fail() { die "verify-phase5a: $*"; }`, trap EXIT cleanup, as in
+        verify-phase0-4.
+      - [1] cert-manager: three Deployments Available; CRDs present.
+      - [2] ClusterIssuer for the current TLS_MODE exists and is Ready=True.
+      - [3] Certificate `backbone-tls` is Ready=True and Secret `kong-tls-cert` holds tls.crt + tls.key.
+      - [4] Kong serves HTTPS: `curl -k https://<endpoint>:<KONG_HTTPS_NODEPORT>/api/ping` -> 200.
+      - [5] HTTP redirects: `curl -I http://<endpoint>:30080/` -> 301 with an https Location.
+      - [6] Mode-appropriate chain assertion, via `openssl s_client -connect ... </dev/null`:
+              selfsigned -> issuer CN is the self-signed CA; cert covers the node IP. Trust NOT asserted.
+              staging    -> issuer O contains "(STAGING)".
+              production -> issuer O is "Let's Encrypt" AND `curl` WITHOUT -k succeeds (real trust).
+            A domainless cluster must PASS here, not be skipped.
+      - [7] The acme-challenge path is reachable un-redirected over plain HTTP (the thing that makes a
+            future domain swap work): `curl -o /dev/null -w '%{http_code}' http://<endpoint>:30080/
+            .well-known/acme-challenge/probe` returns 404 from the solver route, NOT 301.
+      - Prints "PHASE 5A OK".
+
+    == TRACK B - OBSERVABILITY (5B) ==
+
+    - Step 7 - Prometheus (k8s/observability/prometheus/*)
+      - rbac.yaml: ServiceAccount `prometheus` + ClusterRole (get/list/watch on nodes, services,
+        endpoints, pods; `/metrics` nonResourceURL) + ClusterRoleBinding.
+      - configmap.yaml: prometheus.yml with kubernetes_sd_configs for pod and endpoint discovery,
+        relabel rules honouring the standard `prometheus.io/scrape|port|path` pod annotations, plus
+        static scrape of Kong's `/metrics` (requires enabling Kong's `prometheus` plugin in the
+        declarative config - add it in this step, it is not on by default). external_labels with
+        CLUSTER_NAME. Retention from PROM_RETENTION.
+      - deployment.yaml: Deployment + PVC (10Gi, local-path) + ClusterIP Service. Single replica -
+        Prometheus is not HA here and does not need to be. `--storage.tsdb.retention.time` from config.
+      - alert-rules.yaml: node down, pod crashloop, Kong 5xx rate, PVC >85% full, BullMQ queue depth
+        sustained high, certificate expiry <15d (consumes 5A - the rule is meaningless without it,
+        which is part of why TLS comes first).
+      - Verify: port-forward :9090, targets page shows kong + kube-state + the annotated services UP.
+
+    - Step 8 - Alertmanager + Loki + Promtail
+      - alertmanager/deployment.yaml: Deployment + Service + config Secret. Route to ALERT_WEBHOOK_URL
+        via /ci/notify.sh's webhook contract when set; when blank, a null receiver so alerts still
+        collect in the UI without erroring. Wire Prometheus's alerting.alertmanagers at it.
+      - loki/configmap.yaml: single-binary config, boltdb-shipper + filesystem store, retention from
+        LOKI_RETENTION, ingestion limits sized for a small cluster.
+      - loki/statefulset.yaml: StatefulSet + volumeClaimTemplate (10Gi) + Service. StatefulSet not
+        Deployment - it owns a PVC, same reasoning as Phase 1.
+      - promtail/daemonset.yaml: DaemonSet + its own RBAC, tails /var/log/pods, relabels to
+        namespace/pod/container, ships to `loki.observability.svc:3100`. DaemonSet means every future
+        joined node ships logs with zero extra configuration - this is the Phase 0 horizontal-scale
+        property being honoured.
+      - Verify: Promtail Ready on every node (`kubectl get ds -n observability` desired == ready);
+        a LogQL query for a known pod returns lines from the last 5m.
+
+    - Step 9 - Grafana + service metrics
+      - grafana/configmap.yaml: provisioning for datasources (Prometheus + Loki) and a dashboard
+        provider; `auth.anonymous.enabled=false`; `GF_SERVER_ROOT_URL` and
+        `GF_SERVER_SERVE_FROM_SUB_PATH=true` so the `/grafana` path route works without a domain.
+      - grafana/dashboards/: JSON for cluster health, Kong traffic/latency/5xx, MongoDB, Redis,
+        BullMQ queues, per-service logs.
+      - grafana/deployment.yaml: Deployment + PVC + Service; admin creds from the `grafana-admin`
+        Secret (created from .env by bootstrap-observability.sh via the create-secrets.sh pattern).
+      - Kong route: `/grafana` on the existing proxy, plus the `grafana.<DOMAIN>` host route activated
+        only when DOMAIN is real. Per the domain constraint, the path route always works.
+      - services/common/metrics.js: shared prom-client middleware - default metrics, an HTTP request
+        histogram, and a BullMQ queue-depth gauge for the worker. Mount it in all five backend services
+        (ping, auth, jobs-api, worker, and the frontend's NGINX via a stub exporter or skip the frontend)
+        at `/metrics`, and add the `prometheus.io/scrape` annotations to their Deployments.
+        This is the second place Phase 5 touches Phase 2-4 artifacts; it is additive (a new route and
+        new annotations) and requires an image rebuild of those services.
+      - The queue-depth gauge is what Phase 4's HPA note anticipated. Wiring the HPA to it is
+        explicitly OUT of scope here (it needs prometheus-adapter, a whole extra component); the metric
+        exists so a later phase can. Say so, do not half-build it.
+      - docs/metrics-scraping.md: the annotation convention every future service must follow.
+      - Verify: Grafana loads at /grafana, login with GRAFANA_ADMIN_*, both datasources green, each
+        dashboard renders with data.
+
+    - Step 10 - Orchestration + Track B gate
+      - scripts/bootstrap-observability.sh: assert ns observability exists (die pointing at `make base`);
+        create grafana-admin Secret from .env; apply Prometheus (rbac -> config -> rules -> deploy) ->
+        Alertmanager -> Loki -> Promtail -> Grafana; enable Kong's prometheus plugin + add the grafana
+        route; wait every rollout. Idempotent.
+      - scripts/verify-phase5b.sh -> "PHASE 5B OK":
+        [1] All observability workloads Ready; Promtail DaemonSet ready on every node.
+        [2] Prometheus targets: kong, kube-state-metrics, node-exporter, and at least the annotated
+            backend services all UP (query the /api/v1/targets endpoint from an in-cluster pod).
+        [3] A metric that only exists if 5B's own instrumentation works is present - e.g. the HTTP
+            histogram from services/common/metrics.js for the ping service.
+        [4] Loki: LogQL query for a pod known to be running returns >0 lines from the last 5m.
+        [5] Grafana: /grafana returns 200 through Kong; both datasources report healthy via the
+            Grafana API; anonymous access is refused (401 without credentials).
+        [6] A synthetic alert fires end-to-end: apply a rule that is immediately true, confirm it
+            reaches Alertmanager, then remove it.
+        [7] Prometheus and Alertmanager have NO public Kong route (assert 404 from outside).
+
+    == TRACK C - CI/CD + REGISTRY (5C) ==
+
+    - Step 11 - Gitea (k8s/ci/gitea/*, scripts/gitea-secrets.sh)
+      - gitea-secrets.sh: create `gitea-admin` (user/password/email from .env) and `drone-rpc-secret`
+        (DRONE_RPC_SECRET) in ns `ci`, idempotent, never echoed.
+      - configmap.yaml: app.ini - SQLite backend (no Postgres; this is a single-instance CI server,
+        matching the no-extra-moving-parts posture), open registration DISABLED, the built-in container
+        registry ENABLED, webhook ALLOWED_HOST_LIST covering the in-cluster Drone URL (Gitea blocks
+        webhooks to private IPs by default - this is the standard Gitea+Drone bring-up failure).
+        ROOT_URL set from DOMAIN-or-nodeip so clone URLs and the registry host are correct in both cases.
+      - statefulset.yaml: StatefulSet + volumeClaimTemplate (20Gi - repos AND registry blobs share it;
+        size accordingly) + probes on /api/healthz.
+      - service.yaml: ClusterIP for HTTP (3000) and SSH (22).
+      - Kong route `/git` (+ `git.<DOMAIN>` when real). The registry is served from the same host.
+      - Verify: Gitea UI loads through Kong, admin can log in, a test repo can be created and pushed to.
+
+    - Step 12 - Drone (k8s/ci/drone/*, scripts/deploy-key.sh)
+      - rbac.yaml: ServiceAccount + Role/RoleBinding in `ci` letting the runner create/watch pods and
+        secrets for build steps.
+      - server-deployment.yaml: Drone server + Service. Needs a Gitea OAuth app - bootstrap-ci.sh
+        creates it via Gitea's API using the admin credential and injects client id/secret as a Secret.
+        (Doing this by hand in the UI is the usual instruction; automate it or the phase is not
+        reproducible.) DRONE_RPC_SECRET from the shared secret; DRONE_SERVER_HOST from DOMAIN-or-nodeip.
+      - runner-deployment.yaml: drone-runner-kube, same RPC secret, configured to schedule build pods
+        into `ci`.
+      - deploy-key.sh: create a ServiceAccount in `app` with a Role permitting only
+        `patch deployments` + `get deployments/status` (NOT cluster-admin), mint a token, and register
+        it as a Drone secret. This is the credential pipelines deploy with - least privilege matters
+        here because it is reachable from any repo the CI server builds.
+      - ci/.drone.example.yml: reference pipeline - test -> build image -> push to the Gitea registry ->
+        `kubectl set image` -> wait rollout -> rollback on failed health -> notify.
+      - ci/notify.sh: post success/failure to ALERT_WEBHOOK_URL; shared with Alertmanager from 5B.
+      - scripts/migrate.sh: up/down MongoDB migration runner for use as a pipeline step, tracking
+        applied migrations in a `_migrations` collection.
+      - Verify: a push to a Gitea test repo triggers a Drone build that completes and updates a
+        Deployment; a deliberately failing health check rolls back.
+
+    - Step 13 - Registry cutover (scripts/registry-secret.sh + lib.sh + six Deployments)
+      - lib.sh gains `registry_prefix()`: returns `$REGISTRY_URL` when REGISTRY_MODE=external, and the
+        in-cluster Gitea registry host when REGISTRY_MODE=incluster. build-push.sh and every bootstrap
+        script resolve image names through it - this is what makes the cutover one variable.
+      - registry-secret.sh: mint a Gitea deploy token via the API, create the `registry-credentials`
+        docker-registry Secret in `app` and `ci`, idempotent, never echoed.
+      - Staged cutover (do NOT flip all six at once):
+        (1) REGISTRY_MODE=incluster; run build-push.sh for `ping` only; flip ping's Deployment image +
+            imagePullSecrets; confirm ping rolls out and `/api/ping` still answers.
+        (2) Repeat for auth, jobs-api, worker, frontend.
+        (3) Re-run verify-phase1/3/4 - all still green.
+      - Rollback: set REGISTRY_MODE=external and re-run the bootstraps; images resolve to the public
+        registry again. Verify this path works before declaring the track done - an untested rollback
+        is not a rollback.
+      - Update the Phase 0 "DROPPED (superseded)" note: `scripts/registry-secret.sh` is reinstated in
+        Phase 5 with a Gitea-backed implementation. Also update the Phase 2 note that says images go to
+        a public registry "until Phase 5", to point here.
+      - Verify: `kubectl -n app get deploy -o jsonpath` shows all six images on the Gitea host;
+        `kubectl -n app get pods` shows no ImagePullBackOff; deleting a pod re-pulls successfully
+        (proves the pull secret works, not just a cached image).
+
+    - Step 14 - Track C gate (scripts/verify-phase5c.sh) -> "PHASE 5C OK"
+      - [1] Gitea and Drone (server + runner) Deployments/StatefulSet Ready.
+      - [2] Gitea reachable through Kong at /git; admin login works; open registration is OFF
+            (assert the register endpoint refuses).
+      - [3] Registry: push a tiny test image to the Gitea registry with the deploy token and pull it
+            back from a throwaway pod using `registry-credentials`.
+      - [4] End-to-end pipeline: push a commit to a seeded test repo -> Drone build triggers ->
+            completes -> the target Deployment's image changes -> rollout succeeds.
+      - [5] Auto-rollback: push a commit whose health check fails -> the pipeline rolls the Deployment
+            back and the previous image is serving.
+      - [6] Deploy credential is least-privilege: with the deploy token, `kubectl get secrets -n app`
+            is DENIED while `kubectl patch deploy` is allowed.
+      - [7] All six app Deployments pull from the in-cluster registry (REGISTRY_MODE=incluster).
+      - Clean up the test repo, test image, and any throwaway pods (trap EXIT).
+
+    - Step 15 - Makefile wiring
+      - New targets (.PHONY; reuse the top-of-file `KUBECONFIG`):
+        `make tls`            -> scripts/bootstrap-tls.sh
+        `make verify-phase5a` -> scripts/verify-phase5a.sh
+        `make obs`            -> scripts/bootstrap-observability.sh
+        `make verify-phase5b` -> scripts/verify-phase5b.sh
+        `make ci`             -> scripts/bootstrap-ci.sh
+        `make verify-phase5c` -> scripts/verify-phase5c.sh
+        `make verify-phase5`  -> scripts/verify-phase5.sh   (runs 5a, 5b, 5c in order)
+        `make phase5`         -> tls obs ci verify-phase5
+      - All fail fast via `_need-kubeconfig`.
+      - `make lint`: add the new scripts to shellcheck; add `k8s/observability/`, `k8s/ci/`, and
+        `k8s/platform/cert-manager/` to the `kubectl apply --dry-run=server` set.
+      - `make help`: add the Phase 5 lines, marking `tls` as safe to run with no domain.
+
+    - Step 16 - Clean-cluster dry run
+      - On a cluster that has passed Phase 4, with NO domain: `make phase5` -> "PHASE 5 OK".
+        This is the primary acceptance run - the domainless path is the default path, not a fallback.
+      - Then exercise the plug-and-play swap on that same cluster: point a real domain's A record at
+        the node, set DOMAIN + ACME_EMAIL + TLS_MODE=staging, `make tls` -> 5A gate passes with a
+        staging chain. Set TLS_MODE=production, `make tls` -> 5A passes with a trusted chain and
+        `curl` without `-k` succeeds. Confirm nothing outside .env changed and no service was rebuilt.
+      - Re-run `make verify`, `make verify-phase1`, `make verify-phase3`, `make verify-phase4` -> all
+        still pass. Resolve verify-phase2 per the Guiding rules note (update for https, or retire it).
+      - Tag `phase-5-complete` once the domainless run is green AND the domain swap has been done at
+        least once against staging.
+
+    - Definition of done (Phase 5)
+      - Every file in "Files (Phase 5 - Operate)" exists with real content (no STUB markers).
+      - On a Phase 4 cluster with no domain: `make phase5` -> "PHASE 5 OK"; each track's gate also
+        passes standalone.
+      - TLS: HTTPS terminates at Kong, HTTP 301-redirects, and the mode swap selfsigned -> staging ->
+        production is a pure .env edit plus `make tls`, verified at least through staging. The
+        acme-challenge path stays reachable un-redirected so a future swap cannot deadlock.
+      - Observability: Prometheus scrapes every service via annotations, Loki has logs from every node
+        via the Promtail DaemonSet, Grafana renders all dashboards behind a login at /grafana, alerts
+        reach Alertmanager. Prometheus/Alertmanager/Loki have no public route.
+      - CI/CD: a push to Gitea triggers a Drone build that deploys to `app` with a least-privilege
+        credential and auto-rolls-back on a failed health check.
+      - Registry: all six service Deployments pull from the in-cluster Gitea registry using
+        `registry-credentials`; REGISTRY_MODE=external is a verified rollback. The Phase 0 DROPPED note
+        and the Phase 2 "until Phase 5" note are both updated to match reality.
+      - Phases 0-4 still green (verify-phase2 resolved, not left rotting).
+      - No secrets in git; new .env keys blank where secret; scripts pass `bash -n` (shellcheck where
+        available); all new k8s directories pass `kubectl apply --dry-run=server`.
+      - README gains a "Phase 5 - Operate" section: the three tracks and their targets, the TLS mode
+        table with the exact domain-swap procedure, Grafana access, the CI/CD walkthrough, and the
+        registry cutover + rollback.
+
 - Files (Phase 5 - Operate)
   Format: file_name | file_path | description | depends_on[]
-  Three independent tracks that can be built in any order: CI/CD (ci ns), Observability (observability ns), TLS (platform ns / cluster-wide).
-  All consume, but are not consumed by, Phases 0-4.
+  Three tracks, built in the order 5A TLS -> 5B Observability -> 5C CI/CD (see the Phase 5 plan above
+  for the ordering rationale and the per-track sub-gates). Tracks are independent enough to stop after
+  any one, but the plan's order is the tested one: 5B's cert-expiry alert consumes 5A, and 5C's Gitea
+  registry is served over 5A's TLS listener.
+  All consume, but are not consumed by, Phases 0-4 - except two deliberate mutations of earlier
+  artifacts, both in the plan above: services/common/metrics.js is added to the Phase 2-4 services
+  (additive), and the Phase 5 registry cutover rewrites the image reference in all six Deployments.
+
+  STATUS: IMPLEMENTED, NOT YET RUN AGAINST A CLUSTER. All files below exist with real content (no
+  STUB markers); every script passes `bash -n` and `shellcheck -S warning`; all 46 manifests parse as
+  YAML with their templates rendered. The acceptance runs in Step 16 (domainless `make phase5`, then
+  the staging domain swap) still need a live Phase 4 cluster before tagging `phase-5-complete`.
+
+  Deviations from the plan above, decided during implementation:
+   - Kong's TLS listener is patched on by bootstrap-tls.sh rather than shipped in deployment.yaml.
+     Kong refuses to start when an `ssl` listener is declared with no certificate present, which would
+     have made cert-manager a hard prerequisite for the Phase 2 gateway. The committed Deployment
+     stays HTTP-only so Phase 2 still stands alone; the kong-tls-cert mount is `optional: true`.
+   - The self-signed path issues a real CA + leaf (clusterissuer-selfsigned.yaml creates a SelfSigned
+     bootstrap issuer, a CA Certificate, then a CA ClusterIssuer) rather than a bare self-signed leaf,
+     which some clients reject outright. It also exercises the same chain-building code as ACME.
+   - Kong declarative routes are merged by `kong_insert_block()` in lib.sh, not by `awk -v`: BSD/macOS
+     awk rejects embedded newlines in a -v assignment, so the awk form silently injected nothing on a
+     macOS control host. The marker is matched at column 0 (`^plugins:`) because kubectl strips the
+     block-scalar indent when reading kong.yaml back out of the ConfigMap.
+   - build-push.sh now builds all five services (jobs-api and worker were never added in Phase 4) and
+     selects the Docker build context per service - ping/jobs-api/worker need the repo root because
+     they COPY services/common; frontend/auth use their own directory. One shared context breaks two
+     of them either way.
+   - verify-phase5b [6] asserts the alerting PIPELINE (Alertmanager connected, rule groups loaded)
+     rather than firing a synthetic alert, which would require mounting a rule into Prometheus and
+     restarting it to test the same two failure modes.
+   - The in-cluster registry needs `/etc/rancher/k3s/registries.yaml` on every node (it is plain HTTP
+     inside the cluster). registry-secret.sh prints the exact file; this is manual, per-node, and is
+     the most likely cause of ImagePullBackOff after setting REGISTRY_MODE=incluster.
+   - services/auth switched to a repo-root Docker build context so it can COPY services/common; it
+     was the one backend service that never imported the shared modules. build-push.sh knows this
+     (only the frontend still builds from its own directory).
+   - Instrumentation IS wired: prom-client added to ping/auth/jobs-api/worker, instrumentHttp() in
+     the three Express services, /metrics folded into the worker's existing health server (its
+     mongo+worker readiness logic was better than the generic one in metrics.js), job counters and
+     duration recorded around the handler, and the queue-depth gauge polled from the worker. The
+     prometheus.io/scrape annotations are on all four pod templates.
+   - STILL OUTSTANDING: verify-phase2.sh has NOT been updated for the https scheme. The Guiding rules
+     require it be updated to follow the redirect or formally retired - it currently fails for two
+     independent reasons (Phase 3 made /api/ping auth-protected, and Phase 5A moved the scheme).
+     Decide and do it before tagging phase-5-complete.
 
   == Track A: CI/CD (Gitea + Drone) ==
     - gitea-config.yaml | /k8s/ci/gitea/configmap.yaml

@@ -5,7 +5,8 @@
 #   data     - datastores (MongoDB, Redis later)
 #   app      - application services (auth, jobs-api, worker later)
 #
-# observability and ci are created in Phase 5; left commented here on purpose.
+#   observability - PLG stack (Prometheus, Loki, Grafana) - Phase 5B
+#   ci            - Gitea + Drone + the in-cluster registry - Phase 5C
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -26,17 +27,17 @@ metadata:
   name: app
   labels:
     backbone.dev/tier: app
-# ---
-# apiVersion: v1
-# kind: Namespace
-# metadata:
-#   name: observability
-#   labels:
-#     backbone.dev/tier: observability
-# ---
-# apiVersion: v1
-# kind: Namespace
-# metadata:
-#   name: ci
-#   labels:
-#     backbone.dev/tier: ci
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    backbone.dev/tier: observability
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ci
+  labels:
+    backbone.dev/tier: ci

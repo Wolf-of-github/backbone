@@ -19,3 +19,11 @@ spec:
     targetPort: 8000
     protocol: TCP
     nodePort: 30080
+  # Phase 5A. Present before TLS is configured too - until bootstrap-tls.sh adds
+  # Kong's 8443 listener this port simply has nothing behind it, which is
+  # harmless and keeps the NodePort reserved at a stable number.
+  - name: proxy-ssl
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+    nodePort: 30443

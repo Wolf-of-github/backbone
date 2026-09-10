@@ -1,0 +1,46 @@
+# configmap.yaml
+# Purpose: Grafana provisioning - datasources and the dashboard provider.
+# depends_on: [../prometheus/deployment.yaml, ../loki/statefulset.yaml]
+#
+# Datasources are provisioned as files rather than clicked in, so a rebuilt
+# Grafana comes back identical and the verify script can assert on them.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: observability
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      # uids are pinned because the provisioned dashboards reference them by uid.
+      # Letting Grafana generate them would leave every panel with a dangling
+      # datasource on a fresh install.
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.observability.svc:9090
+        isDefault: true
+        editable: false
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.observability.svc:3100
+        editable: false
+        jsonData:
+          maxLines: 1000
+
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: backbone
+        orgId: 1
+        folder: backbone
+        type: file
+        disableDeletion: true
+        updateIntervalSeconds: 30
+        allowUiUpdates: false
+        options:
+          path: /var/lib/grafana/dashboards

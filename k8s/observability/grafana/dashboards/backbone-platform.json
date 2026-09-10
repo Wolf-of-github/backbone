@@ -1,0 +1,187 @@
+{
+  "//": "backbone platform overview. Provisioned read-only from a ConfigMap - edit this file, not the UI. Panels intentionally cover the four things that break: the edge, the datastores, the async queue, and node capacity.",
+  "title": "backbone / Platform Overview",
+  "uid": "backbone-platform",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(kube_pod_info, namespace)",
+        "current": { "text": "app", "value": "app" },
+        "includeAll": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Edge (Kong)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Request rate by status class",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum by (code) (rate(kong_http_requests_total[5m]))",
+          "legendFormat": "{{code}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request latency (p50 / p95 / p99)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(kong_request_latency_ms_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(kong_request_latency_ms_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kong_request_latency_ms_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Async jobs (BullMQ)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Queue depth",
+      "description": "Waiting jobs. Sustained growth means workers are not keeping up - scale deploy/worker.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        { "expr": "backbone_queue_depth", "legendFormat": "{{queue}} / {{state}}" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Job throughput",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(backbone_jobs_processed_total[5m]))",
+          "legendFormat": "processed / {{type}}"
+        },
+        {
+          "expr": "sum by (type) (rate(backbone_jobs_failed_total[5m]))",
+          "legendFormat": "failed / {{type}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Worker replicas",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 10 },
+      "targets": [
+        {
+          "expr": "kube_deployment_status_replicas_available{namespace=\"app\", deployment=\"worker\"}",
+          "legendFormat": "available"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Nodes and storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "CPU usage by node",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "1 - avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "bargauge",
+      "title": "PVC utilisation",
+      "description": "local-path volumes do not grow. The PVCNearlyFull alert fires at 85%.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.75 },
+              { "color": "red", "value": 0.85 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes",
+          "legendFormat": "{{persistentvolumeclaim}}"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Logs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 }
+    },
+    {
+      "id": 31,
+      "type": "logs",
+      "title": "Errors across the selected namespace",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 28 },
+      "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending" },
+      "targets": [
+        {
+          "expr": "{namespace=~\"$namespace\"} |~ \"(?i)error|exception|fatal\"",
+          "queryType": "range"
+        }
+      ]
+    }
+  ]
+}
