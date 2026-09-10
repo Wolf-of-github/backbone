@@ -3,7 +3,10 @@
 #          written by kong-configmap.yaml once Phase 5A runs.
 # depends_on: [kong-configmap.yaml, ../cert-manager/certificate.yaml]
 #
-# TEMPLATE: ${ACME_SOLVER_ROUTE} is substituted by scripts/bootstrap-tls.sh.
+# TEMPLATE: the ACME_SOLVER_ROUTE placeholder near the end of the services list
+# is substituted by scripts/bootstrap-tls.sh. Never write that variable in its
+# dollar-brace form inside a comment: envsubst rewrites comment lines too, and
+# expanding a multi-line YAML block into a '#' line corrupts the document.
 #
 # WHY THIS IS A WHOLE CONFIG, NOT A FRAGMENT
 # Kong in DB-less mode loads exactly one declarative file. Shipping a second

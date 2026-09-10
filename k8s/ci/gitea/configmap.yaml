@@ -2,7 +2,7 @@
 # Purpose: Gitea app.ini - self-hosted git + the built-in container registry.
 # depends_on: [k8s/base/namespaces.yaml]
 #
-# TEMPLATE: ${GITEA_ROOT_URL} and ${GITEA_DOMAIN} substituted by
+# TEMPLATE: GITEA_ROOT_URL and GITEA_DOMAIN substituted by
 # scripts/bootstrap-ci.sh.
 #
 # SQLite, not Postgres: this is a single-instance CI server for one platform.

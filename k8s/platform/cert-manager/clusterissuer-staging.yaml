@@ -3,7 +3,7 @@
 #          no meaningful rate limits - this is the rehearsal for production.
 # depends_on: [scripts/cert-manager-install.sh]
 #
-# TEMPLATE: ${ACME_EMAIL} is substituted by scripts/bootstrap-tls.sh.
+# TEMPLATE: ACME_EMAIL is substituted by scripts/bootstrap-tls.sh.
 #
 # The HTTP-01 solver publishes a challenge at
 #   http://<domain>/.well-known/acme-challenge/<token>

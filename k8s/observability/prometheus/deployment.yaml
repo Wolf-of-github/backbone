@@ -2,7 +2,7 @@
 # Purpose: Prometheus server - Deployment + PVC + ClusterIP Service.
 # depends_on: [configmap.yaml, rbac.yaml, alert-rules.yaml, k8s/base/storageclass.yaml]
 #
-# TEMPLATE: ${PROM_RETENTION} substituted by scripts/bootstrap-observability.sh.
+# TEMPLATE: PROM_RETENTION substituted by scripts/bootstrap-observability.sh.
 #
 # Single replica on a PVC, deliberately. Two Prometheis on one local-path volume
 # would corrupt the TSDB, and HA Prometheus means Thanos/Mimir - far past what

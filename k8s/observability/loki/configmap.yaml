@@ -2,7 +2,7 @@
 # Purpose: Loki single-binary config - filesystem storage on a local-path PVC.
 # depends_on: [k8s/base/namespaces.yaml]
 #
-# TEMPLATE: ${LOKI_RETENTION} substituted by scripts/bootstrap-observability.sh.
+# TEMPLATE: LOKI_RETENTION substituted by scripts/bootstrap-observability.sh.
 #
 # Single-binary (all components in one process) with filesystem storage, not the
 # microservices topology. The scaled-out mode needs object storage (S3/MinIO),

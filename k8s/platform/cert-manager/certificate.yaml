@@ -4,8 +4,8 @@
 # depends_on: [clusterissuer-selfsigned.yaml, clusterissuer-staging.yaml,
 #              clusterissuer-prod.yaml]
 #
-# TEMPLATE: ${CERT_ISSUER}, ${CERT_DNS_NAMES}, ${CERT_IP_ADDRESSES} and
-# ${CERT_COMMON_NAME} are substituted by scripts/bootstrap-tls.sh from TLS_MODE.
+# TEMPLATE: CERT_ISSUER, CERT_DNS_NAMES, CERT_IP_ADDRESSES and
+# CERT_COMMON_NAME are substituted by scripts/bootstrap-tls.sh from TLS_MODE.
 #
 # secretName is HARDCODED to kong-tls-cert and must stay that way. Kong's TLS
 # listener mounts that one name, so switching issuers (selfsigned -> staging ->

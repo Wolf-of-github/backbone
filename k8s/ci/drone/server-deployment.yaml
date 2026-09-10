@@ -2,7 +2,7 @@
 # Purpose: Drone CI server - receives Gitea webhooks, schedules builds.
 # depends_on: [../gitea/service.yaml, scripts/gitea-secrets.sh]
 #
-# TEMPLATE: ${DRONE_SERVER_HOST}, ${DRONE_SERVER_PROTO} and ${GITEA_SERVER_URL}
+# TEMPLATE: DRONE_SERVER_HOST, DRONE_SERVER_PROTO and GITEA_SERVER_URL
 # substituted by scripts/bootstrap-ci.sh.
 #
 # The Gitea OAuth client id/secret come from the drone-gitea-oauth Secret, which

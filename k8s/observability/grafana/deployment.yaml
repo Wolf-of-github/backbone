@@ -2,7 +2,7 @@
 # Purpose: Grafana - the only observability surface exposed through Kong.
 # depends_on: [configmap.yaml, dashboards/, scripts/bootstrap-observability.sh]
 #
-# TEMPLATE: ${GRAFANA_ROOT_URL} substituted by scripts/bootstrap-observability.sh
+# TEMPLATE: GRAFANA_ROOT_URL substituted by scripts/bootstrap-observability.sh
 # (https://<domain>/grafana, or https://<node-ip>:<port>/grafana with no domain).
 #
 # Served under the /grafana subpath rather than a subdomain, so it works on a

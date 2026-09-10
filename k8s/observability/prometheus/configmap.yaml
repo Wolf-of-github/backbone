@@ -3,7 +3,7 @@
 #          annotation-driven scraping convention documented in docs/metrics-scraping.md.
 # depends_on: [k8s/base/namespaces.yaml, rbac.yaml]
 #
-# TEMPLATE: ${CLUSTER_NAME} and ${PROM_RETENTION} are substituted by
+# TEMPLATE: CLUSTER_NAME and PROM_RETENTION are substituted by
 # scripts/bootstrap-observability.sh.
 #
 # Note on '$' below: relabel configs use ${1} capture-group syntax, which must

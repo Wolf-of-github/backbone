@@ -2,7 +2,7 @@
 # Purpose: Alertmanager - routes fired alerts to the configured webhook.
 # depends_on: [k8s/base/namespaces.yaml, /ci/notify.sh]
 #
-# TEMPLATE: ${ALERTMANAGER_RECEIVERS} and ${ALERTMANAGER_ROUTE_RECEIVER} are
+# TEMPLATE: ALERTMANAGER_RECEIVERS and ALERTMANAGER_ROUTE_RECEIVER are
 # substituted by scripts/bootstrap-observability.sh, which picks a webhook
 # receiver when ALERT_WEBHOOK_URL is set and a null receiver when it is blank.
 # A blank webhook must NOT be a failure - alerts still collect in the UI.
