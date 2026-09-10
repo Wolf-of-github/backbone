@@ -1627,11 +1627,252 @@
     - verify-phase3.sh | /scripts/verify-phase3.sh
       | Through public Kong: register+login returns a valid JWT; /api/auth/me with the token = 200, without/with tampered token = 401; a protected ping route rejects missing token; refresh rotates and old refresh token is revoked; cross-user object access is denied (IDOR).
       | depends_on: [bootstrap-auth.sh]
+- Phase 4 - Async work: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Scope: Add asynchronous background job processing using BullMQ (backed by Redis from Phase 1).
+      Two new services: (1) jobs-api - REST API for creating and monitoring jobs (auth-protected via Phase 3),
+      (2) worker - separate Deployment that pulls jobs from the queue and processes them. Jobs stored
+      durably in MongoDB beyond Redis retention. This proves the full async pattern: API enqueues →
+      Redis queue → worker processes → writes result to Mongo → API can fetch status/result.
+    - Runtime decision: BullMQ for queue management (mature, Redis-backed, built-in retry/progress/events),
+      separate worker Deployment (not part of web services, scales independently), HPA for auto-scaling
+      workers based on CPU (and later queue depth from Phase 5 observability). Job ownership tied to
+      authenticated user (req.user.id from Phase 3) for IDOR prevention. Jobs have unique IDs, status
+      tracking (pending/active/completed/failed), retry with exponential backoff, and graceful shutdown
+      (SIGTERM drains in-flight jobs).
+    - This is the FIRST phase that uses Redis as a queue (not just a cache). `services/common/queue.js`
+      is the shared BullMQ setup consumed by both jobs-api (producer) and worker (consumer). Pattern:
+      all job types in one queue, worker dispatches by job.name to handlers/ directory (one file per type).
+    - Example job types for this phase: (1) "hello-world" - trivial async task that sleeps then returns
+      a greeting (proves the basic flow), (2) "failing-job" - always throws an error (proves retry logic),
+      (3) optional: "slow-job" with progress updates (proves job.updateProgress()).
+
+    - Guiding rules (same as Phase 0-3)
+      - Bottom-up by depends_on: shared queue.js first, then jobs-api, then worker, then Kong routes,
+        then orchestration, then verification.
+      - Two passes per file: (1) instantiate with a header comment (purpose + depends_on, body a STUB
+        marker); (2) implement - real content, remove the STUB marker.
+      - Nothing is "done" until `make verify-phase4` (verify-phase4.sh) prints "PHASE 4 OK" and the
+        full chain `make phase4` exits 0 on a cluster that has passed Phase 3.
+      - Security: jobs tied to req.user.id (from Phase 3 auth); IDOR prevention (user A cannot read
+        user B's jobs); no secrets in logs; Redis password from Phase 1 secret.
+      - Phase 0-3 must still be green afterwards: `make verify`, `make verify-phase1`, `make verify-phase3`
+        all keep passing. (Phase 2 verify will fail on /api/ping since it's auth-protected now, but that's
+        expected and documented.)
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories: /services/jobs-api/src /services/worker/src /services/worker/src/handlers
+        /k8s/app/jobs-api /k8s/app/worker
+      - Instantiate headered stubs:
+        /services/common/queue.js
+        /services/jobs-api/{package.json,Dockerfile,.dockerignore,src/index.js,src/routes/jobs.js,src/models/job.js}
+        /services/worker/{package.json,Dockerfile,.dockerignore,src/index.js,src/handlers/helloWorld.js,src/handlers/failingJob.js}
+        /k8s/app/jobs-api/{deployment.yaml,service.yaml}
+        /k8s/app/worker/{deployment.yaml,hpa.yaml}
+        /scripts/{bootstrap-jobs.sh,verify-phase4.sh}
+      - `chmod +x` the new /scripts/*.sh.
+
+    - Step 1 - Shared queue library (services/common/queue.js)
+      - Purpose: Central BullMQ setup so jobs-api and worker use identical queue config.
+      - `const { Queue, Worker, QueueEvents } = require('bullmq');`
+      - `const Redis = require('ioredis');`
+      - Export `createQueue(name, opts)` - returns a BullMQ Queue instance connected to Redis
+        (host: redis.data.svc, port: 6379, password from env.REDIS_PASSWORD).
+      - Export `createWorker(name, processor, opts)` - returns a Worker connected to the same Redis.
+      - Export `createQueueEvents(name)` - returns QueueEvents for listening to queue-level events.
+      - Export `JOB_TYPES` enum: { HELLO_WORLD: 'hello-world', FAILING_JOB: 'failing-job' }.
+      - Default job options: `{ attempts: 3, backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: 100, removeOnFail: 200 }`.
+      - Verify: instantiate a Queue and Worker in a throwaway script, confirm they connect to Redis.
+
+    - Step 2 - Job model (services/jobs-api/src/models/job.js)
+      - Mongoose schema: `{ jobId: String (unique, indexed), ownerId: String (indexed), type: String,
+        status: String (enum: pending/active/completed/failed), data: Mixed (input params),
+        result: Mixed (output), progress: Number (0-100), createdAt: Date, updatedAt: Date,
+        completedAt: Date }`.
+      - Purpose: durable record of every job beyond Redis retention (BullMQ purges completed jobs after
+        removeOnComplete limit). The API lists a user's jobs by querying Mongo, not Redis.
+      - Indexes: `jobId` (unique), `ownerId` (for listing user's jobs), `status` (for filtering).
+      - Verify: `Job.create({ jobId: 'test', ownerId: 'user1', type: 'hello-world', status: 'pending' })`
+        succeeds; query by ownerId returns it.
+
+    - Step 3 - jobs-api service (services/jobs-api/src/)
+      - package.json: `{ "name": "jobs-api", "dependencies": { "express": "^4.18", "bullmq": "^5.0",
+        "ioredis": "^5.3", "mongoose": "^8.0", "dotenv": "^16.0" }, "scripts": { "start": "node src/index.js" } }`.
+      - Dockerfile: Multi-stage (Node 20 build -> Node 20-alpine runtime, non-root user uid 1001).
+        `COPY --chown=appuser:appgroup services/common ./src/common` (for queue.js + authContext.js).
+        `EXPOSE 3000`, `HEALTHCHECK --interval=30s CMD node -e "require('http').get('http://localhost:3000/healthz')"`.
+        `CMD ["node", "src/index.js"]`.
+      - src/index.js: Express app, connects to MongoDB (MONGO_APP_USER/PASSWORD/DB from env), connects
+        to Redis (via queue.js), mounts `/api/jobs` routes (from routes/jobs.js), `/healthz` (returns 200).
+      - src/routes/jobs.js:
+        - `const { requireAuth } = require('../common/authContext');`
+        - `const { createQueue, JOB_TYPES } = require('../common/queue');`
+        - `const Job = require('../models/job');`
+        - `POST /api/jobs` (requireAuth middleware):
+          - Extract `type` (from body, validate against JOB_TYPES), `data` (JSON), `priority` (optional).
+          - Generate `jobId` (uuid v4).
+          - Create Mongo record: `Job.create({ jobId, ownerId: req.user.id, type, status: 'pending', data })`.
+          - Enqueue to BullMQ: `queue.add(type, { jobId, ownerId: req.user.id, ...data }, { jobId, priority })`.
+          - Return `201 { jobId, status: 'pending' }`.
+        - `GET /api/jobs/:id` (requireAuth):
+          - Find job in Mongo by jobId.
+          - If not found, return 404.
+          - If job.ownerId !== req.user.id, return 403 (IDOR prevention).
+          - Optionally merge latest state from BullMQ (queue.getJob(jobId)) if Redis still has it.
+          - Return `200 { jobId, status, data, result, progress, createdAt, completedAt }`.
+        - `GET /api/jobs` (requireAuth):
+          - Query Mongo: `Job.find({ ownerId: req.user.id }).sort({ createdAt: -1 }).limit(50)`.
+          - Return `200 { jobs: [...] }`.
+      - Verify: start jobs-api locally (with local Mongo/Redis), POST /api/jobs with a Bearer token,
+        confirm job is queued (check Redis with redis-cli KEYS bullmq:*), GET /api/jobs/:id returns it.
+
+    - Step 4 - Worker service (services/worker/src/)
+      - package.json: `{ "name": "worker", "dependencies": { "bullmq": "^5.0", "ioredis": "^5.3",
+        "mongoose": "^8.0", "dotenv": "^16.0" }, "scripts": { "start": "node src/index.js" } }`.
+      - Dockerfile: Multi-stage, same pattern as jobs-api. `COPY --chown=appuser:appgroup services/common ./src/common`.
+        No EXPOSE (no HTTP server), but add `/healthz` via a minimal http server on port 3000 for the
+        liveness probe (returns 200 if worker.isRunning()).
+      - src/index.js:
+        - Connect to Mongo (for Job model updates), connect to Redis.
+        - `const { createWorker, JOB_TYPES } = require('./common/queue');`
+        - `const handlers = { [JOB_TYPES.HELLO_WORLD]: require('./handlers/helloWorld'),
+          [JOB_TYPES.FAILING_JOB]: require('./handlers/failingJob') };`
+        - Processor function: `async (job) => { const handler = handlers[job.name]; if (!handler) throw
+          new Error('Unknown job type'); await Job.updateOne({ jobId: job.id }, { status: 'active' });
+          const result = await handler(job); await Job.updateOne({ jobId: job.id }, { status: 'completed',
+          result, completedAt: new Date() }); return result; }`.
+        - On job.failed event: `await Job.updateOne({ jobId: job.id }, { status: 'failed', result:
+          job.failedReason })`.
+        - Graceful shutdown: on SIGTERM, `worker.close()` (drains in-flight jobs, waits up to 30s).
+        - Start the worker: `createWorker('jobs', processor, { concurrency: 5 })`.
+      - src/handlers/helloWorld.js:
+        - `module.exports = async (job) => { const { name = 'World' } = job.data; await sleep(2000);
+          return { greeting: \`Hello, \${name}!\`, processedAt: new Date() }; }`.
+      - src/handlers/failingJob.js:
+        - `module.exports = async (job) => { throw new Error('This job always fails for testing retry logic'); }`.
+      - Verify: start worker locally, enqueue a hello-world job via jobs-api, confirm worker picks it up
+        (logs show "Processing job <id>"), job.status updates to completed in Mongo, result is stored.
+
+    - Step 5 - Kubernetes manifests (k8s/app/jobs-api/* and k8s/app/worker/*)
+      - jobs-api/deployment.yaml: Deployment `jobs-api` in ns `app`, replicas 2, image from REGISTRY_URL,
+        env from secrets (MONGO_APP_USER/PASSWORD/DB from mongodb-credentials, REDIS_PASSWORD from
+        redis-password), readiness/liveness probes on /healthz. SecurityContext runAsNonRoot.
+      - jobs-api/service.yaml: ClusterIP Service `jobs-api` in ns `app`, port 80 -> 3000.
+      - worker/deployment.yaml: Deployment `worker` in ns `app`, replicas 2 (or 1 initially), image from
+        REGISTRY_URL, env from secrets (same as jobs-api), liveness probe on /healthz (no readiness - workers
+        don't serve traffic). Resource requests/limits: `requests: { cpu: 100m, memory: 256Mi },
+        limits: { cpu: 500m, memory: 512Mi }`. Graceful shutdown: `terminationGracePeriodSeconds: 60`.
+      - worker/hpa.yaml: HorizontalPodAutoscaler targeting `worker` Deployment, minReplicas 1, maxReplicas 10,
+        targetCPUUtilizationPercentage 70. (Phase 5 will add a custom queue-depth metric.)
+      - Verify (dry-run): `kubectl apply --dry-run=server -f k8s/app/jobs-api/` and `k8s/app/worker/` pass.
+
+    - Step 6 - Kong integration (update k8s/platform/kong/kong-configmap.yaml)
+      - Add a new route to the declarative config:
+        ```yaml
+        - name: jobs-api-route
+          paths:
+          - /api/jobs
+          service:
+            name: jobs-api
+            namespace: app
+            port: 80
+          strip_path: false
+        ```
+      - No separate rate-limit plugin for now (can add in Phase 5 if needed).
+      - Auth is handled by jobs-api itself (requireAuth middleware), not Kong.
+      - Verify: after applying the updated ConfigMap and restarting Kong, `curl http://<kong-proxy>/api/jobs`
+        with a valid Bearer token reaches jobs-api.
+
+    - Step 7 - Orchestration (scripts/bootstrap-jobs.sh)
+      - `set -euo pipefail`; source lib.sh; `load_env`; `need kubectl docker`.
+      - Assert Phase 0 namespaces exist; assert Phase 1 (mongodb + redis) and Phase 3 (auth) are healthy.
+      - Order:
+        (1) Build + push jobs-api image: `docker build -t $REGISTRY_URL/jobs-api:$TAG -f services/jobs-api/Dockerfile .
+            && docker push $REGISTRY_URL/jobs-api:$TAG`.
+        (2) Build + push worker image: same pattern.
+        (3) Apply jobs-api deployment + service: `kubectl apply -f k8s/app/jobs-api/` and wait rollout.
+        (4) Apply worker deployment + hpa: `kubectl apply -f k8s/app/worker/` and wait rollout.
+        (5) Update Kong config (patch kong-configmap.yaml to add /api/jobs route), restart Kong.
+        (6) Run `kongctl.sh routes` to confirm /api/jobs route is present.
+      - Idempotent (re-running rebuilds images, reapplies manifests).
+      - Log each step; die on any failure.
+      - Verify: one `bootstrap-jobs.sh` run on a Phase 3 cluster leaves jobs-api + worker Running,
+        Kong restarted with /api/jobs route active.
+
+    - Step 8 - .env additions (optional for Phase 4)
+      - No new .env vars required (reuses REGISTRY_URL, mongodb/redis creds from earlier phases).
+      - Optional: add `WORKER_CONCURRENCY=5` (how many jobs a worker processes concurrently) if you want
+        it configurable.
+
+    - Step 9 - Makefile wiring
+      - New targets (.PHONY; reuse top-of-file `KUBECONFIG`):
+        `make jobs`          -> scripts/bootstrap-jobs.sh
+        `make verify-phase4` -> scripts/verify-phase4.sh
+        `make phase4`        -> jobs verify-phase4
+      - All fail fast via `_need-kubeconfig` if ./kubeconfig is missing.
+      - Update `make build-push` to also build jobs-api + worker (or create a separate `make build-jobs` target).
+      - `make lint`: add scripts/bootstrap-jobs.sh and scripts/verify-phase4.sh to shellcheck; add
+        `k8s/app/jobs-api/` and `k8s/app/worker/` to `kubectl apply --dry-run=server`.
+      - `make help`: add Phase 4 lines.
+
+    - Step 10 - Verification script (scripts/verify-phase4.sh) - the 100% gate
+      - `set -euo pipefail`; source lib.sh; `load_env`; KUBECONFIG from lib.
+        `fail() { die "verify-phase4: $*"; }`. Numbered `[n/N]` logs like verify-phase0/1/2/3.
+      - [1] Deployments: jobs-api and worker exist and are Available (2/2 and >=1/1); jobs-api Service
+            has a ClusterIP; HPA exists for worker.
+      - [2] End-to-end job creation (authenticated):
+          - Register + login a test user (or reuse from verify-phase3).
+          - Get the public Kong endpoint (NodePort).
+          - `curl -X POST http://<endpoint>/api/jobs -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json'
+            -d '{"type":"hello-world","data":{"name":"Phase4"}}'` -> 201 with jobId.
+      - [3] Job completion polling:
+          - Poll `GET /api/jobs/:id` (with auth) every 2s for up to 30s until status = 'completed'.
+          - Confirm result.greeting = "Hello, Phase4!".
+      - [4] Failing job retry:
+          - Enqueue a failing-job: `POST /api/jobs -d '{"type":"failing-job"}'`.
+          - Poll until status = 'failed' (should happen after 3 attempts with exponential backoff, ~10-15s total).
+          - Confirm job.result contains "This job always fails".
+      - [5] Job ownership (IDOR prevention):
+          - Register a second test user (user2), login, get token2.
+          - Attempt to `GET /api/jobs/:id` (from [2], owned by user1) with token2 -> 403.
+          - Confirm user2 can create their own job and read it -> 200.
+      - [6] Worker resilience:
+          - Enqueue a slow job (if implemented) or another hello-world job.
+          - While it's active, kill one worker pod: `kubectl -n app delete pod -l app=worker --field-selector=status.phase=Running | head -1`.
+          - Confirm the job completes (another worker picks it up or the pod restarts and finishes it).
+      - [7] List jobs:
+          - `GET /api/jobs` (with user1 token) returns at least 2 jobs (hello-world + failing-job from this run).
+          - Confirm all returned jobs have ownerId = user1.id.
+      - Clean up: delete test users from MongoDB, delete test jobs from MongoDB (optional).
+      - Exit non-zero with a clear message on the first failed assertion; print "PHASE 4 OK" on success.
+
+    - Step 11 - Clean-cluster dry run
+      - On a cluster that has passed Phase 0, Phase 1, and Phase 3: `make phase4` -> "PHASE 4 OK".
+      - Re-run `make verify`, `make verify-phase1`, `make verify-phase3` -> all still pass (Phase 4 did
+        not regress earlier phases).
+      - From the browser (if frontend is updated): login, trigger a job via UI (or use curl), poll status,
+        see result.
+      - Tag `phase-4-complete` once `make phase4` is green from a clean Phase 3 cluster and the end-to-end
+        test passes.
+
+    - Definition of done (Phase 4)
+      - Every file in "Files (Phase 4 - Async work)" exists with real content (no STUB markers).
+      - On a Phase 3 cluster: `make phase4` -> "PHASE 4 OK" and `make` exits 0; earlier phase verifications
+        still pass.
+      - jobs-api deployed and healthy; worker deployed and healthy; HPA active; Kong routes /api/jobs.
+      - End-to-end flow works: authenticated user enqueues a job, worker processes it, result stored in
+        Mongo, API can fetch status/result; failing jobs retry then fail; user A cannot read user B's jobs.
+      - Worker gracefully shuts down on SIGTERM (drains in-flight jobs); killing a worker pod does not lose jobs.
+      - Shared queue.js library in services/common/ available for future services that need async work.
+      - No secrets in git (.env.example has no new Phase 4 vars, Redis password from Phase 1); scripts pass
+        `bash -n` (shellcheck where available); k8s/app/jobs-api/ and k8s/app/worker/ pass `kubectl apply --dry-run=server`.
+      - README gains a "Phase 4 - Async Work" section: BullMQ setup, `make phase4`, expected output,
+        creating jobs via API, checking job status, adding new job types (handlers/ directory).
 
 - Files (Phase 4 - Async work)
   Format: file_name | file_path | description | depends_on[]
   A job-producing API service + a separate worker Deployment, both in `app` ns.
-  Queue = Redis + BullMQ (Phase 1). Requests are auth-verified by Kong (Phase 3); worker uses authContext only for logging user provenance.
+  Queue = Redis + BullMQ (Phase 1). Requests are auth-verified by jobs-api using requireAuth from Phase 3; worker uses ownerId only for logging provenance.
 
   - Shared queue library
     - queue-lib | /services/common/queue.js
