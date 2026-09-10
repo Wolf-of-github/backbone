@@ -45,7 +45,7 @@ REGISTER_RESPONSE=$(curl -s -X POST "$ENDPOINT/api/auth/register" \
   -H "Content-Type: application/json" \
   -d "{\"email\":\"$TEST_EMAIL\",\"password\":\"$TEST_PASSWORD\"}")
 
-echo "$REGISTER_RESPONSE" | jq -e '.email' > /dev/null || fail "Registration failed: $REGISTER_RESPONSE"
+echo "$REGISTER_RESPONSE" | jq -e '.message' > /dev/null || fail "Registration failed: $REGISTER_RESPONSE"
 ok "Test user registered"
 
 # Login
