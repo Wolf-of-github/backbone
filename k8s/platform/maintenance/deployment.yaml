@@ -1,0 +1,101 @@
+# deployment.yaml
+# Purpose: The always-running maintenance page pod.
+# depends_on: [page-configmap.yaml, k8s/base/namespaces.yaml]
+#
+# ALWAYS RUNNING, even when maintenance is off. Maintenance is toggled by
+# swapping Kong's routing, not by starting this pod - because starting a pod
+# takes an image pull and a readiness probe, which is exactly the wrong thing
+# to discover is broken at the moment you need to take the site down. Idle cost
+# is a few MB of RAM.
+#
+# Stock nginx image with everything mounted from a ConfigMap: no build, no push,
+# and no dependency on the registry that Phase 5C would have provided.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maintenance
+  namespace: platform
+  labels:
+    app: maintenance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: maintenance
+  template:
+    metadata:
+      labels:
+        app: maintenance
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - name: http
+          containerPort: 8080
+        volumeMounts:
+        - name: page
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: page
+          mountPath: /usr/share/nginx/html/maintenance.html
+          subPath: maintenance.html
+          readOnly: true
+        # The nginx image's master process wants to write these; with a
+        # read-only root it needs them as writable mounts.
+        - name: cache
+          mountPath: /var/cache/nginx
+        - name: run
+          mountPath: /var/run
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 101          # nginx user in the alpine image
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        # Minimal: this pod is idle almost all of its life.
+        resources:
+          requests:
+            cpu: "10m"
+            memory: "16Mi"
+          limits:
+            cpu: "100m"
+            memory: "64Mi"
+      volumes:
+      - name: page
+        configMap:
+          name: maintenance-page
+      - name: cache
+        emptyDir: {}
+      - name: run
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maintenance
+  namespace: platform
+  labels:
+    app: maintenance
+spec:
+  type: ClusterIP
+  selector:
+    app: maintenance
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
