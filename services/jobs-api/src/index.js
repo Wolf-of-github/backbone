@@ -6,8 +6,14 @@ require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 
+const { instrumentHttp } = require('./common/metrics');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Phase 5B: request timing + GET /metrics. Before the routes so the middleware
+// sees every request.
+instrumentHttp(app, { serviceName: 'jobs-api' });
 
 // Middleware
 app.use(express.json());

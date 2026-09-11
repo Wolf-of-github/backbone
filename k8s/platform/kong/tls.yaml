@@ -1,0 +1,86 @@
+# tls.yaml
+# Purpose: The full Kong declarative config WITH TLS - replaces the ConfigMap
+#          written by kong-configmap.yaml once Phase 5A runs.
+# depends_on: [kong-configmap.yaml, ../cert-manager/certificate.yaml]
+#
+# TEMPLATE: the ACME_SOLVER_ROUTE placeholder near the end of the services list
+# is substituted by scripts/bootstrap-tls.sh. Never write that variable in its
+# dollar-brace form inside a comment: envsubst rewrites comment lines too, and
+# expanding a multi-line YAML block into a '#' line corrupts the document.
+#
+# WHY THIS IS A WHOLE CONFIG, NOT A FRAGMENT
+# Kong in DB-less mode loads exactly one declarative file. Shipping a second
+# ConfigMap alongside kong-configmap.yaml would not merge - one would silently
+# win. So Phase 5A rewrites the same ConfigMap key with the routes from Phase 2-4
+# plus the TLS additions. Any route added to kong-configmap.yaml later must be
+# added here too; bootstrap-tls.sh applies THIS file once TLS is on.
+#
+# HTTPS termination itself is configured on the Kong Deployment (KONG_SSL_CERT /
+# KONG_SSL_CERT_KEY pointing at the mounted kong-tls-cert secret), not here -
+# declarative `certificates:` entries would require the PEM inline in the
+# ConfigMap, which would put a private key in plaintext in git-adjacent state.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kong-declarative-config
+  namespace: platform
+data:
+  kong.yaml: |
+    _format_version: "3.0"
+
+    services:
+      - name: frontend-service
+        url: http://frontend.app.svc:80
+        routes:
+          - name: frontend-route
+            paths:
+              - /
+            strip_path: false
+            # Everything user-facing is forced to HTTPS.
+            protocols:
+              - https
+            https_redirect_status_code: 301
+
+      - name: auth-service
+        url: http://auth.app.svc:80
+        routes:
+          - name: auth-route
+            paths:
+              - /api/auth
+            strip_path: false
+            protocols:
+              - https
+            https_redirect_status_code: 301
+
+      - name: ping-service
+        url: http://ping.app.svc:80
+        routes:
+          - name: ping-route
+            paths:
+              - /api/ping
+            strip_path: false
+            protocols:
+              - https
+            https_redirect_status_code: 301
+
+      - name: jobs-api-service
+        url: http://jobs-api.app.svc:80
+        routes:
+          - name: jobs-api-route
+            paths:
+              - /api/jobs
+            strip_path: false
+            protocols:
+              - https
+            https_redirect_status_code: 301
+
+${ACME_SOLVER_ROUTE}
+    plugins:
+      # Exposes Kong's own metrics at :8001/metrics for Prometheus (Phase 5B).
+      # Enabled here because Phase 5B's scrape config depends on it and Kong
+      # does not turn it on by default.
+      - name: prometheus
+        config:
+          status_code_metrics: true
+          latency_metrics: true
+          bandwidth_metrics: true

@@ -13,12 +13,19 @@ spec:
       app: jobs-api
   template:
     metadata:
+      # Phase 5B: opt in to Prometheus discovery. These MUST be on the pod
+      # template - annotations on the Deployment itself are ignored.
+      # See docs/metrics-scraping.md.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
       labels:
         app: jobs-api
     spec:
       containers:
       - name: jobs-api
-        image: REGISTRY_URL/jobs-api:latest
+        image: REGISTRY_URL/backbone-jobs-api:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

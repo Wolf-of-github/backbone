@@ -1,0 +1,43 @@
+# clusterissuer-selfsigned.yaml
+# Purpose: Default issuer (TLS_MODE=selfsigned). Mints certs with no DNS, no
+#          ACME account and no internet egress, so HTTPS works on a cluster
+#          that has no domain - and on an air-gapped one.
+# depends_on: [scripts/cert-manager-install.sh]
+#
+# Two objects: a bare SelfSigned issuer used only to mint a CA, then a CA issuer
+# that signs the actual serving cert. The indirection matters - a single
+# SelfSigned issuer produces a leaf that is its own root, which some clients
+# reject outright. This way there is a real (if untrusted) chain to present,
+# so the selfsigned path exercises the same code as the ACME paths.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: backbone-selfsigned-bootstrap
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: backbone-ca
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: backbone-local-ca
+  secretName: backbone-ca-key-pair
+  duration: 87600h    # 10y - this CA is never rotated automatically
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  issuerRef:
+    name: backbone-selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: backbone-selfsigned
+spec:
+  ca:
+    secretName: backbone-ca-key-pair

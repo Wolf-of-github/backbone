@@ -1,0 +1,146 @@
+# deployment.yaml
+# Purpose: Grafana - the only observability surface exposed through Kong.
+# depends_on: [configmap.yaml, dashboards/, scripts/bootstrap-observability.sh]
+#
+# TEMPLATE: GRAFANA_ROOT_URL substituted by scripts/bootstrap-observability.sh
+# (https://<domain>/grafana, or https://<node-ip>:<port>/grafana with no domain).
+#
+# Served under the /grafana subpath rather than a subdomain, so it works on a
+# cluster with no domain. GF_SERVER_SERVE_FROM_SUB_PATH makes Grafana emit
+# correct asset and redirect URLs under that prefix; without it the app loads
+# but every link 404s.
+#
+# Anonymous access is off. Prometheus, Alertmanager and Loki have no public route
+# at all - reach them with kubectl port-forward.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: observability
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # RWO PVC - see prometheus/deployment.yaml
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        fsGroup: 472
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.2.0
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin
+              key: admin-user
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-admin
+              key: admin-password
+        - name: GF_SERVER_ROOT_URL
+          value: ${GRAFANA_ROOT_URL}
+        - name: GF_SERVER_SERVE_FROM_SUB_PATH
+          value: "true"
+        - name: GF_AUTH_ANONYMOUS_ENABLED
+          value: "false"
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: "false"
+        # Telemetry off: this is a self-hosted platform with no external deps.
+        - name: GF_ANALYTICS_REPORTING_ENABLED
+          value: "false"
+        - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+          value: "false"
+        ports:
+        - name: http
+          containerPort: 3000
+        volumeMounts:
+        - name: provisioning-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+          readOnly: true
+        - name: provisioning-dashboards
+          mountPath: /etc/grafana/provisioning/dashboards
+          readOnly: true
+        - name: dashboards
+          mountPath: /var/lib/grafana/dashboards
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/grafana
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 45
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      # One ConfigMap, two mounts - Grafana wants datasources and dashboard
+      # providers in separate provisioning directories.
+      - name: provisioning-datasources
+        configMap:
+          name: grafana-provisioning
+          items:
+          - key: datasources.yaml
+            path: datasources.yaml
+      - name: provisioning-dashboards
+        configMap:
+          name: grafana-provisioning
+          items:
+          - key: dashboards.yaml
+            path: dashboards.yaml
+      - name: dashboards
+        configMap:
+          name: grafana-dashboards
+      - name: data
+        persistentVolumeClaim:
+          claimName: grafana-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+  labels:
+    app: grafana
+spec:
+  type: ClusterIP
+  selector:
+    app: grafana
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000

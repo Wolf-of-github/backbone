@@ -13,13 +13,20 @@ spec:
       app: worker
   template:
     metadata:
+      # Phase 5B: opt in to Prometheus discovery. These MUST be on the pod
+      # template - annotations on the Deployment itself are ignored.
+      # See docs/metrics-scraping.md.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
       labels:
         app: worker
     spec:
       terminationGracePeriodSeconds: 60
       containers:
       - name: worker
-        image: REGISTRY_URL/worker:latest
+        image: REGISTRY_URL/backbone-worker:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

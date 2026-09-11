@@ -3,14 +3,18 @@ FROM node:20-alpine AS build
 
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Build context is the REPO ROOT (see scripts/build-push.sh) so that
+# services/common can be copied in - Phase 5B needs metrics.js here.
+COPY services/auth/package*.json ./
 
 # Install dependencies
 RUN npm ci --only=production
 
 # Copy source code
-COPY src ./src
+COPY services/auth/src ./src
+
+# Shared modules (metrics.js; authContext.js/queue.js available if needed)
+COPY services/common ./src/common
 
 # Production stage
 FROM node:20-alpine

@@ -1,0 +1,56 @@
+# rbac.yaml
+# Purpose: ServiceAccount + ClusterRole letting Prometheus discover scrape
+#          targets across the cluster.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# Read-only, cluster-wide. Discovery inherently spans namespaces, so this cannot
+# be a namespaced Role - but it grants get/list/watch only, never write, and
+# never access to Secret contents.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/metrics
+  # nodes/proxy is required for the kubernetes-nodes and kubernetes-cadvisor
+  # jobs: both scrape the kubelet THROUGH the API server proxy
+  # (/api/v1/nodes/<n>/proxy/metrics). That is a distinct permission from
+  # nodes and nodes/metrics - without it both targets fail with 403 Forbidden
+  # while pod and Kong scraping keep working, so metrics look mostly fine.
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources:
+  - configmaps
+  verbs: ["get"]
+- apiGroups: ["discovery.k8s.io"]
+  resources:
+  - endpointslices
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: observability

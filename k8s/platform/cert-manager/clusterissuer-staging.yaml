@@ -1,0 +1,30 @@
+# clusterissuer-staging.yaml
+# Purpose: Let's Encrypt STAGING issuer (TLS_MODE=staging). Untrusted chain, but
+#          no meaningful rate limits - this is the rehearsal for production.
+# depends_on: [scripts/cert-manager-install.sh]
+#
+# TEMPLATE: ACME_EMAIL is substituted by scripts/bootstrap-tls.sh.
+#
+# The HTTP-01 solver publishes a challenge at
+#   http://<domain>/.well-known/acme-challenge/<token>
+# Kong runs DB-less and does NOT read Ingress objects, so cert-manager's
+# auto-created Ingress is inert here. k8s/platform/kong/tls.yaml adds an explicit
+# declarative route for that path pointing at the solver Service. Without it the
+# challenge 404s and the ACME order times out - the standard failure on this stack.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: backbone-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: ${ACME_EMAIL}
+    privateKeySecretRef:
+      name: letsencrypt-staging-key
+    solvers:
+    - http01:
+        ingress:
+          # No ingressClassName: Kong is DB-less and ignores Ingress. cert-manager
+          # still creates the solver Pod + Service, which is all the explicit Kong
+          # route needs.
+          serviceType: ClusterIP

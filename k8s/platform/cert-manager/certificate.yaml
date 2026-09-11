@@ -1,0 +1,35 @@
+# certificate.yaml
+# Purpose: The platform's serving certificate. ONE Certificate object across all
+#          three TLS modes - only its issuerRef and SANs differ.
+# depends_on: [clusterissuer-selfsigned.yaml, clusterissuer-staging.yaml,
+#              clusterissuer-prod.yaml]
+#
+# TEMPLATE: CERT_ISSUER, CERT_DNS_NAMES, CERT_IP_ADDRESSES and
+# CERT_COMMON_NAME are substituted by scripts/bootstrap-tls.sh from TLS_MODE.
+#
+# secretName is HARDCODED to kong-tls-cert and must stay that way. Kong's TLS
+# listener mounts that one name, so switching issuers (selfsigned -> staging ->
+# production) rewrites the CONTENTS of the secret and changes nothing else in
+# the cluster. That is the entire mechanism behind "adding a domain is plug and
+# play" - if this name ever became mode-dependent, every swap would also require
+# editing and restarting Kong's mount.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: backbone-tls
+  namespace: platform
+spec:
+  secretName: kong-tls-cert
+  commonName: ${CERT_COMMON_NAME}
+  duration: 2160h       # 90d - matches Let's Encrypt; harmless for selfsigned
+  renewBefore: 360h     # 15d - the cert-expiry alert in Phase 5B fires at the same mark
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always
+  dnsNames: ${CERT_DNS_NAMES}
+  ipAddresses: ${CERT_IP_ADDRESSES}
+  issuerRef:
+    name: ${CERT_ISSUER}
+    kind: ClusterIssuer
+    group: cert-manager.io
