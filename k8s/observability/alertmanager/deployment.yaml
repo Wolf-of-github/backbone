@@ -24,7 +24,10 @@ data:
       group_wait: 30s
       group_interval: 5m
       repeat_interval: 4h
-      receiver: ${ALERTMANAGER_ROUTE_RECEIVER}
+      # Quoted: with no webhook configured the receiver is named "null", and
+      # unquoted YAML parses that as an actual null value - Alertmanager then
+      # sees a route with no receiver and refuses to start.
+      receiver: "${ALERTMANAGER_ROUTE_RECEIVER}"
 
     receivers:
 ${ALERTMANAGER_RECEIVERS}
