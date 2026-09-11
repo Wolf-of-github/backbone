@@ -2853,7 +2853,16 @@
 
 - Files (Phase 6 - Resilience & lifecycle)
   Format: file_name | file_path | description | depends_on[]
-  STATUS: Track A is IMPLEMENTED (2026-09-11), not yet run against a cluster. Every Phase 6A file
+  STATUS: Track A is IMPLEMENTED (2026-09-11). PARTIALLY VERIFIED on cluster `pavilion`:
+  `verify-phase6a.sh --no-s3` -> "PHASE 6A PARTIAL" (checks [1]-[2] pass - secret, staging PVC,
+  CronJob schedules/concurrency, and the PDB assertions including the negative one). Checks [3]-[7]
+  are UNRUN: no S3 bucket is configured, so it is NOT established that a dump can be taken,
+  uploaded, pruned, or restored. The backup guarantee is therefore unproven and the platform's data
+  is still single-copy on one disk. Do not tag `phase-6a-complete` on this.
+  The CronJobs were left installed against a placeholder bucket and will fail on schedule - suspend
+  them (`kubectl -n data patch cronjob mongo-backup -p '{"spec":{"suspend":true}}'`) or supply real
+  BACKUP_S3_* values.
+  Prior status line, for the record: not yet run against a cluster. Every Phase 6A file
   exists with real content; all scripts pass `bash -n` and `shellcheck -S warning`; the CronJob and
   PDB manifests parse as YAML with their templates rendered. Step 10 (a live `make phase6a`, a
   naturally-fired scheduled run, and the manual restore drill) still needs a cluster with an S3
