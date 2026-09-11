@@ -73,7 +73,11 @@ actual_issuer=$(kubectl -n platform get certificate backbone-tls -o jsonpath='{.
   || fail "Certificate points at issuer '$actual_issuer' but TLS_MODE=$TLS_MODE expects '$EXPECT_ISSUER' - re-run 'make tls'"
 
 for key in tls.crt tls.key; do
-  kubectl -n platform get secret kong-tls-cert -o jsonpath="{.data.$key}" 2>/dev/null | grep -q . \
+  # The dot in "tls.crt" is part of the KEY NAME, not a path separator - an
+  # unescaped {.data.tls.crt} resolves as data -> tls -> crt, finds nothing,
+  # and reports a perfectly good secret as missing. Escape it.
+  kubectl -n platform get secret kong-tls-cert \
+    -o jsonpath="{.data['${key/./\\.}']}" 2>/dev/null | grep -q . \
     || fail "secret/kong-tls-cert is missing $key"
 done
 ok "Certificate Ready (issuer $EXPECT_ISSUER); secret/kong-tls-cert has tls.crt + tls.key"
