@@ -677,9 +677,18 @@
       open. See the STATUS block under "Files (Phase 5 - Operate)" for the reasoning and for what is
       known about the one aborted `make ci` run.
   - Phase 6 - Resilience & lifecycle
-    - Backup/DR (mongodump CronJob, Redis AOF, then replica set + multi-node k3s)
-    - Maintenance page (static 503 + maintenance CLI + ConfigMap state) - needs Kong Admin API + CI/CD
-    - Provisioned worker fleet (Terraform + cloud-init self-join) - `make workers COUNT=n`; independent of the other two tracks
+    - 6A Backup/DR (`make phase6a`; gate: verify-phase6a.sh -> "PHASE 6A OK") - PLANNED IN DETAIL
+      Nightly mongodump + Redis RDB CronJobs uploading to EXTERNAL S3-compatible storage, restore
+      scripts, retention pruning, PodDisruptionBudgets. The only Phase 6 track that closes a real
+      exposure: MongoDB is a single replica on node-bound local-path with no copy anywhere, so
+      losing that disk loses every account, token and job record. The gate performs an ACTUAL
+      restore and compares content - a backup that has never been restored is a hypothesis.
+      Deliberately excludes Mongo HA and point-in-time recovery; see the plan for why.
+    - 6B Maintenance page (static 503 + maintenance CLI + ConfigMap state) - NOT PLANNED.
+      Needs rework before it can be built: its bootstrap assumed Phase 5C's notify.sh and image
+      registry, and 5C is deferred. A convenience until there are users to apologise to.
+    - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
+      NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
   - Cross-cutting (from commit #1, never "done")
     - Security guidelines: enable security-guidance plugin + CI checks (secret scanning,
       no exec(), parameterized queries) as soon as a repo exists
@@ -2619,8 +2628,238 @@
         TLS: https://<domain> serves a valid Let's Encrypt cert, http:// 301-redirects, cert renewal (staging) succeeds.
       | depends_on: [bootstrap-ci.sh, bootstrap-observability.sh, bootstrap-tls.sh]
 
+- Phase 6A - Backup / Disaster Recovery: develop from 0 -> 100
+    - Scope: scheduled, restorable, OFF-SITE backups of MongoDB and Redis, plus the disruption
+      budgets that keep the platform up during node drains. Tracks B (maintenance mode) and C
+      (Terraform worker fleet) are NOT in scope - see "Why only Track A" below. `make backup`
+      brings it up; `make verify-phase6a` is the gate -> "PHASE 6A OK".
+    - Why only Track A: it is the one Phase 6 track that closes a real exposure rather than adding
+      a convenience. Today MongoDB is a single replica on `local-path` - node-bound storage with no
+      copy anywhere. Losing that disk loses every user account, refresh token and job record, with
+      no recovery path. Track B matters when there are users to apologise to; Track C matters when
+      one machine stops being enough. Neither is true yet. Both stay in the Files manifest below,
+      unbuilt, and both need rework first (Track B's bootstrap assumed Phase 5C's notify.sh and
+      image registry, and 5C is deferred).
+
+    - Runtime decision: backups go to EXTERNAL S3-compatible object storage (AWS S3, Backblaze B2,
+      Cloudflare R2 - any endpoint that speaks the S3 API). This is the decision that makes the
+      phase worth doing:
+        - A backup on the same node as the database is not a backup. It protects against a dropped
+          collection or a bad migration; it does nothing about the disk dying, which is the failure
+          that actually ends the platform. The existing manifest sketched a `backup-pvc` and an
+          optional in-cluster MinIO - on a single node MinIO shares the same physical disk, so it
+          adds machinery without adding durability. Both are superseded here.
+        - A local PVC is still used, but only as a STAGING area: dump to the PVC, upload, verify the
+          upload, then prune. That way a failed upload leaves the dump recoverable by hand rather
+          than losing the window entirely.
+      Cost is a few dollars a month and one external credential. That is the price of the platform
+      surviving its own hardware.
+    - Runtime decision: plain k8s CronJobs running the official `mongo:7.0` and `redis:7.2-alpine`
+      images plus `amazon/aws-cli` for the upload. No operator, no Velero - consistent with the
+      no-Helm/no-operator rule held since Phase 1. Velero backs up cluster OBJECTS; what is actually
+      irreplaceable here is the DATA inside two StatefulSets, which mongodump/RDB handle directly.
+
+    - What Phase 1 already gives us (do NOT rebuild):
+      - Redis persistence is ALREADY configured in k8s/data/redis/conf-configmap.yaml: RDB save
+        points (900 1 / 300 10 / 60 10000), `appendonly yes`, `appendfsync everysec`. The old
+        manifest's `redis-persistence-patch.yaml` is therefore redundant and is dropped from this
+        plan. Redis needs a backup JOB, not a persistence change.
+      - `mongodb-credentials` (root-* and app-*) and `redis-password` exist in ns `data`. Backups
+        use the ROOT credential, deliberately: the app user is scoped readWrite on one database and
+        cannot read `admin`, so an app-user mongodump would silently omit users and roles.
+
+    - Guiding rules (same as Phases 0-5)
+      - Bottom-up by depends_on; two passes per file (headered stub, then real content).
+      - Nothing is "done" until `make verify-phase6a` prints "PHASE 6A OK" on a live cluster.
+      - Secrets only from .env via the create-secrets.sh convention; never echoed. The S3 secret
+        key is a credential with write access to your backups - treat it like the Mongo root password.
+      - Phases 0-5 stay green: `make verify`, `verify-phase1`, `verify-phase3`, `verify-phase4`,
+        `verify-phase5a`, `verify-phase5b` all keep passing.
+      - RESTORE IS PART OF THE FEATURE. A backup that has never been restored is a hypothesis. The
+        gate performs a real restore into a scratch database and compares content - not a file
+        listing, not an exit code.
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories: /k8s/data/backup
+      - Instantiate headered stubs:
+        /scripts/backup-secrets.sh, /scripts/bootstrap-backup.sh, /scripts/backup-now.sh,
+        /scripts/mongo-restore.sh, /scripts/redis-restore.sh, /scripts/verify-phase6a.sh,
+        /k8s/data/backup/{staging-pvc,mongo-cronjob,redis-cronjob}.yaml,
+        /k8s/base/pdb.yaml
+      - `chmod +x` the new /scripts/*.sh.
+
+    - Step 1 - .env + secrets contract (no cluster needed)
+      - .env.example gains a "Phase 6A - Backup / DR" block:
+          BACKUP_S3_ENDPOINT=            # blank = AWS S3; set for B2/R2/MinIO, e.g.
+                                         #   https://s3.us-west-001.backblazeb2.com
+          BACKUP_S3_BUCKET=              # required. Create it first; the job does not.
+          BACKUP_S3_REGION=us-east-1
+          BACKUP_S3_ACCESS_KEY=          # required
+          BACKUP_S3_SECRET_KEY=          # required
+          BACKUP_S3_PREFIX=backbone      # key prefix inside the bucket
+          BACKUP_SCHEDULE_MONGO=0 3 * * *    # nightly 03:00 UTC
+          BACKUP_SCHEDULE_REDIS=0 4 * * *
+          BACKUP_RETENTION_DAYS=30
+          BACKUP_STAGING_SIZE=5Gi        # local staging PVC; >= 2x expected dump size
+      - Bucket hygiene the plan REQUIRES documenting in README (not automated, because it is
+        provider-specific and destructive to get wrong):
+          - Enable object versioning + a lifecycle rule, so a compromised cluster credential cannot
+            destroy history by overwriting. Ransomware-resistance is the point.
+          - Scope the access key to THIS BUCKET ONLY, with s3:PutObject/GetObject/ListBucket/
+            DeleteObject. Never a root/admin key.
+      - docs/secrets.md: add `backup-s3-credentials` (ns data) to the map.
+      - Verify: `grep` confirms the keys exist and secret-bearing ones are blank.
+
+    - Step 2 - Secrets (scripts/backup-secrets.sh)
+      - set -euo pipefail; source lib.sh; load_env; assert ns data exists.
+      - require_vars BACKUP_S3_BUCKET BACKUP_S3_ACCESS_KEY BACKUP_S3_SECRET_KEY.
+      - Create `backup-s3-credentials` in ns data (keys: endpoint, bucket, region, access-key,
+        secret-key, prefix) via the idempotent --dry-run=client | apply pattern. Never echo values.
+      - Verify: secret exists with six keys; re-running with a changed .env updates it.
+
+    - Step 3 - Staging PVC + PodDisruptionBudgets
+      - k8s/data/backup/staging-pvc.yaml: PVC `backup-staging`, BACKUP_STAGING_SIZE, default SC.
+        Staging only - the durable copy is in S3. Sized >= 2x the dump so a run never half-fills it.
+      - k8s/base/pdb.yaml: PodDisruptionBudgets - kong minAvailable 1, and the 2-replica app
+        services (auth, ping, jobs-api, frontend) minAvailable 1.
+        NOTE, and state it in the file: do NOT write a PDB for single-replica StatefulSets
+        (mongodb, redis). minAvailable 1 on a 1-replica workload makes the node UNDRAINABLE - the
+        eviction blocks forever and `kubectl drain` hangs. Those become PDB candidates only when
+        Mongo moves to a replica set.
+      - Verify: PVC Bound; `kubectl get pdb -A` shows the budgets; `kubectl drain --dry-run` on the
+        node does not report a blocked eviction.
+
+    - Step 4 - MongoDB backup CronJob (k8s/data/backup/mongo-cronjob.yaml)
+      - CronJob `mongo-backup`, schedule from BACKUP_SCHEDULE_MONGO, concurrencyPolicy: Forbid
+        (two dumps must never race onto one staging PVC), backoffLimit 2,
+        successfulJobsHistoryLimit 3, failedJobsHistoryLimit 3, startingDeadlineSeconds 3600.
+      - Two containers, sequenced as initContainer -> container so the upload cannot run on a
+        failed dump:
+        (1) `mongo:7.0` - `mongodump --uri="mongodb://$ROOT_USER:$ROOT_PASS@mongodb.data.svc:27017"
+            --authenticationDatabase=admin --archive=/staging/mongo-<ts>.gz --gzip`.
+            Credentials from secretKeyRef mongodb-credentials/root-*, passed as env and referenced
+            as "$VAR" inside the container - never interpolated into the manifest.
+            Uses --archive (single file) rather than a directory dump: one object to upload, one to
+            verify, and mongorestore reads it directly.
+        (2) `amazon/aws-cli:2` - `aws s3 cp` the archive to
+            s3://$BUCKET/$PREFIX/mongo/<ts>.gz (with --endpoint-url when BACKUP_S3_ENDPOINT is set),
+            then `aws s3api head-object` to CONFIRM it landed and the size matches the local file,
+            then delete the local archive. Finally prune objects older than BACKUP_RETENTION_DAYS.
+      - The verify-then-delete order matters: never remove the only copy before proving the remote
+        one exists.
+      - Verify: `kubectl -n data create job --from=cronjob/mongo-backup test` completes; the object
+        appears in the bucket with a non-zero size.
+
+    - Step 5 - Redis backup CronJob (k8s/data/backup/redis-cronjob.yaml)
+      - CronJob `redis-backup`, same policies. Redis has no mongodump equivalent, so:
+        (1) `redis:7.2-alpine` - `redis-cli -h redis.data.svc -a "$REDIS_PASSWORD" --no-auth-warning
+            BGSAVE`, then poll `LASTSAVE` until the timestamp advances (BGSAVE is asynchronous -
+            copying immediately captures the PREVIOUS snapshot, a subtle way to back up stale data),
+            then `--rdb /staging/redis-<ts>.rdb` to pull a fresh dump over the wire.
+            `--rdb` is used rather than reading the PVC directly: the backup job does not need to
+            share a volume with the Redis pod, so there is no RWO conflict on local-path.
+        (2) same aws-cli upload/verify/prune container, to $PREFIX/redis/<ts>.rdb.
+      - Scheduled an hour after Mongo so the two never contend for the staging PVC.
+      - Note in the file: Redis holds refresh tokens and the BullMQ queue. Restoring it replays
+        old jobs and revives revoked sessions, so a Redis restore is a deliberate act, not routine.
+      - Verify: manual trigger completes; object in the bucket; `redis-check-rdb` accepts the file.
+
+    - Step 6 - Restore scripts (the part that makes it a backup)
+      - scripts/mongo-restore.sh:
+          `mongo-restore.sh list`                      - list available S3 objects with dates/sizes
+          `mongo-restore.sh restore <key> --target <db>` - restore into a NAMED database
+          `mongo-restore.sh restore <key> --overwrite-production --confirm` - the dangerous one
+        Defaults are safe: restoring into a scratch database is one command; overwriting the live
+        database requires BOTH an explicit flag and --confirm, and the script refuses without them.
+        Runs as an in-cluster Job (Mongo has no public endpoint); streams the archive from S3 and
+        pipes into `mongorestore --archive --gzip --drop`.
+      - scripts/redis-restore.sh: same shape, with a louder warning per the Step 5 note.
+      - scripts/backup-now.sh: trigger either CronJob immediately (`kubectl create job --from=`)
+        and tail it - for use before a risky migration.
+      - Verify: `list` shows the objects from Steps 4-5; a restore into a scratch DB reproduces a
+        known document; the overwrite path refuses without both flags.
+
+    - Step 7 - Orchestration (scripts/bootstrap-backup.sh)
+      - set -euo pipefail; source lib.sh; load_env; assert ns data + Phase 1 StatefulSets Ready.
+      - Order: backup-secrets.sh -> staging PVC -> PDBs -> render + apply both CronJobs (schedules,
+        bucket, prefix, retention substituted from .env via render_template).
+      - PREFLIGHT, before creating anything: run a throwaway aws-cli pod that does
+        `aws s3api head-bucket` with the supplied credentials and dies with a clear message on
+        failure. Catching a typo'd bucket or a wrong key here beats discovering it at 03:00 when
+        the first real backup silently fails.
+      - Idempotent. Prints the next scheduled run time for each CronJob.
+
+    - Step 8 - Makefile wiring
+      - `make backup`          -> scripts/bootstrap-backup.sh
+      - `make backup-now`      -> scripts/backup-now.sh
+      - `make verify-phase6a`  -> scripts/verify-phase6a.sh
+      - `make phase6a`         -> backup verify-phase6a
+      - lint: add the new scripts to shellcheck; note k8s/data/backup/ is templated (rendered from
+        .rendered/, like the Phase 5 manifests).
+
+    - Step 9 - Verification gate (scripts/verify-phase6a.sh) -> "PHASE 6A OK"
+      - [1] Secret `backup-s3-credentials` has its six keys; staging PVC Bound; both CronJobs exist
+            with the expected schedules and concurrencyPolicy Forbid.
+      - [2] PDBs exist for kong + the 2-replica app services, and NOT for the single-replica
+            StatefulSets; `kubectl drain --dry-run=server` reports no blocked eviction.
+      - [3] S3 reachability: an in-cluster aws-cli pod head-buckets successfully.
+      - [4] REAL MONGO ROUND TRIP - the core assertion:
+            write a sentinel doc into a scratch collection -> trigger mongo-backup -> wait for
+            completion -> confirm the object exists in S3 with non-zero size -> DROP the scratch
+            collection -> restore from that object into a scratch DB -> assert the sentinel doc is
+            back, byte-identical. Clean up the scratch DB and the test object.
+            This is the only check that proves the backup is restorable rather than merely present.
+      - [5] Redis round trip: SET a sentinel key -> trigger redis-backup -> confirm the object ->
+            restore into a scratch Redis (a throwaway pod loading the RDB) -> assert the key.
+      - [6] Retention/pruning: upload two synthetic objects with old timestamps, run the prune step,
+            confirm objects older than BACKUP_RETENTION_DAYS are gone and recent ones survive.
+      - [7] Credential scope: the backup key must NOT be able to read other secrets' data - assert
+            the S3 credential is scoped to the bucket (attempt a list of a non-configured bucket
+            and expect denial). Best-effort: skip with a logged warning if the provider's error is
+            ambiguous, rather than failing the gate on a provider quirk.
+      - Clean up every scratch object, database and pod (trap EXIT). Print "PHASE 6A OK".
+
+    - Step 10 - Clean-cluster dry run
+      - Fill the Phase 6A .env block, create the bucket with versioning on, then `make phase6a`
+        -> "PHASE 6A OK".
+      - Re-run the Phase 0/1/3/4/5a/5b gates - all still green.
+      - Let one scheduled run fire naturally (not just the manual trigger) and confirm the object
+        appears. A CronJob that works on demand but not on schedule is a common and quiet failure.
+      - Then do the drill that actually matters: pick a real collection, drop it, and restore it
+        from S3 following only what README says. If the docs are not sufficient to recover without
+        reading the scripts, the docs are wrong.
+      - Tag `phase-6a-complete` once the scheduled run and the manual restore drill both pass.
+
+    - Definition of done (Phase 6A)
+      - `make phase6a` -> "PHASE 6A OK"; earlier gates still pass.
+      - Both CronJobs run on schedule and land verified objects in external S3.
+      - A restore has ACTUALLY been performed from an S3 object into a scratch database and
+        compared, by the gate and once by hand from the README.
+      - Overwriting the live database requires two explicit flags; the default restore path cannot.
+      - Retention pruning works and is bounded; the bucket does not grow without limit.
+      - PDBs protect the multi-replica services without making the node undrainable.
+      - No secret values in git or in any log; scripts pass bash -n + shellcheck.
+      - README gains a "Phase 6A - Backup / DR" section: the .env block, bucket setup INCLUDING
+        versioning and a scoped key, `make backup`, how to list and restore, and the restore drill.
+
+    - Explicitly NOT in Phase 6A (say so, do not half-build)
+      - Mongo replica set / HA. Backups answer "the disk died"; HA answers "stay up while it dies".
+        Different problem, and on a single node a replica set buys nothing.
+      - Point-in-time recovery. Nightly dumps mean losing up to a day. PITR needs oplog tailing -
+        a different design. State the actual RPO in the README rather than implying continuous.
+      - Backing up cluster objects (Deployments, ConfigMaps). Those are in git and reproducible with
+        `make`; only the data is irreplaceable.
+      - Tracks B and C, as above.
+
 - Files (Phase 6 - Resilience & lifecycle)
   Format: file_name | file_path | description | depends_on[]
+  STATUS: Track A is planned in detail above (Phase 6A - Backup / Disaster Recovery) and supersedes
+  the Track A entries below where they conflict - specifically: backups go to EXTERNAL S3, not to a
+  local PVC or in-cluster MinIO (minio-statefulset.yaml and the PVC-as-destination design are
+  dropped; the PVC survives only as upload staging), and redis-persistence-patch.yaml is dropped
+  because Phase 1's conf-configmap.yaml already sets AOF + RDB. Tracks B and C are NOT planned or
+  built; both need rework first, since Track B's bootstrap assumed Phase 5C's notify.sh and image
+  registry and 5C is deferred.
   Three independent tracks: Backup/DR (data + platform ns), Maintenance (platform ns),
   and Provisioned worker nodes (Terraform, control-plane host).
   Backup/DR builds on Phase 1 data + optional Phase 5 MinIO; Maintenance builds on Kong Admin API (Phase 2)
