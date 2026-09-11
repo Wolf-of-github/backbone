@@ -19,6 +19,14 @@ spec:
       labels:
         app: kong
     spec:
+      # The kong image runs as uid/gid 1000. Kubernetes mounts secret files
+      # root-owned, so without fsGroup the TLS private key is unreadable and
+      # Kong dies at startup with:
+      #   ssl_cert: failed loading certificate from /etc/secrets/kong-tls/tls.crt
+      # fsGroup makes the mounted files group-owned by 1000; defaultMode on the
+      # volume below then makes them group-readable.
+      securityContext:
+        fsGroup: 1000
       containers:
       - name: kong
         image: kong:3.4
@@ -86,3 +94,7 @@ spec:
         secret:
           secretName: kong-tls-cert
           optional: true
+          # 0640: owner+group read, nothing for other. Combined with the
+          # fsGroup above this is the minimum that lets Kong read its own
+          # private key without making it world-readable in the container.
+          defaultMode: 0640

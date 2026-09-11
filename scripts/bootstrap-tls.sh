@@ -176,6 +176,14 @@ ok "Certificate issued into secret/kong-tls-cert"
 #    which has never run Phase 5A still starts Kong (an ssl listener with no
 #    cert makes Kong refuse to boot).
 # ---------------------------------------------------------------------------
+# Re-apply the Deployment first: it carries the cert mount, the fsGroup that
+# makes the mounted key readable by Kong's uid 1000, and the volume's
+# defaultMode. `set env` alone only touches env vars, so a cluster brought up
+# before those were added would keep an unreadable key and crash-loop with
+# "ssl_cert: failed loading certificate".
+kubectl apply -f k8s/platform/kong/deployment.yaml >/dev/null
+kubectl apply -f k8s/platform/kong/proxy-service.yaml >/dev/null
+
 kubectl -n platform set env deployment/kong \
   KONG_PROXY_LISTEN="0.0.0.0:8000, 0.0.0.0:8443 ssl" \
   KONG_SSL_CERT=/etc/secrets/kong-tls/tls.crt \
@@ -184,9 +192,23 @@ kubectl -n platform set env deployment/kong \
 # Kong does not watch the secret - a reissued cert only takes effect on restart.
 # This is also what picks up a mode switch.
 kubectl -n platform rollout restart deployment/kong
-kubectl -n platform rollout status deployment/kong --timeout=180s \
-  || die "Kong did not come back after enabling TLS.
-  Check: kubectl -n platform logs deploy/kong --tail=50"
+if ! kubectl -n platform rollout status deployment/kong --timeout=180s; then
+  # `logs deploy/kong` picks an arbitrary pod and will usually land on a
+  # healthy OLD replica, showing nothing but probe traffic. Name the pod that
+  # is actually failing.
+  bad=$(kubectl -n platform get pods -l app=kong \
+        --field-selector=status.phase!=Running -o name 2>/dev/null | head -1)
+  [ -n "$bad" ] || bad=$(kubectl -n platform get pods -l app=kong -o json \
+        | jq -r '.items[] | select(.status.containerStatuses[]?.ready==false)
+                 | "pod/"+.metadata.name' | head -1)
+  log ""
+  log "Kong did not come back after enabling TLS. Failing pod: ${bad:-<none found>}"
+  [ -n "$bad" ] && kubectl -n platform logs "$bad" --tail=30 >&2
+  die "TLS rollout failed.
+  The previous Kong pods are still serving, so the platform is up - only the
+  new TLS-enabled replica is failing.
+  Inspect: kubectl -n platform logs ${bad:-<pod>} --tail=50"
+fi
 
 HTTPS_PORT="$(svc_nodeport platform kong-proxy proxy-ssl)"
 HOST="$(platform_host)"
