@@ -2,9 +2,10 @@
 
 **Date:** 2026-09-11
 **Status:** Phase 5A (TLS) + 5B (Observability) verified on the live cluster; 5C (CI/CD) deferred by choice
-**Branch:** master
+**Branch:** phase-5-operate (not yet merged to master)
 **Tag:** phase-4-complete (pending)
-**Last Verified:** All verification gates passing (Phase 0, 1, 3, 4)
+**Last Verified:** Phase 0, 1, 3, 4 gates passing; Phase 5A + 5B verified 2026-09-11.
+`verify-phase2` is knowingly broken - see "Still open".
 
 ---
 
@@ -66,7 +67,7 @@
   - No JWT verification at gateway (services handle auth themselves)
 - **Verification:** `make verify-phase3` passes (8/8 checks)
 
-#### Phase 4 — Async Jobs (✅ Just Completed)
+#### Phase 4 — Async Jobs (Complete)
 - **jobs-api service** (2 replicas) in `app` namespace
   - Express + BullMQ producer
   - REST API for job management (POST/GET)
