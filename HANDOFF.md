@@ -1,7 +1,7 @@
 # Backbone Project Handoff
 
-**Date:** 2026-09-10
-**Status:** Phase 4 (Async Jobs) Complete & Merged to Master
+**Date:** 2026-09-11
+**Status:** Phase 5A (TLS) + 5B (Observability) verified on the live cluster; 5C (CI/CD) deferred by choice
 **Branch:** master
 **Tag:** phase-4-complete (pending)
 **Last Verified:** All verification gates passing (Phase 0, 1, 3, 4)
@@ -263,11 +263,16 @@ To add auth to a new backend service:
 ## Known Issues & Limitations
 
 ### Current Limitations
-- **No TLS/HTTPS** - Tokens currently ride HTTP (Phase 5 will add cert-manager + Let's Encrypt)
+- ~~No TLS/HTTPS~~ **RESOLVED (Phase 5A).** Kong terminates HTTPS on :30443 and 301-redirects
+  HTTP. The cert is self-signed (`TLS_MODE=selfsigned`) because there is no domain yet, so browsers
+  warn and `curl` needs `-k` - the encryption is real, only the identity is unvouched. Adopting a
+  domain is an `.env` edit plus `make tls`; nothing else changes.
 - **Single MongoDB/Redis replicas** - No HA yet (multi-replica comes later)
 - **No persistent volumes for local-path** - Data survives pod restarts but not node loss
 - **No backup automation** - Manual backup procedures only (Phase 5+)
-- **No monitoring/observability** - No Prometheus/Grafana yet (Phase 5+)
+- ~~No monitoring/observability~~ **RESOLVED (Phase 5B).** Prometheus + Loki + Grafana +
+  Alertmanager in the `observability` namespace. Grafana at `/grafana` (admin, password in `.env`).
+  Prometheus/Loki/Alertmanager are deliberately not routed - reach them with `kubectl port-forward`.
 
 ### Phase 3 Specific Notes
 - Access tokens expire in 15 minutes by default - adjust `JWT_ACCESS_EXPIRY` if needed
@@ -297,23 +302,65 @@ To add auth to a new backend service:
 
 ---
 
-## Next Steps (Phase 5+)
+## Phase 5 — Operate (delivered 2026-09-11)
 
-### Recommended Next Phase: Observability (Phase 5)
-- Prometheus + Grafana for metrics and monitoring
-- Loki + Promtail for log aggregation
-- Queue-depth based auto-scaling for workers
-- Alert manager for notifications
-- Job status tracking and retry logic
-- Example: Image processing, report generation, email sending
+Three tracks, each with its own gate. Two adopted, one deferred.
 
-### Future Phases Overview
-- **Phase 5:** TLS/HTTPS (cert-manager + Let's Encrypt)
-- **Phase 6:** Monitoring (Prometheus + Loki + Grafana)
-- **Phase 7:** CI/CD (Gitea + Drone)
-- **Phase 8:** High Availability (multi-replica datastores, PV backups)
+| Track | Command | State |
+|---|---|---|
+| 5A TLS | `make tls` / `make verify-phase5a` | ✅ `PHASE 5A OK` (7/7) |
+| 5B Observability | `make obs` / `make verify-phase5b` | ✅ `PHASE 5B OK` (7/7), 15 targets UP |
+| 5C CI/CD + registry | `make ci` / `make verify-phase5c` | ⏸ Deferred by choice — built, not adopted |
 
-See `architecture.txt` for detailed phase planning.
+**5C was deferred deliberately, not abandoned.** For a single operator its value is
+conditional: the CI half automates a `make` flow that isn't a bottleneck, and the registry
+half removes a Docker Hub dependency that isn't currently causing problems — against a
+Gitea StatefulSet, a Drone server + runner, a 20Gi PVC, two credentials, and a manual
+`registries.yaml` edit on every node forever. The `ci` namespace was deleted and
+`REGISTRY_MODE` remains `external`. Revisit when a second person joins or Docker Hub bites.
+
+One aborted `make ci` run left `gitea-0` in CrashLoopBackOff, undiagnosed (logs never read;
+likely rootless-image paths/ownership — same class as the Kong TLS key fixed in 5A). Anyone
+resuming should start at `kubectl -n ci logs gitea-0`.
+
+### Operating what's now running
+
+```bash
+# Grafana (self-signed cert - the browser warning is expected)
+https://<node-ip>:30443/grafana          # user: admin, password: GRAFANA_ADMIN_PASSWORD in .env
+
+# The backends are intentionally not exposed
+kubectl -n observability port-forward svc/prometheus 9090:9090
+kubectl -n observability port-forward svc/alertmanager 9093:9093
+
+# Rebuild + redeploy a service (note: NOT plain `kubectl apply` - see below)
+make build-push
+make apply-app
+```
+
+> `k8s/app/*/deployment.yaml` are **templates** — the image line carries a `REGISTRY_URL`
+> placeholder. Always apply them with `make apply-app`; a direct `kubectl apply -f` sets the
+> literal placeholder as the image and the pod fails `InvalidImageName`.
+
+### Adopting a real domain (no rebuild, no manifest edits)
+
+1. Point the domain's A record at the node; open :80 to the internet
+2. `.env`: `DOMAIN=<domain>`, `ACME_EMAIL=<you>`, `TLS_MODE=staging`
+3. `make tls` — rehearse against Let's Encrypt staging
+4. `TLS_MODE=production` → `make tls`
+
+The cert always lands in the same `kong-tls-cert` secret, so switching issuers reissues the
+certificate and changes nothing else.
+
+### Still open
+- **`verify-phase2` is knowingly broken** — fails because Phase 3 auth-protected `/api/ping`
+  and 5A moved the scheme to https. Left as-is by decision; update or retire it.
+- **Phase 5C**, as above.
+- **Phase 6** (`architecture.txt`): backup/DR, maintenance page, Terraform worker fleet.
+- **HA** — still single-replica MongoDB/Redis, single k3s server.
+
+See `architecture.txt` for the full Phase 5 plan, the deviations taken during implementation,
+and the seven bugs that only surfaced on real hardware.
 
 ---
 
@@ -382,8 +429,10 @@ For questions or issues:
 - [x] Async job queue system implemented and documented
 - [x] Handoff documentation updated
 
-**Status:** ✅ Ready for handoff. Platform operational with authentication and async job processing. Phase 4 merged to master.
+**Status:** ✅ Ready for handoff. Platform operational with authentication, async job
+processing, HTTPS at the edge, and full metrics/logs/alerting. Phase 5A + 5B verified on the
+live cluster; 5C built but deferred by choice.
 
 ---
 
-*Last updated: 2026-09-10 by Claude Code (Phase 4 implementation complete)*
+*Last updated: 2026-09-11 (Phase 5A + 5B verified on cluster `pavilion`; 5C deferred)*

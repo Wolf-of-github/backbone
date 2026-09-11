@@ -672,6 +672,10 @@
       Last, and the only track that mutates earlier phases: it cuts all six service Deployments off
       the public REGISTRY_URL onto the Gitea registry, discharging the "deferred to Phase 5" promise
       made in the Phase 0 and Phase 2 notes. REGISTRY_MODE=external is the tested rollback.
+      DEFERRED BY CHOICE (2026-09-11) - built but not adopted; the `ci` namespace was deleted and
+      REGISTRY_MODE remains `external`. The Phase 0/Phase 2 registry promise therefore still stands
+      open. See the STATUS block under "Files (Phase 5 - Operate)" for the reasoning and for what is
+      known about the one aborted `make ci` run.
   - Phase 6 - Resilience & lifecycle
     - Backup/DR (mongodump CronJob, Redis AOF, then replica set + multi-node k3s)
     - Maintenance page (static 503 + maintenance CLI + ConfigMap state) - needs Kong Admin API + CI/CD
@@ -2426,10 +2430,50 @@
   artifacts, both in the plan above: services/common/metrics.js is added to the Phase 2-4 services
   (additive), and the Phase 5 registry cutover rewrites the image reference in all six Deployments.
 
-  STATUS: IMPLEMENTED, NOT YET RUN AGAINST A CLUSTER. All files below exist with real content (no
-  STUB markers); every script passes `bash -n` and `shellcheck -S warning`; all 46 manifests parse as
-  YAML with their templates rendered. The acceptance runs in Step 16 (domainless `make phase5`, then
-  the staging domain swap) still need a live Phase 4 cluster before tagging `phase-5-complete`.
+  STATUS (2026-09-11, single-node cluster `pavilion`, TLS_MODE=selfsigned, no domain):
+    5A TLS           ✅ VERIFIED - `make verify-phase5a` -> "PHASE 5A OK" (7/7)
+    5B Observability ✅ VERIFIED - `make verify-phase5b` -> "PHASE 5B OK" (7/7), 15 scrape targets UP
+    5C CI/CD         ⏸  DEFERRED BY CHOICE - implemented, not adopted. See below.
+
+  Why 5C is deferred, not failed: its value is real but conditional, and the conditions do not hold
+  for a single operator today. The CI half automates a manual `make` flow that is not yet a
+  bottleneck; the registry half removes a Docker Hub dependency that is not currently causing
+  problems. Against that: a Gitea StatefulSet, a Drone server + runner, a 20Gi PVC, two more
+  credentials, and a manual /etc/rancher/k3s/registries.yaml edit on EVERY node including future
+  ones - permanent operational surface. 5A and 5B closed real gaps (credentials in cleartext; no
+  visibility beyond `kubectl logs`); 5C mostly replaces working external services with self-hosted
+  equivalents. Revisit when a second person joins, or when the Docker Hub dependency starts to bite.
+  The `ci` namespace was deleted; REGISTRY_MODE stays `external`.
+
+  Known state of the 5C code: `make ci` was run once and got as far as creating the secrets,
+  ConfigMap, StatefulSet and Service before gitea-0 entered CrashLoopBackOff. NOT diagnosed - the
+  logs were never read. Most likely the rootless image's paths/ownership (it wants /etc/gitea for
+  config and runs as uid 1000, and the PVC mounts root-owned - the same class of bug as the Kong
+  TLS key in 5A, which needed fsGroup). Anyone resuming 5C should start with
+  `kubectl -n ci logs gitea-0` and expect a securityContext fix, then work through Track C's
+  remaining unexercised steps: the admin-user creation and the OAuth app registration.
+
+  Everything else below exists with real content (no STUB markers); every script passes `bash -n`
+  and `shellcheck -S warning`; all 46 manifests parse as YAML with their templates rendered.
+
+  Bugs found by running 5A/5B on real hardware that static validation did not catch - all fixed:
+   1. envsubst rewrote the templates' own header comments, splicing a multi-line YAML block into a
+      '#' line (11 files). Placeholders are now named bare in comments.
+   2. Kong could not read its TLS key: the image runs as uid 1000, secrets mount root-owned, and the
+      pod had no fsGroup. Added fsGroup 1000 + defaultMode 0640.
+   3. verify-phase5a used jsonpath {.data.tls.crt}, which parses as data->tls->crt and failed a
+      perfectly good secret. Needs the escaped bracket form.
+   4. Alertmanager's route said `receiver: null` unquoted - YAML read it as an empty value, so the
+      root route had no receiver and it refused to start.
+   5. Prometheus lacked the nodes/proxy RBAC subresource, so the kubelet scrapes 403'd while pod and
+      Kong scrapes kept working - node and container metrics silently absent.
+   6. prom-client was added to four package.json files without regenerating the lockfiles, so
+      `npm ci` refused every build. Also surfaced that auth and frontend had NO lockfile committed
+      despite their Dockerfiles running `npm ci` (pre-existing, from Phases 2/3).
+   7. k8s/app/*/deployment.yaml are templates carrying a REGISTRY_URL placeholder; applying them with
+      plain `kubectl apply` set the literal string as the image (InvalidImageName). Added
+      scripts/apply-app-manifests.sh (`make apply-app`) as the one substitution path, and fixed
+      jobs-api/worker asking for image names build-push.sh never produced.
 
   Deviations from the plan above, decided during implementation:
    - Kong's TLS listener is patched on by bootstrap-tls.sh rather than shipped in deployment.yaml.
