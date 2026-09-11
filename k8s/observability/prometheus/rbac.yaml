@@ -21,6 +21,12 @@ rules:
   resources:
   - nodes
   - nodes/metrics
+  # nodes/proxy is required for the kubernetes-nodes and kubernetes-cadvisor
+  # jobs: both scrape the kubelet THROUGH the API server proxy
+  # (/api/v1/nodes/<n>/proxy/metrics). That is a distinct permission from
+  # nodes and nodes/metrics - without it both targets fail with 403 Forbidden
+  # while pod and Kong scraping keep working, so metrics look mostly fine.
+  - nodes/proxy
   - services
   - endpoints
   - pods
