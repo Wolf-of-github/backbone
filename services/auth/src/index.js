@@ -9,6 +9,7 @@ const helmet = require('helmet');
 const { configurePassport } = require('./passport');
 const tokenStore = require('./tokenStore');
 const authRoutes = require('./routes/auth');
+const maintenanceRoutes = require('./routes/maintenance');
 
 const { instrumentHttp } = require('./common/metrics');
 
@@ -41,6 +42,11 @@ app.get('/healthz', (req, res) => {
 
 // Mount auth routes
 app.use('/api/auth', authRoutes);
+
+// Admin-only maintenance control. Mounted at /internal so the gateway can keep
+// it on the maintenance bypass list without exposing anything else - it is the
+// escape hatch when the rest of the platform is returning 503.
+app.use('/internal/maintenance', maintenanceRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {

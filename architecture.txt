@@ -684,9 +684,25 @@
       losing that disk loses every account, token and job record. The gate performs an ACTUAL
       restore and compares content - a backup that has never been restored is a hypothesis.
       Deliberately excludes Mongo HA and point-in-time recovery; see the plan for why.
-    - 6B Maintenance page (static 503 + maintenance CLI + ConfigMap state) - NOT PLANNED.
-      Needs rework before it can be built: its bootstrap assumed Phase 5C's notify.sh and image
-      registry, and 5C is deferred. A convenience until there are users to apologise to.
+    - 6B Maintenance page (`make phase6b`; gate: verify-phase6b.sh -> "PHASE 6B OK") - IMPLEMENTED
+      2026-09-11, statically validated, NOT yet run against a cluster.
+      The 5C dependencies were designed out rather than worked around:
+        - No built image. The page is a ConfigMap (HTML + nginx.conf) mounted into stock
+          nginx:1.25-alpine, so there is no Dockerfile, no build-push, and no registry - and
+          editing the page is `kubectl apply` instead of a rebuild.
+        - No notify.sh. Maintenance is a deliberate operator action, not an alert.
+      Design points worth keeping: the page pod runs ALWAYS (toggling is a Kong routing swap, not a
+      pod start - an image pull is the wrong thing to find broken when you need the site down); the
+      state ConfigMap stores the SAVED Kong config, so `off` restores exactly what was there rather
+      than rebuilding routes and silently dropping grafana/git; and the bypass list
+      (/api/auth/login, /internal/maintenance, ACME) is the anti-lockout guarantee that the gate
+      tests explicitly. The auth service gained an admin-role-gated POST /internal/maintenance/off
+      backed by RBAC scoped to two named ConfigMaps plus restarting Kong - the gate asserts that SA
+      cannot read secrets in app/data/platform. There is deliberately no HTTP way to turn
+      maintenance ON. Queue pausing is opt-in (--pause-queues), global via Redis so HPA-started
+      workers are covered, and lets in-flight jobs finish.
+      The gate's on/off cycle is disruptive (~60s of 503s) and skipped unless
+      --i-know-this-causes-downtime is passed; without it it prints PHASE 6B PARTIAL.
     - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
       NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
   - Cross-cutting (from commit #1, never "done")

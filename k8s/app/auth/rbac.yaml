@@ -1,0 +1,57 @@
+# rbac.yaml
+# Purpose: Let the auth service end maintenance mode via the Kubernetes API.
+# depends_on: [k8s/base/namespaces.yaml, k8s/platform/maintenance/state-configmap.yaml]
+#
+# SCOPE, DELIBERATELY NARROW
+# This grants the auth pod the ability to edit TWO NAMED ConfigMaps in the
+# platform namespace and to restart the Kong Deployment. Nothing else - no
+# secrets, no other ConfigMaps, no pod creation, no access to `app` or `data`.
+#
+# That matters because the auth service is internet-facing. The endpoint using
+# these rights is admin-role gated, but RBAC is the backstop for the case where
+# that gate is wrong: the worst a compromised auth pod can do here is restore
+# normal routing and bounce the gateway.
+#
+# resourceNames restricts get/patch to specific objects. Note that Kubernetes
+# does NOT allow resourceNames on `list` or `watch`, which is why neither verb
+# appears - the endpoint reads by name and never enumerates.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: auth
+  namespace: app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: auth-maintenance
+  namespace: platform
+rules:
+# Read and update only these two ConfigMaps.
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["maintenance-state", "kong-declarative-config"]
+  verbs: ["get", "patch", "update"]
+# Restart Kong so it reloads the restored declarative config. `patch` on the
+# Deployment is what a rollout restart does; there is no create or delete.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  resourceNames: ["kong"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: auth-maintenance
+  namespace: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: auth-maintenance
+subjects:
+# The auth pod lives in `app`; the Role it needs is in `platform`. A RoleBinding
+# in the target namespace referencing a ServiceAccount from another is the
+# correct way to cross that boundary without a ClusterRole.
+- kind: ServiceAccount
+  name: auth
+  namespace: app

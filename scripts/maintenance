@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# maintenance
+# Purpose: Turn maintenance mode on and off by swapping Kong's routing.
+# depends_on: [scripts/lib.sh, k8s/platform/maintenance/*]
+#
+# usage:
+#   maintenance status
+#   maintenance on  [--reason "..."] [--pause-queues]
+#   maintenance off
+#   maintenance resume-queues
+#
+# HOW IT WORKS
+# Kong runs DB-less: one ConfigMap holds every route. Turning maintenance on
+# rewrites that ConfigMap so all public routes point at the maintenance service,
+# stashes the original in the state ConfigMap, and restarts Kong. Turning it off
+# puts the original back.
+#
+# Swapping ROUTING rather than stopping services means the real services stay
+# up and warm the whole time - so ending maintenance is one Kong restart, not a
+# cold start of everything, and a failed deploy can be rolled back behind the
+# page without users seeing the churn.
+#
+# THE BYPASS LIST is the part that matters most. These stay routed normally even
+# during maintenance:
+#   /api/auth/login            - or nobody can authenticate to turn it off
+#   /internal/maintenance      - the off-switch itself
+#   /.well-known/acme-challenge - or certificate renewal fails mid-maintenance
+#                                 and you come back to an expired cert
+# Locking yourself out is the classic maintenance-mode failure; this is the fix.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$REPO_ROOT"
+
+# shellcheck source=scripts/lib.sh
+source "$REPO_ROOT/scripts/lib.sh"
+
+load_env
+need kubectl
+need jq
+
+NS=platform
+STATE_CM=maintenance-state
+KONG_CM=kong-declarative-config
+
+state_get() {
+  kubectl -n "$NS" get configmap "$STATE_CM" -o jsonpath="{.data.$1}" 2>/dev/null || true
+}
+
+state_set() {
+  # Merge-patch so unspecified keys keep their values.
+  kubectl -n "$NS" patch configmap "$STATE_CM" --type=merge -p "$1" >/dev/null
+}
+
+kong_restart() {
+  kubectl -n "$NS" rollout restart deployment/kong >/dev/null
+  log "Restarting Kong..."
+  kubectl -n "$NS" rollout status deployment/kong --timeout=180s >/dev/null \
+    || die "Kong did not come back. Check: kubectl -n $NS logs deploy/kong --tail=50"
+}
+
+# Pause or resume the BullMQ queue.
+#
+# Runs inside the WORKER pod rather than spawning a throwaway node container:
+# the worker already has bullmq installed, the Redis password mounted, and
+# network access to redis.data.svc. A fresh pod would have to npm-install at
+# runtime, which needs internet egress and turns a one-second operation into a
+# minute - during an incident.
+#
+# Pausing is global (BullMQ writes a marker into Redis), so it applies to every
+# worker replica including any the HPA starts later.
+queue_cmd() {
+  local fn="$1"
+  local pod
+  pod="$(kubectl -n app get pod -l app=worker \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+  if [ -z "$pod" ]; then
+    log "  no running worker pod - skipping queue $fn"
+    log "  (with zero workers there is nothing consuming the queue anyway)"
+    return 0
+  fi
+
+  kubectl -n app exec "$pod" -- node -e "
+    const { Queue } = require('bullmq');
+    const q = new Queue('jobs', { connection: {
+      host: 'redis.data.svc', port: 6379,
+      password: process.env.REDIS_PASSWORD,
+    }});
+    (async () => {
+      await q.${fn}();
+      const c = await q.getJobCounts('waiting', 'active');
+      console.log(JSON.stringify(c));
+      await q.close();
+    })().catch(e => { console.error(e.message); process.exit(1); });
+  " 2>/dev/null
+}
+
+cmd_status() {
+  local enabled since reason paused
+  enabled="$(state_get enabled)"
+  [ -n "$enabled" ] || die "maintenance-state ConfigMap not found - run 'make maintenance' first"
+
+  since="$(state_get since)"
+  reason="$(state_get reason)"
+  paused="$(state_get queues_paused)"
+
+  if [ "$enabled" = "on" ]; then
+    log "Maintenance mode: ON"
+    [ -n "$since" ]  && log "  since:  $since"
+    [ -n "$reason" ] && log "  reason: $reason"
+    [ "$paused" = "true" ] && log "  queues: PAUSED"
+    log ""
+    log "End it with: ./scripts/maintenance off"
+  else
+    ok "Maintenance mode: OFF (normal routing)"
+    [ "$paused" = "true" ] && log "  NOTE: job queues are still paused - ./scripts/maintenance resume-queues"
+  fi
+}
+
+cmd_on() {
+  local reason="" pause_queues=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason)       reason="${2:-}"; shift 2 ;;
+      --pause-queues) pause_queues=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  [ "$(state_get enabled)" != "on" ] || die "maintenance mode is already on
+  Status: ./scripts/maintenance status"
+
+  local current
+  current="$(kubectl -n "$NS" get configmap "$KONG_CM" -o jsonpath='{.data.kong\.yaml}')"
+  [ -n "$current" ] || die "could not read the current Kong config"
+
+  # Stash the live config before overwriting it. This is what `maintenance off`
+  # and the HTTP endpoint restore from - rebuilding the routes from scratch
+  # would silently drop anything added since (grafana, git, a new service).
+  log "Saving current Kong routing..."
+
+  # Build the maintenance config: every public path to the maintenance service,
+  # except the bypass list.
+  local maint_config
+  maint_config=$(cat <<'KONGYAML'
+_format_version: "3.0"
+
+services:
+  # BYPASS LIST - these must keep working during maintenance.
+
+  # Without login, nobody can authenticate to turn maintenance off.
+  - name: auth-service
+    url: http://auth.app.svc:80
+    routes:
+      - name: auth-route
+        paths:
+          - /api/auth
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 301
+
+  # The off-switch itself, called by the maintenance page.
+  - name: auth-maintenance-service
+    url: http://auth.app.svc:80
+    routes:
+      - name: auth-maintenance-route
+        paths:
+          - /internal/maintenance
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 301
+
+  # Certificate renewal must not fail because of maintenance - coming back to
+  # an expired certificate turns an hour of downtime into a much worse day.
+  - name: acme-solver-service
+    url: http://cm-acme-http-solver.platform.svc:8089
+    routes:
+      - name: acme-solver-route
+        paths:
+          - /.well-known/acme-challenge
+        strip_path: false
+        protocols: [http]
+
+  # EVERYTHING ELSE -> the 503 page.
+  - name: maintenance-service
+    url: http://maintenance.platform.svc:80
+    routes:
+      - name: maintenance-catchall
+        paths:
+          - /
+        strip_path: false
+        protocols: [https]
+        https_redirect_status_code: 301
+
+plugins:
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+KONGYAML
+)
+
+  if [ "$pause_queues" = true ]; then
+    log "Pausing job queues (in-flight jobs will finish)..."
+    local counts
+    counts="$(queue_cmd pause || true)"
+    [ -n "$counts" ] && log "  queue state: $counts"
+  fi
+
+  # Write state BEFORE swapping routing: if the Kong patch fails, `off` can
+  # still find the saved config and put things back.
+  state_set "$(jq -nc \
+    --arg saved "$current" \
+    --arg since "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg reason "$reason" \
+    --arg paused "$pause_queues" \
+    '{data: {enabled: "on", since: $since, reason: $reason,
+             queues_paused: $paused, saved_kong_config: $saved}}')"
+
+  kubectl -n "$NS" patch configmap "$KONG_CM" --type=merge \
+    -p "$(jq -nc --arg c "$maint_config" '{data: {"kong.yaml": $c}}')" >/dev/null
+
+  kong_restart
+
+  log ""
+  ok "Maintenance mode ON"
+  [ -n "$reason" ] && log "  reason: $reason"
+  log "  Public traffic now gets a 503 maintenance page."
+  log "  Still reachable: /api/auth/login, /internal/maintenance, ACME challenge"
+  log ""
+  log "End it with: ./scripts/maintenance off"
+}
+
+cmd_off() {
+  [ "$(state_get enabled)" = "on" ] || die "maintenance mode is not on
+  Status: ./scripts/maintenance status"
+
+  local saved
+  saved="$(state_get saved_kong_config)"
+  [ -n "$saved" ] || die "no saved Kong config in the state ConfigMap.
+
+  Routing cannot be restored automatically. Re-apply it by hand:
+    kubectl apply -f k8s/platform/kong/tls.yaml    # if Phase 5A is in use
+    kubectl -n $NS rollout restart deployment/kong"
+
+  log "Restoring the saved Kong routing..."
+  kubectl -n "$NS" patch configmap "$KONG_CM" --type=merge \
+    -p "$(jq -nc --arg c "$saved" '{data: {"kong.yaml": $c}}')" >/dev/null
+
+  kong_restart
+
+  local paused
+  paused="$(state_get queues_paused)"
+
+  state_set '{"data": {"enabled": "off", "since": "", "reason": "", "saved_kong_config": ""}}'
+
+  if [ "$paused" = "true" ]; then
+    log "Resuming job queues..."
+    local counts
+    counts="$(queue_cmd resume || true)"
+    [ -n "$counts" ] && log "  queue state: $counts"
+    state_set '{"data": {"queues_paused": "false"}}'
+  fi
+
+  log ""
+  ok "Maintenance mode OFF - normal routing restored"
+}
+
+cmd_resume_queues() {
+  log "Resuming job queues..."
+  local counts
+  counts="$(queue_cmd resume || true)"
+  [ -n "$counts" ] && log "  queue state: $counts"
+  state_set '{"data": {"queues_paused": "false"}}'
+  ok "Queues resumed"
+}
+
+case "${1:-status}" in
+  status)        cmd_status ;;
+  on)            shift; cmd_on "$@" ;;
+  off)           cmd_off ;;
+  resume-queues) cmd_resume_queues ;;
+  *)
+    cat >&2 <<'USAGE'
+usage: maintenance <command>
+
+  status                              show current state
+  on [--reason "..."] [--pause-queues]  route public traffic to the 503 page
+  off                                 restore normal routing
+  resume-queues                       resume queues without touching routing
+
+During maintenance these stay reachable: /api/auth/login,
+/internal/maintenance, and the ACME challenge path.
+USAGE
+    exit 1
+    ;;
+esac

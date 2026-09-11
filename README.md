@@ -962,3 +962,107 @@ wrong — fix them while it's a drill rather than an incident.
 | Job fails at upload | The staging copy is **kept** on failure — nothing is lost. `kubectl -n data logs job/<name> --all-containers` |
 | `kubectl drain` hangs | A PDB on a single-replica workload. `k8s/base/pdb.yaml` explains why mongodb/redis have none |
 | Backups stop appearing | `kubectl -n data get cronjob` — check `LAST SCHEDULE`; a CronJob that works manually but not on schedule usually means a bad cron expression |
+
+---
+
+## Phase 6B — Maintenance mode
+
+A static **503 page** you can put in front of the platform during migrations or
+risky deploys, toggled by swapping Kong's routing rather than stopping services.
+
+```bash
+./scripts/maintenance status
+./scripts/maintenance on --reason "database migration"
+./scripts/maintenance off
+```
+
+### How it works
+
+Kong is DB-less — one ConfigMap holds every route. `maintenance on` rewrites it
+so public traffic goes to the maintenance service, **stashes the original**, and
+restarts Kong. `maintenance off` puts the original back.
+
+Swapping routing rather than stopping services means the real services stay up
+and warm throughout, so ending maintenance is one Kong restart rather than a
+cold start of everything.
+
+### The bypass list
+
+These stay reachable during maintenance, by design:
+
+| Path | Why |
+|---|---|
+| `/api/auth/login` | Otherwise nobody can authenticate to turn maintenance **off** |
+| `/internal/maintenance` | The off-switch itself |
+| `/.well-known/acme-challenge` | Otherwise cert renewal fails and you return to an expired certificate |
+
+Locking yourself out is the classic maintenance-mode failure. The gate tests
+this explicitly.
+
+### Two ways out
+
+**CLI** (normal): `./scripts/maintenance off`
+
+**Browser** (when you're away from a machine with kubectl): the maintenance page
+has an "Administrator access" control that logs in and calls
+`POST /internal/maintenance/off`. It requires the **`admin` role** — a normal
+account gets a 403.
+
+There is deliberately **no HTTP way to turn maintenance on** — that would put a
+"take the platform down" button behind only a password.
+
+Promote a user to admin:
+
+```bash
+kubectl -n data exec -it statefulset/mongodb -- mongosh \
+  "mongodb://<root-user>:<pw>@localhost/backbone?authSource=admin" \
+  --eval 'db.users.updateOne({email:"you@example.com"},{$addToSet:{roles:"admin"}})'
+```
+
+### Pausing background jobs
+
+```bash
+./scripts/maintenance on --pause-queues     # workers stop taking new jobs
+```
+
+Off by default — a frontend deploy has no reason to stop background work, but a
+database migration does. In-flight jobs finish rather than being killed, and the
+pause is global, so a worker the HPA starts mid-maintenance is paused too.
+`maintenance off` resumes them automatically.
+
+### Deploying
+
+```bash
+make phase6b          # maintenance -> verify-phase6b
+```
+
+The gate's on/off cycle is **disruptive** (~60s of 503s while Kong restarts
+twice), so it's skipped by default and prints `PHASE 6B PARTIAL`. To run it
+fully:
+
+```bash
+./scripts/verify-phase6b.sh --i-know-this-causes-downtime
+```
+
+That's the run that actually proves maintenance mode can be turned **off** —
+worth doing once, deliberately, rather than discovering the answer during an
+incident.
+
+### Editing the page
+
+The HTML lives in a ConfigMap, not an image:
+
+```bash
+$EDITOR k8s/platform/maintenance/page-configmap.yaml
+kubectl apply -f k8s/platform/maintenance/page-configmap.yaml
+kubectl -n platform rollout restart deployment/maintenance
+```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `maintenance off` fails | `kubectl -n platform get cm maintenance-state -o jsonpath='{.data.saved_kong_config}'` — if empty, re-apply Kong's config by hand and restart it |
+| Stuck at 503 after `off` | Kong may still be restarting: `kubectl -n platform rollout status deploy/kong` |
+| HTTP off-switch returns 403 | The account lacks the `admin` role |
+| HTTP off-switch returns 500 | Auth image predates Phase 6B — `make build-push && make apply-app` |

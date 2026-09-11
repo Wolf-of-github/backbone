@@ -16,7 +16,8 @@ export KUBECONFIG
         jobs verify-phase4 phase4 \
         tls verify-phase5a obs verify-phase5b ci verify-phase5c \
         verify-phase5 phase5 \
-        backup backup-now verify-phase6a phase6a
+        backup backup-now verify-phase6a phase6a \
+        maintenance verify-phase6b phase6b
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
@@ -70,6 +71,12 @@ help:
 	@echo "  make backup                       - CronJobs + staging PVC + PodDisruptionBudgets"
 	@echo "  make backup-now                   - take a backup right now (before risky work)"
 	@echo "  make verify-phase6a               - run the Phase 6A gate (performs a real restore)"
+	@echo ""
+	@echo "  Phase 6B - Maintenance mode"
+	@echo "  make phase6b                      - maintenance -> verify-phase6b"
+	@echo "  make maintenance                  - deploy the 503 page + auth RBAC"
+	@echo "  make verify-phase6b               - run the Phase 6B gate"
+	@echo "    ./scripts/maintenance on|off|status   - the control CLI"
 	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
 
@@ -183,11 +190,20 @@ verify-phase6a: _need-kubeconfig
 
 phase6a: backup verify-phase6a
 
+# --- Phase 6B: Maintenance mode ---------------------------------------------
+maintenance: _need-kubeconfig
+	./scripts/bootstrap-maintenance.sh
+
+verify-phase6b: _need-kubeconfig
+	./scripts/verify-phase6b.sh
+
+phase6b: maintenance verify-phase6b
+
 down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh ci/notify.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance ci/notify.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
