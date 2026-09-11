@@ -25,7 +25,7 @@ spec:
     spec:
       containers:
       - name: jobs-api
-        image: REGISTRY_URL/jobs-api:latest
+        image: REGISTRY_URL/backbone-jobs-api:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

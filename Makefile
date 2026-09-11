@@ -11,7 +11,7 @@ export KUBECONFIG
 
 .PHONY: help cluster base secrets verify phase0 down lint node-join \
         secrets-data data verify-phase1 phase1 \
-        build-push edge verify-phase2 phase2 \
+        build-push apply-app edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
         jobs verify-phase4 phase4 \
         tls verify-phase5a obs verify-phase5b ci verify-phase5c \
@@ -103,6 +103,12 @@ phase1: data verify-phase1
 build-push: _need-kubeconfig
 	./scripts/build-push.sh
 
+# Apply k8s/app/* with the registry substituted into the image placeholder.
+# Never `kubectl apply -f k8s/app/...` directly - those files are templates and
+# a direct apply sets the image to the literal placeholder (InvalidImageName).
+apply-app: _need-kubeconfig
+	./scripts/apply-app-manifests.sh
+
 edge: _need-kubeconfig
 	./scripts/bootstrap-edge.sh
 
@@ -162,7 +168,7 @@ down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh ci/notify.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh ci/notify.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
