@@ -103,8 +103,26 @@ for k in endpoint bucket region access-key secret-key prefix; do
     -o jsonpath="{.data['${k/./\\.}']}" >/dev/null 2>&1 \
     || fail "secret/backup-s3-credentials is missing key '$k'"
 done
+# The PVC must EXIST, but demanding Bound here is wrong: Phase 0's local-path
+# StorageClass uses WaitForFirstConsumer, so the volume is not provisioned until
+# a pod actually mounts it. Before the first backup runs there is no consumer,
+# and Pending is the correct state. Check [4] proves it really binds, because a
+# backup job cannot complete otherwise.
 phase=$(kubectl -n data get pvc backup-staging -o jsonpath='{.status.phase}' 2>/dev/null || true)
-[ "$phase" = "Bound" ] || fail "PVC backup-staging is '$phase', expected Bound"
+[ -n "$phase" ] || fail "PVC backup-staging does not exist - run 'make backup' first"
+
+binding=$(kubectl get storageclass local-path -o jsonpath='{.volumeBindingMode}' 2>/dev/null || true)
+case "$phase" in
+  Bound)
+    PVC_NOTE="Bound" ;;
+  Pending)
+    [ "$binding" = "WaitForFirstConsumer" ] \
+      || fail "PVC backup-staging is Pending and the StorageClass binds immediately - provisioning is broken.
+  Check: kubectl -n data describe pvc backup-staging"
+    PVC_NOTE="Pending (WaitForFirstConsumer - binds on the first backup)" ;;
+  *)
+    fail "PVC backup-staging is '$phase' - expected Bound, or Pending under WaitForFirstConsumer" ;;
+esac
 
 for cj in mongo-backup redis-backup; do
   kubectl -n data get cronjob "$cj" >/dev/null 2>&1 || fail "cronjob/$cj missing"
@@ -112,7 +130,7 @@ for cj in mongo-backup redis-backup; do
   [ "$policy" = "Forbid" ] \
     || fail "cronjob/$cj has concurrencyPolicy '$policy' - must be Forbid (both mount one RWO staging PVC)"
 done
-ok "secret (6 keys), staging PVC Bound, both CronJobs present with Forbid"
+ok "secret (6 keys), staging PVC ${PVC_NOTE}, both CronJobs present with Forbid"
 
 # [2/7] PDBs, including the ones that must NOT exist
 log "[2/7] PodDisruptionBudgets"
@@ -164,6 +182,12 @@ kubectl -n data wait --for=condition=complete "job/$TEST_JOB" --timeout=600s >/d
 CREATED_KEY=$(s3_exec 'aws $EP s3 ls "s3://${bucket}/${prefix}/mongo/" | sort -r | head -1 | awk "{print \$4}"' 2>/dev/null | tr -d '\r\n ')
 [ -n "$CREATED_KEY" ] || fail "no backup object appeared in the bucket"
 log "  uploaded: $CREATED_KEY"
+
+# A backup job cannot have completed unless the staging PVC bound, so this is
+# the honest place to assert it - check [1] only sees an unconsumed PVC.
+bound=$(kubectl -n data get pvc backup-staging -o jsonpath='{.status.phase}' 2>/dev/null || true)
+[ "$bound" = "Bound" ] \
+  || fail "a backup completed but PVC backup-staging is '$bound' - expected Bound"
 
 log "  destroying the source data..."
 mongo_eval "db.getSiblingDB(\"$MONGO_APP_DB\").verify6a.drop()" >/dev/null \
