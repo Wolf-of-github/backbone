@@ -836,3 +836,129 @@ kubectl -n data run redis-cli --rm -it --restart=Never --image=redis:7.2-alpine 
 ```
 
 ---
+
+---
+
+## Phase 6A — Backup / Disaster Recovery
+
+Nightly **MongoDB** and **Redis** snapshots uploaded to **external S3-compatible
+storage**, with restore scripts and retention pruning. Plus PodDisruptionBudgets
+so node drains don't take services to zero.
+
+External storage is the whole point. A backup on the same disk as the database
+survives a dropped collection, but not the disk dying — which is the failure that
+actually ends the platform. MongoDB here is a single replica on node-bound
+`local-path`, so until this phase there was no copy of your data anywhere.
+
+### 1. Create the bucket first
+
+`make backup` does **not** create it. On your provider (AWS S3, Backblaze B2,
+Cloudflare R2 — anything speaking the S3 API):
+
+1. **Create a bucket**, and turn on **object versioning** with a lifecycle rule
+   to expire old versions. Without versioning, anything that can write to the
+   bucket can also destroy history by overwriting it.
+2. **Issue an access key scoped to that bucket only**, with `s3:PutObject`,
+   `GetObject`, `ListBucket`, `DeleteObject`. Never a root or admin key — it
+   lives in the cluster and is only as safe as the cluster is.
+
+### 2. Configure
+
+Fill the **Phase 6A** block in `.env`:
+
+| Variable | Notes |
+|---|---|
+| `BACKUP_S3_BUCKET` | Required. Must already exist. |
+| `BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY` | The scoped key from step 1 |
+| `BACKUP_S3_ENDPOINT` | Blank for AWS; required for B2/R2/MinIO |
+| `BACKUP_S3_REGION` | Some providers reject a mismatched region |
+| `BACKUP_RETENTION_DAYS` | Default 30 |
+| `BACKUP_SCHEDULE_MONGO` / `_REDIS` | Cron, UTC. Redis runs an hour later — both use one RWO staging volume |
+
+### 3. Deploy
+
+```bash
+make phase6a          # backup -> verify-phase6a
+```
+
+`make backup` preflights the bucket before creating anything, so a typo'd name
+or wrong key fails immediately rather than silently at 03:00.
+
+**Expect:**
+
+```
+[1/7] Secret, staging volume and CronJobs   OK
+[2/7] PodDisruptionBudgets                  OK
+[3/7] Bucket reachability                   OK
+[4/7] Mongo backup and restore round trip   OK
+[5/7] Redis backup                          OK
+[6/7] Retention pruning                     OK
+[7/7] Backup freshness                      OK
+
+PHASE 6A OK
+```
+
+Check **[4]** is the one that matters: it writes a sentinel document, backs up,
+**drops it**, restores from S3, and confirms it came back. A backup that has
+never been restored is a hypothesis.
+
+### Taking a backup now
+
+```bash
+./scripts/backup-now.sh mongo        # or redis, or all
+```
+
+Do this before a migration or a bulk delete. Scheduled backups mean an **RPO of
+up to 24 hours** — anything written since the last run is not recoverable.
+
+### Restoring
+
+```bash
+./scripts/mongo-restore.sh list
+./scripts/mongo-restore.sh restore <key> --target restore_check
+```
+
+The default restores **beside** your live data into a named database, so you can
+inspect it and copy across only what you need. Overwriting production needs two
+explicit flags:
+
+```bash
+./scripts/mongo-restore.sh restore <key> --overwrite-production --confirm
+```
+
+**Redis is different.** It holds refresh tokens and the job queue, so restoring
+it revives sessions that were revoked at logout and replays jobs that already
+ran. Use `inspect` to look without touching production:
+
+```bash
+./scripts/redis-restore.sh inspect <key>
+```
+
+### Practise the restore
+
+Do this once, now, from these instructions alone — not from the scripts:
+
+1. `./scripts/backup-now.sh mongo`
+2. `./scripts/mongo-restore.sh list`
+3. `./scripts/mongo-restore.sh restore <newest-key> --target drill`
+4. Connect and confirm your data is in `drill`, then `db.dropDatabase()`
+
+If these steps aren't enough to recover without reading the source, the docs are
+wrong — fix them while it's a drill rather than an incident.
+
+### What this does NOT cover
+
+- **Point-in-time recovery.** Nightly dumps only; RPO is up to 24h.
+- **High availability.** Backups answer "the disk died", not "stay up while it
+  dies". MongoDB is still single-replica.
+- **Cluster objects** (Deployments, ConfigMaps) — those are in git and rebuilt
+  with `make`. Only the data is irreplaceable.
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `make backup` fails at preflight | Bucket name, key, and `BACKUP_S3_ENDPOINT` for non-AWS providers |
+| Job fails at upload | The staging copy is **kept** on failure — nothing is lost. `kubectl -n data logs job/<name> --all-containers` |
+| `kubectl drain` hangs | A PDB on a single-replica workload. `k8s/base/pdb.yaml` explains why mongodb/redis have none |
+| Backups stop appearing | `kubectl -n data get cronjob` — check `LAST SCHEDULE`; a CronJob that works manually but not on schedule usually means a bad cron expression |

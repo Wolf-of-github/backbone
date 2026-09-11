@@ -1,0 +1,192 @@
+# mongo-cronjob.yaml
+# Purpose: Nightly mongodump -> external S3, with remote verification, pruning,
+#          and a local copy retained until the upload is proven.
+# depends_on: [staging-pvc.yaml, scripts/backup-secrets.sh,
+#              k8s/data/mongodb/service.yaml]
+#
+# TEMPLATE: BACKUP_SCHEDULE_MONGO and BACKUP_RETENTION_DAYS are substituted by
+# scripts/bootstrap-backup.sh. Never write those names in dollar-brace form in
+# a comment - envsubst rewrites comment lines too (learned in Phase 5).
+#
+# Uses the ROOT credential deliberately. The app user is scoped readWrite on one
+# database and cannot read `admin`, so an app-user mongodump silently omits
+# users and roles - a backup that restores the data but not who may touch it.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mongo-backup
+  namespace: data
+  labels:
+    app: mongo-backup
+spec:
+  schedule: "${BACKUP_SCHEDULE_MONGO}"
+  # Two dumps must never race onto one RWO staging volume.
+  concurrencyPolicy: Forbid
+  # If the cluster was down at the scheduled time, still run when it returns -
+  # but only if less than an hour late, otherwise wait for the next slot.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            fsGroup: 999
+          # The dump runs as an initContainer so the upload container cannot
+          # start on a failed dump - Kubernetes enforces the ordering for us.
+          initContainers:
+          - name: dump
+            image: mongo:7.0
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -euo pipefail
+              TS="$(date -u +%Y%m%dT%H%M%SZ)"
+              echo "$TS" > /staging/.mongo-timestamp
+              ARCHIVE="/staging/mongo-${TS}.gz"
+
+              echo "dumping to ${ARCHIVE}"
+              # Credentials come from env and are referenced as shell variables -
+              # never interpolated into this manifest, and never printed.
+              # --archive gives one file to upload and verify; mongorestore
+              # reads it directly, unlike a directory dump.
+              mongodump \
+                --host=mongodb.data.svc \
+                --port=27017 \
+                --username="$MONGO_ROOT_USER" \
+                --password="$MONGO_ROOT_PASSWORD" \
+                --authenticationDatabase=admin \
+                --archive="$ARCHIVE" \
+                --gzip \
+                --quiet
+
+              SIZE=$(stat -c%s "$ARCHIVE")
+              [ "$SIZE" -gt 0 ] || { echo "dump is empty - refusing to upload"; exit 1; }
+              echo "dump complete: ${SIZE} bytes"
+            env:
+            - name: MONGO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-credentials
+                  key: root-username
+            - name: MONGO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-credentials
+                  key: root-password
+            volumeMounts:
+            - name: staging
+              mountPath: /staging
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "256Mi"
+              limits:
+                cpu: "1000m"
+                memory: "1Gi"
+          containers:
+          - name: upload
+            image: amazon/aws-cli:2.17.0
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -euo pipefail
+              TS="$(cat /staging/.mongo-timestamp)"
+              ARCHIVE="/staging/mongo-${TS}.gz"
+              KEY="${S3_PREFIX}/mongo/mongo-${TS}.gz"
+
+              # Empty endpoint means AWS S3; anything else needs the flag.
+              EP=""
+              [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url ${S3_ENDPOINT}"
+
+              LOCAL_SIZE=$(stat -c%s "$ARCHIVE")
+              echo "uploading ${LOCAL_SIZE} bytes to s3://${S3_BUCKET}/${KEY}"
+              # shellcheck disable=SC2086
+              aws $EP s3 cp "$ARCHIVE" "s3://${S3_BUCKET}/${KEY}"
+
+              # Prove the object is actually there and complete before the local
+              # copy is destroyed. An upload that reports success but lands a
+              # truncated object is the failure this catches.
+              # shellcheck disable=SC2086
+              REMOTE_SIZE=$(aws $EP s3api head-object \
+                --bucket "$S3_BUCKET" --key "$KEY" \
+                --query 'ContentLength' --output text)
+
+              [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ] \
+                || { echo "size mismatch: local ${LOCAL_SIZE}, remote ${REMOTE_SIZE} - keeping local copy"; exit 1; }
+              echo "verified ${REMOTE_SIZE} bytes at ${KEY}"
+
+              rm -f "$ARCHIVE" /staging/.mongo-timestamp
+
+              # Prune old objects. Compare by the date embedded in the key, not
+              # by LastModified: re-uploads and lifecycle transitions can move
+              # LastModified and silently spare or destroy the wrong backups.
+              CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)
+              echo "pruning mongo backups older than ${CUTOFF}"
+              # shellcheck disable=SC2086
+              aws $EP s3api list-objects-v2 \
+                --bucket "$S3_BUCKET" --prefix "${S3_PREFIX}/mongo/" \
+                --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' \
+              | while read -r k; do
+                  [ -n "$k" ] || continue
+                  d=$(echo "$k" | sed -n 's/.*mongo-\([0-9]\{8\}\)T.*/\1/p')
+                  [ -n "$d" ] || continue
+                  if [ "$d" -lt "$CUTOFF" ]; then
+                    echo "  pruning $k"
+                    # shellcheck disable=SC2086
+                    aws $EP s3 rm "s3://${S3_BUCKET}/${k}"
+                  fi
+                done
+              echo "backup complete"
+            env:
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: endpoint
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: bucket
+            - name: S3_PREFIX
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: prefix
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: region
+            - name: RETENTION_DAYS
+              value: "${BACKUP_RETENTION_DAYS}"
+            volumeMounts:
+            - name: staging
+              mountPath: /staging
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+          volumes:
+          - name: staging
+            persistentVolumeClaim:
+              claimName: backup-staging

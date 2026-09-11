@@ -2853,9 +2853,36 @@
 
 - Files (Phase 6 - Resilience & lifecycle)
   Format: file_name | file_path | description | depends_on[]
-  STATUS: Track A is planned in detail above (Phase 6A - Backup / Disaster Recovery) and supersedes
-  the Track A entries below where they conflict - specifically: backups go to EXTERNAL S3, not to a
-  local PVC or in-cluster MinIO (minio-statefulset.yaml and the PVC-as-destination design are
+  STATUS: Track A is IMPLEMENTED (2026-09-11), not yet run against a cluster. Every Phase 6A file
+  exists with real content; all scripts pass `bash -n` and `shellcheck -S warning`; the CronJob and
+  PDB manifests parse as YAML with their templates rendered. Step 10 (a live `make phase6a`, a
+  naturally-fired scheduled run, and the manual restore drill) still needs a cluster with an S3
+  bucket configured before tagging `phase-6a-complete`.
+
+  Implementation notes / deviations:
+   - Restore Jobs use an aws-cli initContainer that fetches onto a shared emptyDir, then the
+     mongo:7.0 container restores from it. Installing the AWS CLI into the mongo image at run time
+     would need internet egress on every restore and add a minute to the one operation performed
+     under pressure.
+   - mongorestore is invoked with --nsFrom/--nsTo so a dump taken from the live database lands in
+     the scratch one. Without that rewrite mongorestore writes back to the database the dump came
+     from, silently ignoring --target - which would turn a "safe" restore into an overwrite.
+   - Redis has no safe in-place restore (no namespace to redirect into), so redis-restore.sh offers
+     `inspect` as the default path - it loads the RDB into a throwaway Redis on port 6399 and
+     reports DBSIZE and sample keys. The actual restore uses MIGRATE rather than a GET/SET loop, so
+     TTLs survive; a naive copy would turn expiring refresh tokens into permanent ones.
+   - verify-phase6a builds its kubectl --overrides with jq rather than string interpolation. The
+     mongosh expressions contain quotes and braces, and hand-rolled escaping through shell -> JSON
+     -> mongosh is exactly where Phase 5's template bugs came from.
+   - Check [2] asserts a NEGATIVE: that no PDB exists for mongodb/redis. minAvailable on a
+     1-replica workload makes the node permanently undrainable, and the failure mode (drain hangs
+     forever with no clear reason) is worth a gate.
+   - Both CronJobs verify the remote object's size against the local file BEFORE deleting the local
+     copy, so a truncated upload leaves the dump recoverable by hand.
+
+  Supersedes the older Track A entries below where they conflict - specifically: backups go to
+  EXTERNAL S3, not a local PVC or in-cluster MinIO (minio-statefulset.yaml and the
+  PVC-as-destination design are
   dropped; the PVC survives only as upload staging), and redis-persistence-patch.yaml is dropped
   because Phase 1's conf-configmap.yaml already sets AOF + RDB. Tracks B and C are NOT planned or
   built; both need rework first, since Track B's bootstrap assumed Phase 5C's notify.sh and image

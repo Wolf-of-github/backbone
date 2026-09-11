@@ -1,0 +1,195 @@
+# redis-cronjob.yaml
+# Purpose: Nightly Redis RDB snapshot -> external S3, same verify/prune flow as
+#          the Mongo job.
+# depends_on: [staging-pvc.yaml, scripts/backup-secrets.sh,
+#              k8s/data/redis/service.yaml]
+#
+# TEMPLATE: BACKUP_SCHEDULE_REDIS and BACKUP_RETENTION_DAYS are substituted by
+# scripts/bootstrap-backup.sh.
+#
+# WHAT RESTORING THIS ACTUALLY MEANS - read before using it
+# Redis here holds refresh tokens (Phase 3) and the BullMQ queue (Phase 4).
+# Restoring it therefore REVIVES sessions that were deliberately revoked and
+# REPLAYS jobs that already ran. That is rarely what you want. This backup
+# exists for total-loss recovery, where losing it means users cannot refresh
+# and queued work vanishes - not for routine rollback. MongoDB is the
+# authoritative store; Redis is closer to durable cache.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-backup
+  namespace: data
+  labels:
+    app: redis-backup
+spec:
+  # Scheduled after the Mongo job: both mount the same RWO staging PVC, and a
+  # node can only attach it to one pod at a time.
+  schedule: "${BACKUP_SCHEDULE_REDIS}"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            fsGroup: 999
+          initContainers:
+          - name: snapshot
+            image: redis:7.2-alpine
+            command: ["/bin/sh", "-c"]
+            args:
+            - |
+              set -eu
+              TS="$(date -u +%Y%m%dT%H%M%SZ)"
+              echo "$TS" > /staging/.redis-timestamp
+              RDB="/staging/redis-${TS}.rdb"
+
+              R="redis-cli -h redis.data.svc -a $REDIS_PASSWORD --no-auth-warning"
+
+              # BGSAVE is ASYNCHRONOUS. Pulling the dump immediately would copy
+              # whatever snapshot already existed on disk - possibly hours old -
+              # and report success. Record LASTSAVE, trigger, then wait for the
+              # timestamp to advance before trusting the snapshot.
+              BEFORE=$($R LASTSAVE)
+              echo "triggering BGSAVE (LASTSAVE was ${BEFORE})"
+              $R BGSAVE > /dev/null
+
+              WAITED=0
+              while [ "$WAITED" -lt 120 ]; do
+                AFTER=$($R LASTSAVE)
+                [ "$AFTER" != "$BEFORE" ] && break
+                sleep 2
+                WAITED=$((WAITED + 2))
+              done
+              [ "${AFTER:-$BEFORE}" != "$BEFORE" ] \
+                || { echo "BGSAVE did not complete within 120s"; exit 1; }
+              echo "BGSAVE complete (LASTSAVE now ${AFTER})"
+
+              # --rdb pulls the snapshot over the wire, so this job needs no
+              # shared volume with the Redis pod - which matters because the
+              # Redis PVC is RWO and already attached to it.
+              $R --rdb "$RDB" > /dev/null 2>&1
+
+              SIZE=$(stat -c%s "$RDB")
+              [ "$SIZE" -gt 0 ] || { echo "snapshot is empty - refusing to upload"; exit 1; }
+
+              # An RDB that cannot be parsed is not a backup. Catch it here,
+              # while the data is still live, rather than during a restore.
+              redis-check-rdb "$RDB" || { echo "RDB failed integrity check"; exit 1; }
+              echo "snapshot verified: ${SIZE} bytes"
+            env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-password
+                  key: password
+            volumeMounts:
+            - name: staging
+              mountPath: /staging
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+          containers:
+          - name: upload
+            image: amazon/aws-cli:2.17.0
+            command: ["/bin/bash", "-c"]
+            args:
+            - |
+              set -euo pipefail
+              TS="$(cat /staging/.redis-timestamp)"
+              RDB="/staging/redis-${TS}.rdb"
+              KEY="${S3_PREFIX}/redis/redis-${TS}.rdb"
+
+              EP=""
+              [ -n "${S3_ENDPOINT:-}" ] && EP="--endpoint-url ${S3_ENDPOINT}"
+
+              LOCAL_SIZE=$(stat -c%s "$RDB")
+              echo "uploading ${LOCAL_SIZE} bytes to s3://${S3_BUCKET}/${KEY}"
+              # shellcheck disable=SC2086
+              aws $EP s3 cp "$RDB" "s3://${S3_BUCKET}/${KEY}"
+
+              # shellcheck disable=SC2086
+              REMOTE_SIZE=$(aws $EP s3api head-object \
+                --bucket "$S3_BUCKET" --key "$KEY" \
+                --query 'ContentLength' --output text)
+
+              [ "$REMOTE_SIZE" = "$LOCAL_SIZE" ] \
+                || { echo "size mismatch: local ${LOCAL_SIZE}, remote ${REMOTE_SIZE} - keeping local copy"; exit 1; }
+              echo "verified ${REMOTE_SIZE} bytes at ${KEY}"
+
+              rm -f "$RDB" /staging/.redis-timestamp
+
+              CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%Y%m%d)
+              echo "pruning redis backups older than ${CUTOFF}"
+              # shellcheck disable=SC2086
+              aws $EP s3api list-objects-v2 \
+                --bucket "$S3_BUCKET" --prefix "${S3_PREFIX}/redis/" \
+                --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '\n' \
+              | while read -r k; do
+                  [ -n "$k" ] || continue
+                  d=$(echo "$k" | sed -n 's/.*redis-\([0-9]\{8\}\)T.*/\1/p')
+                  [ -n "$d" ] || continue
+                  if [ "$d" -lt "$CUTOFF" ]; then
+                    echo "  pruning $k"
+                    # shellcheck disable=SC2086
+                    aws $EP s3 rm "s3://${S3_BUCKET}/${k}"
+                  fi
+                done
+              echo "backup complete"
+            env:
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: endpoint
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: bucket
+            - name: S3_PREFIX
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: prefix
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: access-key
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: secret-key
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: backup-s3-credentials
+                  key: region
+            - name: RETENTION_DAYS
+              value: "${BACKUP_RETENTION_DAYS}"
+            volumeMounts:
+            - name: staging
+              mountPath: /staging
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "128Mi"
+              limits:
+                cpu: "500m"
+                memory: "512Mi"
+          volumes:
+          - name: staging
+            persistentVolumeClaim:
+              claimName: backup-staging

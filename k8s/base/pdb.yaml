@@ -1,0 +1,78 @@
+# pdb.yaml
+# Purpose: PodDisruptionBudgets so a node drain or voluntary eviction cannot
+#          take a service to zero replicas.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# WHAT A PDB DOES - and does not
+# It constrains VOLUNTARY disruption: `kubectl drain`, node upgrades, the
+# cluster autoscaler. It does nothing about a node crashing - that is
+# involuntary, and the only answer there is more replicas on more machines.
+#
+# WHY THERE IS NO PDB FOR mongodb OR redis
+# Both are single-replica StatefulSets. `minAvailable: 1` on a 1-replica
+# workload means the pod can NEVER be evicted: `kubectl drain` blocks forever
+# waiting for a disruption budget that can never be satisfied, and it is not
+# obvious from the error why. Leaving them unprotected is the correct call
+# while they are single-replica - the drain briefly takes them down, which is
+# exactly what a single replica means. They become PDB candidates only when
+# MongoDB moves to a replica set (explicitly out of scope for Phase 6A).
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kong
+  namespace: platform
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: kong
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: auth
+  namespace: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: auth
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ping
+  namespace: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ping
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: jobs-api
+  namespace: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: jobs-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: app
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: frontend
+---
+# The worker has no PDB on purpose: it is HPA-managed (1-10) and can scale to a
+# single replica, which would hit the same undrainable trap as the StatefulSets.
+# Losing workers mid-drain is safe - BullMQ redelivers in-flight jobs, which
+# Phase 4's verify already proved.
