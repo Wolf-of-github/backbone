@@ -45,6 +45,14 @@ mkdir -p "$RENDER_DIR"
 #    healthy-looking CronJob that fails silently at 03:00, and you discover it
 #    when you need the backup. Ten seconds here buys that back.
 # ---------------------------------------------------------------------------
+# SKIP_PREFLIGHT=true installs the CronJobs without proving the bucket works.
+# Only for bring-up on a cluster that has no real bucket yet: the CronJobs will
+# be created and WILL FAIL at their first scheduled run. Never set this on
+# anything you expect to actually recover from.
+if [ "${SKIP_PREFLIGHT:-false}" = "true" ]; then
+  log "SKIP_PREFLIGHT=true - NOT checking bucket access."
+  log "The CronJobs will be created but backups will FAIL until BACKUP_S3_* is real."
+else
 log "Preflight: checking bucket access..."
 PREFLIGHT_POD="backup-preflight-$$"
 cleanup_preflight() {
@@ -83,6 +91,7 @@ fi
 ok "bucket '${BACKUP_S3_BUCKET}' reachable"
 cleanup_preflight
 trap - EXIT
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Staging volume, CronJobs, PDBs

@@ -21,6 +21,13 @@ need jq
 
 fail() { die "verify-phase6a: $*"; }
 
+# --no-s3 runs only the checks that need no bucket: the Kubernetes wiring.
+# It deliberately prints PARTIAL, never OK - the checks it skips are the ones
+# that prove a backup can actually be taken and restored, which is the entire
+# point of the phase. Useful during bring-up; never sufficient to call this done.
+NO_S3=false
+[ "${1:-}" = "--no-s3" ] && NO_S3=true
+
 SENTINEL="phase6a-$(date +%s)"
 SCRATCH_DB="verify6a_restore"
 TEST_JOB=""
@@ -121,6 +128,17 @@ for s in mongodb redis; do
   fi
 done
 ok "PDBs present for multi-replica services; correctly absent for single-replica StatefulSets"
+
+if [ "$NO_S3" = true ]; then
+  log ""
+  log "--no-s3: skipping checks [3]-[7]."
+  log "NOT verified: that a dump can be taken, uploaded, pruned, or RESTORED."
+  log "Those are the checks this phase exists for. Re-run without --no-s3 once a"
+  log "bucket is configured, and do the restore drill in README > Phase 6A."
+  log ""
+  ok "PHASE 6A PARTIAL (Kubernetes wiring only - backups NOT verified)"
+  exit 0
+fi
 
 # [3/7] S3 reachable
 log "[3/7] Bucket reachability"
