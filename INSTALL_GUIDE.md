@@ -200,3 +200,75 @@ Running each phase individually (`make phase0`, `make phase1`, … `make
 phase6b`), rather than all at once via `make backbone`, is also supported —
 useful if you're debugging one phase specifically. Run `make help` for the
 full command list.
+
+---
+
+## Adding a worker node
+
+**What:** the control-plane instance from Step 1-3 can run everything alone,
+but joining a second machine as a k3s **worker** adds real capacity - pods
+get scheduled across both. The joined machine only ever runs workloads; it
+never becomes a second control-plane (this platform runs single-server k3s,
+not an HA/multi-server setup) - if the original instance goes down, the
+cluster's API goes down regardless of how many workers are joined.
+
+**Prerequisite:** the new instance must be in the **same AWS account, VPC,
+and region** as the control-plane. Private IPs (`172.31.x.x`) only route
+within one VPC - a different account or VPC needs cross-account networking
+(VPC peering) that isn't covered here.
+
+**How:**
+
+1. **Launch the worker instance** - same AMI, same VPC/subnet/region as the
+   control-plane. Nothing needs installing on it ahead of time (no k3s,
+   Docker, or cloned repo) - the join pushes everything it needs over SSH.
+
+2. **Security groups - both directions, not just one.** It's easy to open
+   the new instance's inbound rules and assume that's the whole job; the
+   control-plane's own security group also needs new inbound rules to
+   accept traffic *from* the worker, or the join hangs indefinitely on
+   `failed to get CA certs` with no obvious cause.
+
+   On the **worker's** security group, allow inbound from the control-plane's private IP:
+   | Port | Protocol | Source |
+   |---|---|---|
+   | `22` | TCP | your IP (for SSH access) |
+   | `6443` | TCP | control-plane's private IP `/32` |
+   | `10250` | TCP | control-plane's private IP `/32` |
+   | `51820` | UDP | control-plane's private IP `/32` |
+
+   On the **control-plane's** security group, add inbound rules allowing the same three ports from the **worker's** private IP `/32` (`6443`, `10250`, `51820`) - this is the direction that's easy to miss.
+
+3. **SSH access from the control-plane to the worker.** The control-plane
+   instance itself (not your laptop) needs the private key for the
+   worker's key pair, since it's the one dispatching the join over SSH. If
+   you only have the `.pem` on your own machine, copy it over:
+   ```bash
+   # from your own machine, in the folder with the .pem
+   scp -i your-key.pem your-key.pem ubuntu@<control-plane-public-ip>:~/.ssh/
+   ```
+   Then on the control-plane:
+   ```bash
+   chmod 600 ~/.ssh/your-key.pem
+   sed -i "s|^SSH_KEY=.*|SSH_KEY=/home/ubuntu/.ssh/your-key.pem|" .env
+   grep '^SSH_KEY=' .env
+   ```
+
+4. **Run the join, from the control-plane:**
+   ```bash
+   ./scripts/node-join.sh ubuntu@<worker-private-ip>
+   ```
+
+**Success looks like:**
+```bash
+kubectl get nodes -o wide
+```
+showing two `Ready` nodes - the original as `control-plane,etcd,master`,
+the new one with no role (a plain worker).
+
+**Want to look closer?** If the join hangs at "No change detected so
+skipping service start" or the worker's `k3s-agent` logs (`sudo journalctl
+-u k3s-agent -n 30 --no-pager`, on the worker) show repeating `failed to
+get CA certs: ... context deadline exceeded`, that's a network path
+problem to port 6443, not an SSH/key problem - re-check step 2 above,
+specifically the control-plane's own inbound rules.
