@@ -93,3 +93,20 @@ spec:
           runAsUser: 1001
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: false
+        volumeMounts:
+        # authContext.js resolves the public key at src/jwt-public-key.pem
+        # (one level up from src/common/authContext.js). Without this mount
+        # authContext.js finds no key, falls back to jwt.decode() with no
+        # signature check, and requireAuth accepts any well-formed JWT -
+        # including a forged one - as long as it decodes.
+        - name: jwt-public-key
+          mountPath: /app/src/jwt-public-key.pem
+          subPath: jwt-public-key.pem
+          readOnly: true
+      volumes:
+      - name: jwt-public-key
+        secret:
+          secretName: jwt-public-key
+          items:
+          - key: public-key
+            path: jwt-public-key.pem

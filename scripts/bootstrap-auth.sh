@@ -45,6 +45,18 @@ log "[1/7] Generating JWT keypair..."
 "${SCRIPT_DIR}/jwt-keys.sh"
 ok "JWT keys ready"
 
+# jwt-keys.sh creates jwt-public-key only in `platform`, but ping and
+# jobs-api (both in `app`) need it to actually verify tokens -
+# services/common/authContext.js falls back to jwt.decode() with NO
+# signature check if the key file isn't present, silently accepting any
+# well-formed JWT as valid. Mirror it into `app` the same way as the
+# data-layer secrets above.
+log "Mirroring jwt-public-key into the app namespace..."
+kubectl -n platform get secret jwt-public-key -o json \
+  | jq 'del(.metadata.namespace, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.ownerReferences)' \
+  | kubectl -n app apply -f - >/dev/null
+ok "jwt-public-key present in app"
+
 # Step 2: Create auth ConfigMap with settings from .env
 log "[2/7] Creating auth-config ConfigMap..."
 JWT_ACCESS_EXPIRY="${JWT_ACCESS_EXPIRY:-15m}"
