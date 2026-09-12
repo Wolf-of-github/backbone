@@ -218,7 +218,7 @@ log "Cleaning up test users..."
 MONGO_URI_CLEANUP="mongodb://$(urlencode "$MONGO_APP_USER"):$(urlencode "$MONGO_APP_PASSWORD")@mongodb.data.svc/$MONGO_APP_DB"
 kubectl -n data run mongosh-cleanup --rm -it --restart=Never --image=mongo:7.0 -- \
   mongosh "$MONGO_URI_CLEANUP" \
-  --quiet --eval "db.users.deleteMany({email: {$in: ['$TEST_EMAIL', '$TEST_EMAIL_2']}})" 2>/dev/null || true
+  --quiet --eval "db.users.deleteMany({email: {\$in: ['$TEST_EMAIL', '$TEST_EMAIL_2']}})" 2>/dev/null || true
 
 log ""
 ok "PHASE 4 OK"
