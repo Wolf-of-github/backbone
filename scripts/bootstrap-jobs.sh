@@ -40,27 +40,34 @@ log "Building and pushing images (tag: $TAG)..."
 # worse than a slower build: it fails silently. Force a clean build instead
 # of trusting the cache.
 log "  Building jobs-api..."
+# Image name must match what k8s/app/jobs-api/deployment.yaml actually pulls
+# (backbone-jobs-api) - every other service (auth, ping, frontend, via
+# build-push.sh) follows the same backbone-<service> convention. This
+# script previously pushed to a differently-named repo (jobs-api, no
+# prefix), so the Deployment kept pulling whatever old/unrelated image
+# already existed at backbone-jobs-api:latest on the registry, completely
+# disconnected from anything this script built.
 docker build --no-cache \
-  -t "$REGISTRY_URL/jobs-api:$TAG" \
-  -t "$REGISTRY_URL/jobs-api:latest" \
+  -t "$REGISTRY_URL/backbone-jobs-api:$TAG" \
+  -t "$REGISTRY_URL/backbone-jobs-api:latest" \
   -f services/jobs-api/Dockerfile \
   . || die "Failed to build jobs-api image"
 
 log "  Pushing jobs-api..."
-docker push "$REGISTRY_URL/jobs-api:$TAG" || die "Failed to push jobs-api:$TAG"
-docker push "$REGISTRY_URL/jobs-api:latest" || die "Failed to push jobs-api:latest"
+docker push "$REGISTRY_URL/backbone-jobs-api:$TAG" || die "Failed to push jobs-api:$TAG"
+docker push "$REGISTRY_URL/backbone-jobs-api:latest" || die "Failed to push jobs-api:latest"
 
 # Build worker
 log "  Building worker..."
 docker build --no-cache \
-  -t "$REGISTRY_URL/worker:$TAG" \
-  -t "$REGISTRY_URL/worker:latest" \
+  -t "$REGISTRY_URL/backbone-worker:$TAG" \
+  -t "$REGISTRY_URL/backbone-worker:latest" \
   -f services/worker/Dockerfile \
   . || die "Failed to build worker image"
 
 log "  Pushing worker..."
-docker push "$REGISTRY_URL/worker:$TAG" || die "Failed to push worker:$TAG"
-docker push "$REGISTRY_URL/worker:latest" || die "Failed to push worker:latest"
+docker push "$REGISTRY_URL/backbone-worker:$TAG" || die "Failed to push worker:$TAG"
+docker push "$REGISTRY_URL/backbone-worker:latest" || die "Failed to push worker:latest"
 
 # Update image references in manifests
 #
