@@ -9,7 +9,7 @@ SHELL := /usr/bin/env bash
 KUBECONFIG ?= ./kubeconfig
 export KUBECONFIG
 
-.PHONY: help setup backbone cluster base secrets verify phase0 down lint node-join \
+.PHONY: help setup backbone backbone-reset cluster base secrets verify phase0 down lint node-join \
         secrets-data data verify-phase1 phase1 \
         build-push apply-app edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
@@ -26,6 +26,7 @@ help:
 	@echo "  Quick start"
 	@echo "  make setup                        - one-time interactive wizard, builds .env"
 	@echo "  make backbone                     - setup -> every phase (0-4, 5A, 5B, 6A, 6B), unattended"
+	@echo "  make backbone-reset               - clear progress so the next backbone starts over"
 	@echo ""
 	@echo "Targets:"
 	@echo "  Phase 0 - Substrate"
@@ -91,32 +92,56 @@ setup:
 # depends on the one before it, so continuing past a failure just produces a
 # more confusing failure two phases later.
 #
+# Each step is marked done with a stamp file under .backbone-state/ once it
+# succeeds. Re-running `make backbone` after a failure skips everything
+# already stamped and resumes at the step that failed, instead of redoing
+# completed phases (including their `--no-cache` image rebuilds) from
+# scratch. `make backbone-reset` clears the stamps to force a full re-run.
+#
 # 5C (CI/CD + in-cluster registry) is not on this branch - deferred by
 # choice; see HANDOFF.md and the phase-5c-cicd branch.
 # 6A is skipped entirely (not degraded) when no bucket was configured in
 # .env - backup-secrets.sh hard-requires real S3 credentials for even the
 # wiring-only path, so there is no partial mode to fall back to here.
+STATE_DIR := .backbone-state
+
+# usage: $(call bb_step,<stamp-name>,<make target to run on miss>)
+define bb_step
+	@if [ -f "$(STATE_DIR)/$(1).done" ]; then \
+		echo "  [skip] $(1) already completed - rm $(STATE_DIR)/$(1).done to redo it"; \
+	else \
+		$(MAKE) $(2) && mkdir -p "$(STATE_DIR)" && touch "$(STATE_DIR)/$(1).done"; \
+	fi
+endef
+
 backbone:
 	@[ -f .env ] || $(MAKE) setup
-	$(MAKE) phase0
-	$(MAKE) phase1
-	$(MAKE) phase2
-	$(MAKE) phase3
-	$(MAKE) phase4
-	$(MAKE) tls
-	$(MAKE) verify-phase5a
-	$(MAKE) promote-admin
-	$(MAKE) obs
-	$(MAKE) verify-phase5b
-	@if [ -n "$$(grep '^BACKUP_S3_BUCKET=' .env | cut -d= -f2-)" ]; then \
-		$(MAKE) phase6a; \
+	@mkdir -p $(STATE_DIR)
+	$(call bb_step,phase0,phase0)
+	$(call bb_step,phase1,phase1)
+	$(call bb_step,phase2,phase2)
+	$(call bb_step,phase3,phase3)
+	$(call bb_step,phase4,phase4)
+	$(call bb_step,tls,tls)
+	$(call bb_step,verify-phase5a,verify-phase5a)
+	$(call bb_step,promote-admin,promote-admin)
+	$(call bb_step,obs,obs)
+	$(call bb_step,verify-phase5b,verify-phase5b)
+	@if [ -f "$(STATE_DIR)/phase6a.done" ]; then \
+		echo "  [skip] phase6a already completed - rm $(STATE_DIR)/phase6a.done to redo it"; \
+	elif [ -n "$$(grep '^BACKUP_S3_BUCKET=' .env | cut -d= -f2-)" ]; then \
+		$(MAKE) phase6a && touch "$(STATE_DIR)/phase6a.done"; \
 	else \
 		echo "  No BACKUP_S3_BUCKET set in .env - skipping Phase 6A (backups)."; \
 		echo "  Run 'make setup' again to add a bucket, then 'make phase6a'."; \
 	fi
-	$(MAKE) phase6b
+	$(call bb_step,phase6b,phase6b)
 	@echo ""
 	@echo "  backbone is up. See INSTALL_GUIDE.md for what to check next."
+
+backbone-reset:
+	rm -rf $(STATE_DIR)
+	@echo "  Cleared $(STATE_DIR) - next 'make backbone' starts from Phase 0 again."
 
 promote-admin: _need-kubeconfig
 	./scripts/promote-admin.sh

@@ -30,6 +30,11 @@ node_modules/
 # substituted in). Generated on every run - the templates are the source of truth.
 /.rendered/
 
+# 'make backbone' progress stamps - lets a re-run resume after a mid-way
+# failure instead of redoing already-completed phases. 'make backbone-reset'
+# clears these to force a full re-run.
+/.backbone-state/
+
 # OS cruft
 .DS_Store
 

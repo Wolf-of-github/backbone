@@ -147,7 +147,10 @@ backbone is up. See INSTALL_GUIDE.md for what to check next.
 ```
 with no `ERROR` lines above it. If something fails partway, the error names
 which phase and check failed - fix what it describes and re-run
-`make backbone`; already-completed phases are safe to re-run.
+`make backbone`. It picks up where it left off rather than starting over:
+each phase is marked done once it succeeds, and a re-run skips anything
+already completed. To force a full re-run from Phase 0 instead, run `make
+backbone-reset` first.
 
 ---
 
