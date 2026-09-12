@@ -757,6 +757,145 @@ kubectl -n observability port-forward svc/prometheus 9090:9090 &
 > shows `MemoryPressure`, that's this — worth knowing before assuming it's a
 > new bug.
 
+> **Transient flake seen during this install (not a bug, no fix needed):**
+> `verify-phase5b.sh` failed once with `promtail DaemonSet is 0/1 Ready`. The
+> pod was already `1/1 Running` by the time we looked — on first start,
+> promtail scans every pod's existing log files on the node (there are a lot,
+> by Phase 5), and that initial scan was enough to make it miss the `/ready`
+> HTTP probe's deadline a couple of times before catching up. Its log also
+> showed `dial tcp ...:3100: connect: connection refused` while pushing to
+> Loki, because Loki itself wasn't up yet either. Both settled within about a
+> minute. If you hit this, just re-run `make verify-phase5b` once before
+> assuming something's actually broken.
+
 ---
 
-*(Next: Step 9 — backups and maintenance mode.)*
+## Step 9 — Backups and disaster recovery
+
+**What:** Phase 6A deploys scheduled CronJobs that dump MongoDB and Redis and
+ship them to an S3 bucket, plus PodDisruptionBudgets so routine node
+maintenance can't take down every replica of a service at once. Unlike every
+earlier phase, its own verification gate doesn't stop at "the CronJob
+exists" — it writes a real sentinel document, takes a real backup, destroys
+the source data, restores from S3, and confirms the sentinel came back. A
+backup you haven't test-restored is a hope, not a backup, and this phase is
+built around proving that distinction.
+
+This is also the first phase needing a **real AWS resource outside the
+EC2 instance** — an S3 bucket and an IAM user scoped to just that bucket.
+
+**How:**
+
+1. **Create the bucket and a scoped IAM user** (in the AWS Console, not on
+   the instance):
+   - S3 → Create bucket → pick a globally-unique name (e.g.
+     `<your-name>-backbone-backups`) → same region you'd query most from →
+     leave "Block all public access" **on**.
+   - IAM → Users → Create user → no console access needed → attach an
+     inline policy scoped to just this bucket (not full `AmazonS3FullAccess`
+     — this key can write and delete backups, so it deserves the same
+     restraint as a database password):
+     ```json
+     {
+       "Version": "2012-10-17",
+       "Statement": [{
+         "Effect": "Allow",
+         "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+         "Resource": [
+           "arn:aws:s3:::<your-bucket-name>",
+           "arn:aws:s3:::<your-bucket-name>/*"
+         ]
+       }]
+     }
+     ```
+   - Security credentials tab → Create access key → note the **Access key
+     ID** and **Secret access key** (shown once).
+
+2. **Put the bucket name in `.env` now** (not secret, safe to script):
+   ```bash
+   sed -i "s|^BACKUP_S3_BUCKET=.*|BACKUP_S3_BUCKET=<your-bucket-name>|" .env
+   sed -i "s|^BACKUP_S3_REGION=.*|BACKUP_S3_REGION=<your-bucket-region>|" .env
+   grep -E "^BACKUP_S3_(BUCKET|REGION)=" .env
+   ```
+   Leave `BACKUP_S3_ENDPOINT` blank (that's only for non-AWS S3-compatible
+   providers) and `BACKUP_S3_PREFIX` at its default (`backbone`).
+
+3. **Put the access key and secret key in `.env` yourself, directly on the
+   EC2 instance** — same reasoning as Step 5's Docker Hub token: an access
+   key that can write/delete your backups shouldn't be typed anywhere but
+   your own terminal. Run this on the instance, pasting your own values:
+   ```bash
+   sed -i "s|^BACKUP_S3_ACCESS_KEY=.*|BACKUP_S3_ACCESS_KEY=<paste-access-key-id>|" .env
+   sed -i "s|^BACKUP_S3_SECRET_KEY=.*|BACKUP_S3_SECRET_KEY=<paste-secret-access-key>|" .env
+   ```
+   Confirm both are non-empty without printing the values themselves:
+   ```bash
+   grep -c -E "^BACKUP_S3_(ACCESS_KEY|SECRET_KEY)=.+" .env   # should print 2
+   ```
+
+4. **Deploy:**
+   ```bash
+   make phase6a
+   ```
+   This creates the `backup-s3-credentials` Secret, preflights bucket
+   access (fails fast with a clear message if the bucket/credentials are
+   wrong, before creating anything that depends on them), then applies the
+   staging PVC, both CronJobs (`mongo-backup` at `0 3 * * *`, `redis-backup`
+   at `0 4 * * *`), and the PodDisruptionBudgets — then runs the
+   verification gate, which is the real restore drill described above.
+
+**Success looks like:** the command ends with, and exits `0`:
+```
+[1/7] Secret, staging volume and CronJobs   OK secret (6 keys), staging PVC Pending (WaitForFirstConsumer - binds on the first backup), both CronJobs present with Forbid
+[2/7] PodDisruptionBudgets                  OK PDBs present for multi-replica services; correctly absent for single-replica StatefulSets
+[3/7] Bucket reachability                   OK bucket reachable with the configured credentials
+[4/7] Mongo backup and restore round trip   OK sentinel written, backed up, destroyed, and restored from S3 intact
+[5/7] Redis backup                          OK redis snapshot uploaded and RDB integrity-checked: <key>
+[6/7] Retention pruning                     OK objects older than 30 days are pruned
+[7/7] Backup freshness                      OK most recent backup: <date> <time> <key>
+
+PHASE 6A OK
+```
+This takes longer than earlier gates (a couple of minutes) — it's actually
+running backup Jobs and a restore, not just checking object existence.
+
+**Want to look closer?**
+```bash
+kubectl -n data get cronjob mongo-backup redis-backup   # schedule, last run
+kubectl -n data get pdb -A                              # kong, auth, ping, jobs-api, frontend only
+aws s3 ls s3://<your-bucket-name>/backbone/mongo/        # (from your own machine, with your IAM creds)
+```
+Take a manual backup any time with `./scripts/backup-now.sh mongo` (or
+`redis`) — useful right before anything risky, since the RPO between
+scheduled runs is up to 24h.
+
+> **Note:** if you'd rather not create real cloud storage just to complete
+> this walkthrough, Phase 6A can be brought up "wiring only" with
+> `make backup && ./scripts/verify-phase6a.sh --no-s3` — this deploys
+> everything but skips the checks that need a real bucket, and deliberately
+> prints `PHASE 6A PARTIAL` rather than `OK`. Treat that as a placeholder,
+> not a working backup — nothing has actually been proven restorable until
+> you come back and do the real thing above.
+
+> **Bug found during this install:** the first `make phase6a` run passed
+> checks [1]–[3], took a real backup, uploaded it, and logged
+> `uploaded: mongo-<timestamp>.gz` — but then check [4] (the actual
+> restore-and-compare test) failed with `the sentinel document did NOT come
+> back from the restore`. Re-running the restore manually to see the real
+> error showed the download step failing with a flat 404: the object no
+> longer existed in the bucket, only minutes after being uploaded and
+> verified. Cause: `verify-phase6a.sh`'s own `cleanup()` (registered via
+> `trap cleanup EXIT`) deleted the backup object it had just created on
+> *every* exit path, including a failed one — so the moment check [4] failed
+> and the script exited, its own cleanup destroyed the only evidence needed
+> to debug the failure (and on a fresh install, the only backup that
+> existed at all). Fixed: cleanup now only deletes the S3 object once the
+> restore has actually been proven to work (check [4] passed); on failure it
+> logs that it's leaving the object in place instead. No action needed on
+> your end — re-run `make verify-phase6a` after pulling the fix. (The
+> underlying "is the backup actually restorable" question is still open —
+> see the next entry once resolved.)
+
+---
+
+*(Next: Step 10 — maintenance mode.)*

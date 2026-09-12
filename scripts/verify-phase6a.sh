@@ -32,6 +32,7 @@ SENTINEL="phase6a-$(date +%s)"
 SCRATCH_DB="verify6a_restore"
 TEST_JOB=""
 CREATED_KEY=""
+RESTORE_PROVEN=false
 
 cleanup() {
   kubectl -n data delete pod -l verify6a=true --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -39,7 +40,16 @@ cleanup() {
   # Drop the scratch DB and the sentinel collection; leave real data alone.
   mongo_eval "db.getSiblingDB('$SCRATCH_DB').dropDatabase()" >/dev/null 2>&1 || true
   mongo_eval "db.getSiblingDB('$MONGO_APP_DB').verify6a.drop()" >/dev/null 2>&1 || true
-  [ -n "$CREATED_KEY" ] && s3_exec "aws \$EP s3 rm \"s3://\${bucket}/\${prefix}/mongo/${CREATED_KEY}\"" >/dev/null 2>&1 || true
+  # Only remove the backup object once it has actually been PROVEN restorable
+  # (check [4] passed). Deleting it unconditionally - including when the
+  # restore itself is what failed - destroys the one artifact needed to
+  # investigate the failure, and on a fresh install it may be the only
+  # backup that exists at all.
+  if [ "$RESTORE_PROVEN" = true ]; then
+    [ -n "$CREATED_KEY" ] && s3_exec "aws \$EP s3 rm \"s3://\${bucket}/\${prefix}/mongo/${CREATED_KEY}\"" >/dev/null 2>&1 || true
+  elif [ -n "$CREATED_KEY" ]; then
+    log "Leaving mongo/${CREATED_KEY} in the backup bucket - the restore was not proven to work, so it was not deleted."
+  fi
 }
 trap cleanup EXIT
 
@@ -203,6 +213,7 @@ found=$(mongo_eval "print(db.getSiblingDB(\"$SCRATCH_DB\").verify6a.countDocumen
 [ "${found:-0}" = "1" ] \
   || fail "the sentinel document did NOT come back from the restore (found ${found:-0}).
   The backup is not restorable. Do not rely on it."
+RESTORE_PROVEN=true
 ok "sentinel written, backed up, destroyed, and restored from S3 intact"
 
 # [5/7] Redis backup produces a valid RDB
