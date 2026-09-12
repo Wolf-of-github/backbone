@@ -2,13 +2,20 @@
 # Purpose: Grafana - the only observability surface exposed through Kong.
 # depends_on: [configmap.yaml, dashboards/, scripts/bootstrap-observability.sh]
 #
-# TEMPLATE: GRAFANA_ROOT_URL substituted by scripts/bootstrap-observability.sh
-# (https://<domain>/grafana, or https://<node-ip>:<port>/grafana with no domain).
+# TEMPLATE: GRAFANA_ROOT_URL and GRAFANA_HOST substituted by
+# scripts/bootstrap-observability.sh (the domain, or the instance's public
+# IP with no domain - see that script's comment on public_host()).
 #
 # Served under the /grafana subpath rather than a subdomain, so it works on a
 # cluster with no domain. GF_SERVER_SERVE_FROM_SUB_PATH makes Grafana emit
 # correct asset and redirect URLs under that prefix; without it the app loads
 # but every link 404s.
+#
+# GF_SERVER_DOMAIN must be set explicitly alongside ROOT_URL, not just
+# ROOT_URL alone: it defaults to "localhost" if left unset, and Grafana's
+# origin-checking on datasource/API calls validates the request's Origin
+# against DOMAIN, not just ROOT_URL - leaving it unset produced a genuine
+# "origin not allowed" on every query even with ROOT_URL fully correct.
 #
 # Anonymous access is off. Prometheus, Alertmanager and Loki have no public route
 # at all - reach them with kubectl port-forward.
@@ -62,6 +69,8 @@ spec:
               key: admin-password
         - name: GF_SERVER_ROOT_URL
           value: ${GRAFANA_ROOT_URL}
+        - name: GF_SERVER_DOMAIN
+          value: ${GRAFANA_HOST}
         - name: GF_SERVER_SERVE_FROM_SUB_PATH
           value: "true"
         - name: GF_AUTH_ANONYMOUS_ENABLED

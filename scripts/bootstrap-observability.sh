@@ -106,22 +106,30 @@ kubectl apply -f "$OBS_DIR/promtail/daemonset.yaml"
 # ---------------------------------------------------------------------------
 # 5. Grafana. Root URL follows the domain when there is one, else a browser-
 #    reachable IP - NOT platform_host()/node_ip(), which return the node's
-#    private VPC IP. Grafana checks the request Origin against this root URL
-#    and rejects anything that doesn't match ("origin not allowed"); on AWS,
-#    a user reaching Grafana via the instance's public IP (as the install
+#    private VPC IP. Grafana checks the request Origin against ROOT_URL and
+#    rejects anything that doesn't match ("origin not allowed"); on AWS, a
+#    user reaching Grafana via the instance's public IP (as the install
 #    guide tells them to) would otherwise always be rejected, since the
 #    private IP baked in here would never match. public_host() tries the
 #    EC2 metadata service for the public IP, falling back to node_ip() where
 #    that doesn't apply (no public IP, non-AWS, or on a real domain anyway).
+#
+#    GF_SERVER_DOMAIN also has to be set explicitly to this same host: it
+#    defaults to "localhost" if left unset, and Grafana's origin-checking
+#    validates against DOMAIN (not just ROOT_URL) - GF_SERVER_ROOT_URL alone
+#    being correct was not sufficient in practice and still produced
+#    "origin not allowed" on every datasource query with domain=localhost.
 # ---------------------------------------------------------------------------
 log "Applying Grafana..."
 HTTPS_PORT="$(svc_nodeport platform kong-proxy proxy-ssl 2>/dev/null || true)"
 if has_real_domain; then
-  GRAFANA_ROOT_URL="https://${DOMAIN}/grafana"
+  GRAFANA_HOST="$DOMAIN"
+  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}/grafana"
 else
-  GRAFANA_ROOT_URL="https://$(public_host):${HTTPS_PORT:-30443}/grafana"
+  GRAFANA_HOST="$(public_host)"
+  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}:${HTTPS_PORT:-30443}/grafana"
 fi
-export GRAFANA_ROOT_URL
+export GRAFANA_HOST GRAFANA_ROOT_URL
 
 kubectl apply -f "$OBS_DIR/grafana/configmap.yaml"
 
@@ -132,7 +140,7 @@ kubectl -n observability create configmap grafana-dashboards \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 render_template "$OBS_DIR/grafana/deployment.yaml" \
-  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL'
+  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL GRAFANA_HOST'
 kubectl apply -f "$RENDER_DIR/grafana-deployment.yaml"
 
 # ---------------------------------------------------------------------------
