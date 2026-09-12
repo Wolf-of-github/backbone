@@ -440,4 +440,82 @@ kubectl -n app get deploy,svc ping frontend    # both 2/2 ready
 
 ---
 
-*(Next: Step 6 — add authentication with `make phase3`.)*
+## Step 6 — Add authentication
+
+**What:** deploys the **auth** service (JWT via Passport.js). Users register
+and log in to get a short-lived access token (15 min) and a longer-lived
+refresh token (7 days); `/api/ping` and any future protected route check
+this token before responding. Since Phase 3's code was already present in
+this checkout (that's what the Step 5 finding proved — `/api/ping` returned
+401 before this step even ran), most of what `make phase3` does is generate
+the signing key and wire up the pieces that were already sitting in the
+image.
+
+**How:**
+
+1. Set `FRONTEND_URL` to the Kong endpoint from Step 5's output — this is
+   the URL the auth service will treat as the legitimate frontend origin:
+   ```bash
+   sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=http://172.31.10.228:30080|" .env
+   grep FRONTEND_URL .env
+   ```
+   Replace the IP if your instance's is different — check with
+   `hostname -I | awk '{print $1}'` if unsure.
+   `JWT_ACCESS_EXPIRY` (`15m`) and `JWT_REFRESH_EXPIRY` (`7d`) already ship
+   with usable defaults — no change needed unless you want different token
+   lifetimes.
+2. Deploy:
+   ```bash
+   make phase3
+   ```
+   This generates an RS256 JWT keypair (`scripts/jwt-keys.sh`, stored in
+   `.secrets/jwt/`, gitignored), creates the `jwt-keypair` Secret, deploys
+   the auth service, rebuilds `ping` and `frontend` (both gain
+   auth-awareness), updates Kong with the auth routes, then runs the
+   verification gate.
+
+**Success looks like:**
+```
+[1/8] Auth Deployment status             OK Auth deployment ready (2/2)
+[2/8] JWT secrets                        OK JWT secrets present
+[3/8] User registration                  OK Registration successful
+[4/8] User login and token issuance      OK Login successful, tokens issued
+[5/8] Token verification (/api/auth/me)  OK /api/auth/me with token returns 200
+                                          OK /api/auth/me without token returns 401
+[6/8] Protected route (/api/ping)        OK /api/ping requires valid token
+[7/8] Token refresh and rotation         OK Token refresh works, single-use enforced
+[8/8] Logout and token revocation        OK Logout successful, token revoked
+
+PHASE 3 OK
+```
+
+Confirm by hand — register, log in, and hit the now-working `/api/ping`:
+```bash
+ENDPOINT=http://172.31.10.228:30080
+
+curl -X POST $ENDPOINT/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"testpass123"}'
+
+TOKEN=$(curl -s -X POST $ENDPOINT/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"testpass123"}' | jq -r '.accessToken')
+
+curl $ENDPOINT/api/ping -H "Authorization: Bearer $TOKEN"
+# now returns 200, unlike the 401 you saw in Step 5
+```
+
+Or just open `http://172.31.10.228:30080/` in a browser — you should see a
+login/register page; register, log in, and the page should show the ping
+result with your email attached.
+
+**Want to look closer?**
+```bash
+kubectl -n app get deploy auth              # 2/2 ready
+kubectl -n app logs -l app=auth --tail=50   # registration/login activity
+ls .secrets/jwt/                            # the generated keypair (gitignored)
+```
+
+---
+
+*(Next: Step 7 — add async jobs with `make phase4`.)*
