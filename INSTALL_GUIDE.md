@@ -53,8 +53,18 @@ Deployment that actually processes it, and the only piece that autoscales.
 - **A Linux host.** Tested spec: `t3.large` (2 vCPU / 8GB RAM), Ubuntu 22.04+,
   **20GB+ disk** (the default 8GB fills up once every image is built and
   running - resize now if `lsblk` shows less than ~18GB).
-- **Inbound access** on `22/tcp` (SSH), and `30443/tcp` (HTTPS) if you want
-  to reach the platform from outside the host's own network.
+- **Inbound firewall rules** open before you start (on AWS: EC2 → your
+  instance → Security tab → the security group → Edit inbound rules → Add
+  rule, for each):
+  | Port | Protocol | Purpose |
+  |---|---|---|
+  | `22` | TCP | SSH |
+  | `30443` | TCP | HTTPS - the platform, once Phase 5A (TLS) is up |
+  | `30080` | TCP | HTTP - only needed if you want to check Phases 2-4 from a browser *before* TLS is deployed; safe to skip if you're not doing that |
+
+  Without `30443` open, `make backbone` still succeeds (every check runs
+  from the host itself), but nothing outside the host - including your own
+  browser - can reach the site afterward.
 - **Docker Hub or GHCR account** - built images get pushed there. (An
   in-cluster registry + CI/CD track, Phase 5C, was built and evaluated but
   is deferred by choice on this branch - see HANDOFF.md.)
