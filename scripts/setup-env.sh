@@ -101,7 +101,9 @@ require_registry="$(current_value REGISTRY_URL)"
 [ -n "$require_registry" ] || die "REGISTRY_URL cannot be blank - create a Docker Hub or GHCR account first"
 
 if ask_yesno "Log in to this registry now? (needed before Phase 2 builds/pushes images) [Y/n]" "Y"; then
-  read -r -p "  Registry username: " REG_USER
+  default_user="${require_registry#*/}"
+  read -r -p "  Registry username (same as in the URL above) [$default_user]: " REG_USER
+  REG_USER="${REG_USER:-$default_user}"
   read -r -p "  Registry access token/password (hidden): " -s REG_TOKEN
   echo >&2
   registry_host="${require_registry%%/*}"
