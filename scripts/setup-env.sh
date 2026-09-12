@@ -96,9 +96,17 @@ ask K3S_SERVER_ADDR "This node's address (workers dial this)" "$MY_IP"
 echo "" >&2
 log "Container registry - where built images are pushed (Phase 2)"
 log "Needs an account you already have on Docker Hub or GHCR."
-ask REGISTRY_URL "Registry URL, e.g. docker.io/<your-username>" ""
+ask REGISTRY_URL "Registry URL - docker.io/<your-username> or ghcr.io/<your-username>" ""
 require_registry="$(current_value REGISTRY_URL)"
 [ -n "$require_registry" ] || die "REGISTRY_URL cannot be blank - create a Docker Hub or GHCR account first"
+
+# A bare username with no '/' is a common mistake here - assume Docker Hub
+# rather than silently trying to "docker login" to a host that doesn't exist.
+if [[ "$require_registry" != */* ]]; then
+  log "'$require_registry' has no registry host - assuming Docker Hub: docker.io/$require_registry"
+  require_registry="docker.io/$require_registry"
+  set_env REGISTRY_URL "$require_registry"
+fi
 
 if ask_yesno "Log in to this registry now? (needed before Phase 2 builds/pushes images) [Y/n]" "Y"; then
   default_user="${require_registry#*/}"
