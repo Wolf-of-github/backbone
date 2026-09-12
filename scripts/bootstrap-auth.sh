@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 
 load_env
-need kubectl docker
+need kubectl docker jq
 
 log "Phase 3 - Auth deployment starting..."
 
@@ -23,6 +23,22 @@ kubectl -n data get statefulset/mongodb statefulset/redis >/dev/null 2>&1 || die
 log "Checking Phase 2 edge..."
 kubectl -n platform get deployment/kong >/dev/null 2>&1 || die "Kong not found. Run 'make phase2' first."
 kubectl -n app get deployment/ping deployment/frontend >/dev/null 2>&1 || die "Ping/Frontend not found. Run 'make phase2' first."
+
+# The auth Deployment reads MongoDB/Redis credentials from Secrets in the
+# `app` namespace, but scripts/data-secrets.sh (Phase 1) only ever creates
+# them in `data` - documented in HANDOFF.md ("must exist in BOTH data and
+# app namespaces for Phase 3 to work") but nothing actually did the copy,
+# so every real install hit CreateContainerConfigError: secret
+# "mongodb-credentials" not found. Mirror both Secrets from data -> app,
+# re-reading from `data` each run so a credential rotation there
+# (`make secrets-data`) propagates here too on the next `make phase3`.
+log "Mirroring data-layer secrets into the app namespace..."
+for s in mongodb-credentials redis-password; do
+  kubectl -n data get secret "$s" -o json \
+    | jq 'del(.metadata.namespace, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.ownerReferences)' \
+    | kubectl -n app apply -f - >/dev/null
+done
+ok "mongodb-credentials and redis-password present in app"
 
 # Step 1: Generate JWT keypair
 log "[1/7] Generating JWT keypair..."
