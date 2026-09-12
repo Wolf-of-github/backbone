@@ -898,4 +898,97 @@ scheduled runs is up to 24h.
 
 ---
 
-*(Next: Step 10 — maintenance mode.)*
+## Step 10 — Maintenance mode
+
+**What:** Phase 6B deploys a standing "site under maintenance" page and a
+`maintenance` CLI that flips Kong's routing to it — public traffic gets a
+503 while the real services keep running underneath (nothing is stopped,
+so ending maintenance is one Kong restart, not a cold start). A fixed
+bypass list (`/api/auth/login`, `/internal/maintenance`, the ACME challenge
+path) always stays routed normally — that's what keeps you from locking
+yourself out, since otherwise nobody could authenticate to turn it back off.
+
+Its own verification gate is unusually blunt about the risk: proving
+maintenance mode actually works means actually turning it on against your
+live gateway, which briefly 503s everything (~60 seconds, across two Kong
+restarts) — so the gate refuses to run that part unless you explicitly pass
+a flag saying you accept the downtime.
+
+**How:**
+
+1. Deploy:
+   ```bash
+   make phase6b
+   ```
+   This applies the maintenance page + its state ConfigMap (left untouched
+   if maintenance already happens to be on — safe to re-run), the RBAC the
+   auth service needs to expose an HTTP off-switch, and redeploys auth to
+   pick up its ServiceAccount, then runs the (non-disruptive) verification
+   gate.
+
+2. **Promote an admin user** — the HTTP off-switch (`/internal/maintenance`)
+   needs an admin account to call it; the CLI (`./scripts/maintenance off`)
+   doesn't, but having one is worth doing now, using the test account from
+   Step 6:
+   ```bash
+   MONGO_ROOT_USER=$(grep '^MONGO_ROOT_USER=' .env | cut -d= -f2)
+   MONGO_ROOT_PASSWORD=$(grep '^MONGO_ROOT_PASSWORD=' .env | cut -d= -f2)
+   kubectl -n data exec -it statefulset/mongodb -- mongosh \
+     "mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@localhost/backbone?authSource=admin" \
+     --eval 'db.users.updateOne({email:"test@example.com"},{$addToSet:{roles:"admin"}})'
+   ```
+   (This reads the password out of your own `.env` into a local shell
+   variable and straight into `mongosh` — it's never typed by hand or shown
+   in a prompt.)
+
+3. **Run the real on/off cycle** — this is the part that actually proves it
+   works, and the part that takes the platform down briefly. Do it when
+   that's acceptable (it's a good dry run for a real future maintenance
+   window, not just a formality). `make verify-phase6b` doesn't take
+   arguments, so call the script directly:
+   ```bash
+   ./scripts/verify-phase6b.sh --i-know-this-causes-downtime
+   ```
+
+**Success looks like:** the command ends with, and exits `0`:
+```
+[1/6] Maintenance page deployment      OK maintenance page Running (state: off), Service present
+[2/6] The page itself returns 503 + Retry-After   OK 503 + Retry-After for traffic; /healthz stays 200
+[3/6] Auth service RBAC is narrowly scoped         OK auth SA can edit the maintenance ConfigMaps; cannot read secrets in app/data/platform
+[4/6] Turning maintenance ON (the platform will 503 briefly)   OK public traffic 503s; /api/auth/login and the ACME path still answer
+[5/6] Turning maintenance OFF and checking routing is restored OK routing restored intact (N entries), state is off, site answers normally
+[6/6] State hygiene                    OK saved config cleared after restore
+
+PHASE 6B OK
+```
+
+Confirm by hand any time afterward:
+```bash
+./scripts/maintenance status                              # OFF (normal routing)
+./scripts/maintenance on --reason "testing" --pause-queues # flips to the 503 page, pauses BullMQ
+curl -k https://$(hostname -I | awk '{print $1}'):30443/    # 503
+curl -k https://$(hostname -I | awk '{print $1}'):30443/api/auth/login -X POST \
+  -H "Content-Type: application/json" -d '{"email":"x","password":"y"}'  # NOT 503 - bypass list working
+./scripts/maintenance off                                  # restores routing, resumes queues
+```
+
+**Want to look closer?**
+```bash
+kubectl -n platform get deploy,svc maintenance         # the standing 503 page
+kubectl -n platform get configmap maintenance-state -o yaml   # on/off, reason, saved routing
+kubectl -n app get sa auth -o yaml                     # the ServiceAccount the off-endpoint runs as
+```
+
+> **Note:** if you'd rather not take the platform down yet, `make phase6b`
+> alone (without the disruptive flag) still deploys everything and runs
+> checks [1]–[3] — the page, its Service, and RBAC scoping — but prints
+> `PHASE 6B PARTIAL`, explicitly meaning the on/off cycle itself is
+> unverified. Come back and run the real cycle before you actually need
+> maintenance mode for something — the failure mode this phase exists to
+> catch is discovering you can't turn it back off, which you'd rather learn
+> now than during a real migration.
+
+---
+
+*(This completes every phase in the build order except 5C/CI-CD, deferred by
+choice — see Step 8's note. The install is done.)*
