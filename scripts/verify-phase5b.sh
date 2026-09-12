@@ -39,20 +39,40 @@ incluster() {
 log "Phase 5B verification (observability)"
 
 # [1/7] workloads
+#
+# Retried, same reasoning as check [4] below: right after bootstrap, Promtail
+# is busy doing its first full scan of every pod's log files on the node
+# (more nodes/pods = longer scan), which can make it miss its own readiness
+# probe's deadline a few times before catching up - a transient startup race,
+# not a real failure. A single immediate check can't tell "still starting"
+# apart from "actually broken", so poll for a bit before failing.
 log "[1/7] Workloads Ready"
-for d in prometheus alertmanager grafana; do
-  avail=$(kubectl -n "$NS" get deploy "$d" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
-  [ "${avail:-0}" -ge 1 ] || fail "deployment/$d is not Available"
+workloads_ready=false
+for _ in $(seq 1 18); do  # ~18 * 10s = 3 minutes
+  ok_so_far=true
+  for d in prometheus alertmanager grafana; do
+    avail=$(kubectl -n "$NS" get deploy "$d" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+    [ "${avail:-0}" -ge 1 ] || { ok_so_far=false; break; }
+  done
+  if [ "$ok_so_far" = true ]; then
+    loki_ready=$(kubectl -n "$NS" get statefulset loki -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+    [ "${loki_ready:-0}" -ge 1 ] || ok_so_far=false
+  fi
+  if [ "$ok_so_far" = true ]; then
+    # Promtail must be on EVERY node - this is what makes log collection
+    # survive joining a new machine.
+    desired=$(kubectl -n "$NS" get ds promtail -o jsonpath='{.status.desiredNumberScheduled}')
+    ready=$(kubectl -n "$NS" get ds promtail -o jsonpath='{.status.numberReady}')
+    if [ -n "$desired" ] && [ "$ready" = "$desired" ]; then
+      workloads_ready=true
+      break
+    fi
+  fi
+  sleep 10
 done
-loki_ready=$(kubectl -n "$NS" get statefulset loki -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-[ "${loki_ready:-0}" -ge 1 ] || fail "statefulset/loki is not Ready"
-
-# Promtail must be on EVERY node - this is what makes log collection survive
-# joining a new machine.
-desired=$(kubectl -n "$NS" get ds promtail -o jsonpath='{.status.desiredNumberScheduled}')
-ready=$(kubectl -n "$NS" get ds promtail -o jsonpath='{.status.numberReady}')
-[ -n "$desired" ] && [ "$ready" = "$desired" ] \
-  || fail "promtail DaemonSet is $ready/$desired Ready - some node is not shipping logs"
+[ "$workloads_ready" = true ] || fail "workloads not all Ready after waiting 3 minutes - one of
+  deployment/prometheus, deployment/alertmanager, deployment/grafana, statefulset/loki, or
+  daemonset/promtail (${ready:-0}/${desired:-?} Ready) did not become Ready in time."
 ok "prometheus, alertmanager, grafana, loki Ready; promtail on $ready/$desired nodes"
 
 # [2/7] Prometheus targets
@@ -86,16 +106,36 @@ else
 fi
 
 # [4/7] Loki has logs
+#
+# On a freshly bootstrapped cluster, Promtail and Loki both just started and
+# need real time to do their first useful work: Promtail has to discover
+# every pod's log files before it ships anything, and Loki has to finish its
+# own startup before it accepts pushes. Neither of those is instant with a
+# few dozen pods already running (Phases 0-4 plus 5A), so the first query
+# here can legitimately see zero streams for up to a minute or two on a
+# brand-new install without anything actually being broken - a single
+# immediate query only proves "not yet", not "broken". Poll instead of
+# failing on the first miss.
 log "[4/7] Loki log ingestion"
-loki_q=$(incluster "curl -sG http://loki.$NS.svc:3100/loki/api/v1/query_range \
-  --data-urlencode 'query={namespace=\"platform\"}' \
-  --data-urlencode 'limit=5' \
-  --data-urlencode 'start='\$(( \$(date +%s) - 900 ))'000000000'")
-status=$(printf '%s' "$loki_q" | jq -r '.status // "error"')
-[ "$status" = "success" ] || fail "Loki query failed: $loki_q"
-streams=$(printf '%s' "$loki_q" | jq '.data.result | length')
+streams=0
+status=""
+for _ in $(seq 1 18); do  # ~18 * 10s = 3 minutes
+  loki_q=$(incluster "curl -sG http://loki.$NS.svc:3100/loki/api/v1/query_range \
+    --data-urlencode 'query={namespace=\"platform\"}' \
+    --data-urlencode 'limit=5' \
+    --data-urlencode 'start='\$(( \$(date +%s) - 900 ))'000000000'")
+  status=$(printf '%s' "$loki_q" | jq -r '.status // "error"')
+  if [ "$status" = "success" ]; then
+    streams=$(printf '%s' "$loki_q" | jq '.data.result | length')
+    [ "${streams:-0}" -ge 1 ] && break
+  fi
+  sleep 10
+done
+[ "$status" = "success" ] || fail "Loki query failed after waiting 3 minutes: $loki_q"
 [ "${streams:-0}" -ge 1 ] \
-  || fail "Loki returned no log streams for namespace 'platform' in the last 15m - is Promtail shipping?"
+  || fail "Loki returned no log streams for namespace 'platform' after waiting 3 minutes - is Promtail shipping?
+  Check: kubectl -n $NS logs -l app=promtail --tail=50
+         kubectl -n $NS logs -l app=loki --tail=50"
 ok "Loki returned $streams log stream(s) from the last 15m"
 
 # [5/7] Grafana reachable and locked down
