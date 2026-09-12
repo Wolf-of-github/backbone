@@ -50,18 +50,16 @@ kubectl -n platform rollout status deployment/kong --timeout=120s
 ok "Kong updated with auth routes"
 
 # Step 4: Build and push auth service image
+#
+# Delegates to build-push.sh rather than re-invoking `docker build` here:
+# every service's Dockerfile expects a specific build context (repo root for
+# everything that COPYs services/common, the service's own dir for
+# frontend), and build-push.sh is the one place that already gets this
+# right per service. A hand-rolled `docker build ... services/auth/` here
+# previously used the wrong context and failed on
+# `COPY services/auth/package*.json ./` with "no source files were specified".
 log "[4/7] Building and pushing auth service image..."
-cd "${REPO_ROOT}"
-
-# Build auth image
-docker build -t "${REGISTRY_URL}/backbone-auth:latest" \
-  -t "${REGISTRY_URL}/backbone-auth:$(git rev-parse --short HEAD 2>/dev/null || echo 'dev')" \
-  services/auth/
-
-# Push images
-docker push "${REGISTRY_URL}/backbone-auth:latest"
-docker push "${REGISTRY_URL}/backbone-auth:$(git rev-parse --short HEAD 2>/dev/null || echo 'dev')" || true
-
+"${SCRIPT_DIR}/build-push.sh" auth
 ok "Auth service image built and pushed"
 
 # Step 5: Deploy auth service
@@ -77,12 +75,7 @@ ok "Auth service deployed"
 # Step 6: Rebuild and redeploy ping (with auth middleware)
 log "[6/7] Rebuilding ping service with auth..."
 
-docker build -t "${REGISTRY_URL}/backbone-ping:latest" \
-  -f services/ping/Dockerfile \
-  --build-arg BUILDCONTEXT=. \
-  .
-
-docker push "${REGISTRY_URL}/backbone-ping:latest"
+"${SCRIPT_DIR}/build-push.sh" ping
 kubectl -n app rollout restart deployment/ping
 kubectl -n app rollout status deployment/ping --timeout=120s
 ok "Ping service updated with auth"
@@ -90,10 +83,7 @@ ok "Ping service updated with auth"
 # Step 7: Rebuild and redeploy frontend (with login/register)
 log "[7/7] Rebuilding frontend with auth UI..."
 
-docker build -t "${REGISTRY_URL}/backbone-frontend:latest" \
-  services/frontend/
-
-docker push "${REGISTRY_URL}/backbone-frontend:latest"
+"${SCRIPT_DIR}/build-push.sh" frontend
 kubectl -n app rollout restart deployment/frontend
 kubectl -n app rollout status deployment/frontend --timeout=120s
 ok "Frontend updated with auth UI"
