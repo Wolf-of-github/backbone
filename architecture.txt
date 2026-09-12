@@ -676,8 +676,17 @@
       REGISTRY_MODE remains `external`. The Phase 0/Phase 2 registry promise therefore still stands
       open. See the STATUS block under "Files (Phase 5 - Operate)" for the reasoning and for what is
       known about the one aborted `make ci` run.
+      REMOVED FROM MASTER (2026-09-12): the code itself (ci/, k8s/ci/, bootstrap-ci.sh,
+      verify-phase5c.sh, gitea-secrets.sh, registry-secret.sh, deploy-key.sh, the `make ci`/
+      `verify-phase5c` targets, REGISTRY_MODE/GITEA_*/DRONE_RPC_SECRET) no longer exists on
+      `master` - preserved as-is on branch `phase-5c-cicd` if ever revisited. See the 2026-09-12
+      SESSION UPDATE at the end of this file.
   - Phase 6 - Resilience & lifecycle
-    - 6A Backup/DR (`make phase6a`; gate: verify-phase6a.sh -> "PHASE 6A OK") - PLANNED IN DETAIL
+    - 6A Backup/DR (`make phase6a`; gate: verify-phase6a.sh -> "PHASE 6A OK") - IMPLEMENTED,
+      VERIFIED end-to-end against real AWS S3 (2026-09-12): all 7 checks pass, including the real
+      restore round-trip (sentinel written, backed up, destroyed, restored, confirmed). See the
+      2026-09-12 SESSION UPDATE at the end of this file for the bug that surfaced (the gate's own
+      cleanup deleting the backup on a failed restore) and the fix.
       Nightly mongodump + Redis RDB CronJobs uploading to EXTERNAL S3-compatible storage, restore
       scripts, retention pruning, PodDisruptionBudgets. The only Phase 6 track that closes a real
       exposure: MongoDB is a single replica on node-bound local-path with no copy anywhere, so
@@ -3086,3 +3095,148 @@
         Provisioned workers: `make workers COUNT=2` -> 2 nodes Ready within ~3 min, labelled backbone.dev/role=worker;
           a test Deployment schedules pods onto them; `make workers-destroy` -> nodes gone from `kubectl get nodes` and instances terminated.
       | depends_on: [bootstrap-dr.sh, bootstrap-maintenance.sh, makefile-workers]
+
+===============================================================================
+SESSION UPDATE (2026-09-12) - first real external-user install, end to end
+===============================================================================
+Everything below reflects what was ACTUALLY built, verified, and shipped to
+`master` in this session, superseding the planned-but-not-built Track A/B/C
+detail above wherever it conflicts (MinIO, Terraform-provisioned workers, and
+`make workers` were never built - ignore those blocks; they document a design
+that was superseded before implementation). This session's role was a
+first-time external user installing the platform end-to-end on real AWS EC2
+hardware (single-node, then a second node joined as a worker), fixing every
+real bug hit along the way, then building the onboarding flow this always
+needed: a guided setup wizard and a single unattended install command.
+
+1. Phase 5C (CI/CD + in-cluster registry) REMOVED from `master`.
+   Already DEFERRED BY CHOICE per the 2026-09-11 note above; this session
+   went further and deleted the code from `master` entirely (ci/, k8s/ci/,
+   scripts/bootstrap-ci.sh, verify-phase5c.sh, gitea-secrets.sh,
+   registry-secret.sh, deploy-key.sh, the `make ci`/`verify-phase5c` targets,
+   and the REGISTRY_MODE/GITEA_*/DRONE_RPC_SECRET .env vars and the
+   `incluster` branch of registry_prefix() in lib.sh) rather than leave a
+   dead, unverified code path in the shipped repo. Preserved byte-for-byte
+   on a new `phase-5c-cicd` branch if ever revisited. `phase5`/
+   verify-phase5.sh now run just 5A + 5B.
+
+2. NEW: `make setup` (scripts/setup-env.sh) - one-time interactive wizard.
+   Asks every question the whole install needs, once, up front: K3S_SERVER_ADDR
+   (auto-detected), REGISTRY_URL + an optional `docker login` done for you,
+   MONGO_ROOT_PASSWORD/MONGO_APP_PASSWORD/REDIS_PASSWORD (Enter to
+   auto-generate via `openssl rand -base64 24`, same as every password this
+   platform has always needed), TLS_MODE (asks if a real domain exists),
+   GRAFANA_ADMIN_PASSWORD (Enter to auto-generate), BACKUP_S3_* (optional -
+   skipping just means Phase 6A is skipped later, not degraded), and
+   ADMIN_EMAIL (a maintenance-mode admin account, promoted automatically
+   later). Writes straight to .env; the user never opens or hand-edits that
+   file. Secrets are read with hidden input and never echoed back.
+   Hardening added after real user testing: a bare username with no '/' at
+   the REGISTRY_URL prompt (a natural mistake) is auto-corrected to
+   docker.io/<name> with a message saying so, rather than silently trying to
+   `docker login` to a host that doesn't exist; the registry-username prompt
+   defaults from the URL already entered instead of asking twice.
+
+3. NEW: `make backbone` - chains every phase unattended: phase0 -> phase1 ->
+   phase2 -> phase3 -> phase4 -> tls -> verify-phase5a -> promote-admin ->
+   obs -> verify-phase5b -> phase6a (skipped, not degraded, if no
+   BACKUP_S3_BUCKET was configured - backup-secrets.sh hard-requires real S3
+   credentials even for wiring-only) -> phase6b. 5C stays out per (1) above.
+   RESUMABLE: each step writes a stamp file under .backbone-state/
+   (gitignored) once it succeeds; a re-run after a mid-way failure skips
+   every already-stamped step and resumes at the one that failed, instead of
+   redoing completed phases (including their `--no-cache` image rebuilds)
+   from scratch. `make backbone-reset` clears the stamps for a genuine
+   full re-run.
+
+4. NEW: scripts/promote-admin.sh (`make promote-admin`) - registers
+   ADMIN_EMAIL (if set) against the live auth service with a freshly
+   generated password (printed once), or promotes it if already registered,
+   then sets its Mongo `roles` to include `admin` - so maintenance mode's
+   HTTP off-switch (/internal/maintenance) has a real admin account without
+   the operator having to run a manual mongosh command by hand. Runs after
+   verify-phase5a (needs HTTPS/Kong genuinely up) and before obs.
+
+5. INSTALL_GUIDE.md rewritten from a ~1000-line, 10-step manual walkthrough
+   with inline "bug found during this install" writeups down to a short
+   quick-start: architecture diagram, prerequisites (exact EC2 spec, the
+   inbound firewall table - 22/30443/30080 - with the AWS Console path
+   spelled out, make/Docker install), then `make setup` -> `make backbone`
+   -> verify. Also documents "Adding a worker node" (see item 8) and the
+   public-vs-private-IP browser trap (see item 7). All prior bug writeups
+   moved verbatim into this file (below) rather than kept in the user-facing
+   guide, which only needs to describe how the install works today.
+
+6. Real bugs found and fixed DURING THIS INSTALL (in addition to the ones
+   already recorded above from earlier sessions - Phase 0 cron-quoting,
+   namespace over-creation, Mongo URI unescaping, Phase 2's auth-vs-Phase-3
+   gate mismatch, Phase 3's build-context/RBAC/cross-namespace-secret/
+   URI-escaping stack, Phase 4's disk-pressure and image-naming bugs):
+     - verify-phase6a.sh's own `cleanup()` (trap on EXIT) deleted the just-
+       created backup object on EVERY exit path, including a FAILED restore
+       check - so the moment the restore check failed, cleanup destroyed the
+       only evidence needed to debug it (and, on a fresh install, the only
+       backup that existed at all). Fixed: only deletes the object once the
+       restore is actually proven to work; logs and leaves it in place on
+       failure.
+     - verify-phase5b.sh checks [1/7] (workload readiness) and [4/7] (Loki
+       ingestion) were observed failing on the very first attempt right
+       after a fresh bootstrap - not broken, just not finished starting yet
+       (Promtail has to scan every pod's log files before shipping anything;
+       Loki needs a moment to accept pushes/queries). A single immediate
+       check can't tell "still starting" from "actually broken". Both now
+       poll for up to 3 minutes before failing for real.
+     - verify-phase6a.sh check [3/7] (bucket reachability) hit the same class
+       of issue once on a real run: failed on the first attempt with a
+       generic "cannot reach the backup bucket", passed instantly on manual
+       re-run with unchanged credentials (a fresh throwaway pod's networking
+       not warmed up yet). Now retries up to 5 times before failing.
+     - .env.example was missing an `SSH_KEY=` line entirely, even though
+       node-join.sh documents SSH_KEY as the supported way to point remote-
+       mode joins at a specific key. `sed -i "s|^SSH_KEY=.*|...|"` (the only
+       sane non-interactive way to set any .env value in this repo) only
+       replaces an EXISTING line - with none to match, it silently did
+       nothing, and node-join.sh fell back to the default SSH agent/config,
+       failing with a bare "Permission denied (publickey)" with no
+       indication why. Fixed by adding the line.
+
+7. Real operational trap found (not a code bug): every command in the
+   install guide runs ON the instance and addresses it via `hostname -I`
+   (the private VPC IP). That's correct there, but opening the same URL
+   from an actual external browser needs the instance's PUBLIC IPv4 address
+   instead - the private IP just times out from outside the VPC, which
+   looks identical to a missing firewall rule or a TLS problem but is
+   neither. Documented explicitly in the guide (Step 8's note) since the
+   symptom is genuinely misleading.
+
+8. Multi-node join VERIFIED end-to-end for the first time on two separate
+   real EC2 instances (same AWS account/VPC/region - a different-account
+   attempt was tried first and correctly fails: 172.31.x private IPs only
+   route within one VPC, and that isn't fixable by any security-group rule,
+   only by using instances in the same VPC or setting up peering, which
+   isn't covered). `./scripts/node-join.sh user@<worker-ip>` (remote mode,
+   dispatched over SSH from the control-plane) succeeded once two things
+   were both true:
+     - the control-plane instance itself (not the operator's laptop) needs
+       the worker's SSH private key, since it's the one dispatching the
+       join - easy to miss when the key only exists on the operator's own
+       machine; and
+     - security groups need rules in BOTH directions. The worker's own SG
+       needs to accept 6443/10250/51820 FROM the control-plane (documented
+       already), but the CONTROL-PLANE's SG ALSO needs new inbound rules
+       accepting 6443/10250/51820 FROM the worker - missing this manifests
+       as an indefinite hang on the worker's `k3s-agent` logs
+       ("failed to get CA certs: ... context deadline exceeded"), which
+       looks like an SSH/key problem but is actually the reverse-direction
+       firewall rule nobody thought to add. `kubectl get nodes -o wide`
+       showed both nodes Ready once both issues were fixed. As designed,
+       the joined node is agent-only - it adds capacity, never control-
+       plane redundancy (single k3s SERVER, no embedded-etcd HA); this was
+       confirmed, not changed, in this session.
+       Documented in INSTALL_GUIDE.md's new "Adding a worker node" section.
+
+  Commits (branch `test`, merged to `master`; `phase-5c-cicd` preserves the
+  pre-removal state of item 1): every fix above landed as its own commit
+  with a descriptive message; see `git log master` for the exact list, or
+  HANDOFF.md for the fuller per-bug writeups carried over from the install
+  guide.
