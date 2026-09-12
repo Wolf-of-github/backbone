@@ -53,17 +53,26 @@ reachable at.
    cd backbone
    cp .env.example .env
    ```
-2. Edit `.env`. The only required value at this stage is `K3S_SERVER_ADDR`.
-   For a single all-in-one instance (this guide's setup), use the instance's
-   **private IP** (`hostname -I | awk '{print $1}'` on the instance itself):
-   ```
-   K3S_SERVER_ADDR=<private-ip>
+2. Set the one required value, `K3S_SERVER_ADDR`, to this instance's private
+   IP. For a single all-in-one instance (this guide's setup), don't hand-edit
+   `.env` in a text editor — it's easy to open the file, mean to fill it in,
+   and leave the session without actually saving. Use this instead, which
+   both gets the IP and writes it in one step:
+   ```bash
+   MY_IP=$(hostname -I | awk '{print $1}')
+   sed -i "s/^K3S_SERVER_ADDR=.*/K3S_SERVER_ADDR=$MY_IP/" .env
    ```
    Leave `TAILSCALE=false` and `WIREGUARD=true` (defaults) — there's only one
    node, so no cross-node traffic to encrypt yet.
 
-**Success looks like:** `backbone/.env` exists and `K3S_SERVER_ADDR` is set
-to a real IP (not blank).
+**Success looks like:** running
+   ```bash
+   grep K3S_SERVER_ADDR .env
+   ```
+   shows a real dotted IP address on the `K3S_SERVER_ADDR=` line — not blank,
+   and not a placeholder like `<private-ip>`. Confirm this before moving on;
+   a blank value here surfaces later as a confusing error in Step 3
+   (`ERROR .env is missing required values: K3S_SERVER_ADDR`), not here.
 
 > **Dev note:** `.env.example` documents `K3S_SERVER_ADDR` as "reachable from
 > each machine you intend to join," which is correct for multi-node but reads
