@@ -73,6 +73,12 @@ spec:
           value: ${GRAFANA_HOST}
         - name: GF_SERVER_SERVE_FROM_SUB_PATH
           value: "true"
+        # ROOT_URL/DOMAIN alone were not sufficient in practice - every API call
+        # still hard-403'd with "origin not allowed" behind Kong's NodePort (a
+        # non-standard port, not :443). Grafana's newer CSRF-origin check
+        # validates against this explicit list, separately from ROOT_URL/DOMAIN.
+        - name: GF_SECURITY_CSRF_TRUSTED_ORIGINS
+          value: ${GRAFANA_ROOT_URL_ORIGIN}
         - name: GF_AUTH_ANONYMOUS_ENABLED
           value: "false"
         - name: GF_USERS_ALLOW_SIGN_UP

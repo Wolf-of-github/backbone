@@ -119,17 +119,27 @@ kubectl apply -f "$OBS_DIR/promtail/daemonset.yaml"
 #    validates against DOMAIN (not just ROOT_URL) - GF_SERVER_ROOT_URL alone
 #    being correct was not sufficient in practice and still produced
 #    "origin not allowed" on every datasource query with domain=localhost.
+#
+#    ROOT_URL and DOMAIN together were STILL not enough behind Kong's
+#    NodePort (a non-standard port, not :443): every API call still hard-403'd
+#    with the same "origin not allowed", confirmed via the browser's Network
+#    tab reaching Grafana's backend and being rejected there (Prometheus's own
+#    logs never saw the request). Grafana's CSRF-origin check
+#    (security.csrf_trusted_origins) validates against an explicit origin
+#    list, separate from ROOT_URL/DOMAIN - GRAFANA_ROOT_URL_ORIGIN below is
+#    the scheme+host+port with no path, which is the form that setting wants.
 # ---------------------------------------------------------------------------
 log "Applying Grafana..."
 HTTPS_PORT="$(svc_nodeport platform kong-proxy proxy-ssl 2>/dev/null || true)"
 if has_real_domain; then
   GRAFANA_HOST="$DOMAIN"
-  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}/grafana"
+  GRAFANA_ROOT_URL_ORIGIN="https://${GRAFANA_HOST}"
 else
   GRAFANA_HOST="$(public_host)"
-  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}:${HTTPS_PORT:-30443}/grafana"
+  GRAFANA_ROOT_URL_ORIGIN="https://${GRAFANA_HOST}:${HTTPS_PORT:-30443}"
 fi
-export GRAFANA_HOST GRAFANA_ROOT_URL
+GRAFANA_ROOT_URL="${GRAFANA_ROOT_URL_ORIGIN}/grafana"
+export GRAFANA_HOST GRAFANA_ROOT_URL GRAFANA_ROOT_URL_ORIGIN
 
 kubectl apply -f "$OBS_DIR/grafana/configmap.yaml"
 
@@ -140,7 +150,7 @@ kubectl -n observability create configmap grafana-dashboards \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 render_template "$OBS_DIR/grafana/deployment.yaml" \
-  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL GRAFANA_HOST'
+  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL GRAFANA_HOST GRAFANA_ROOT_URL_ORIGIN'
 kubectl apply -f "$RENDER_DIR/grafana-deployment.yaml"
 
 # ---------------------------------------------------------------------------
