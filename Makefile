@@ -9,7 +9,7 @@ SHELL := /usr/bin/env bash
 KUBECONFIG ?= ./kubeconfig
 export KUBECONFIG
 
-.PHONY: help cluster base secrets verify phase0 down lint node-join \
+.PHONY: help setup backbone cluster base secrets verify phase0 down lint node-join \
         secrets-data data verify-phase1 phase1 \
         build-push apply-app edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
@@ -17,11 +17,15 @@ export KUBECONFIG
         tls verify-phase5a obs verify-phase5b ci verify-phase5c \
         verify-phase5 phase5 \
         backup backup-now verify-phase6a phase6a \
-        maintenance verify-phase6b phase6b
+        maintenance verify-phase6b phase6b promote-admin
 
 help:
 	@echo "backbone Phase 0 (Linux). 'make cluster' installs a k3s SERVER here;"
 	@echo "other machines join as workers. Set K3S_SERVER_ADDR in .env first."
+	@echo ""
+	@echo "  Quick start"
+	@echo "  make setup                        - one-time interactive wizard, builds .env"
+	@echo "  make backbone                     - setup -> every phase (0-4, 5A, 5B, 6A, 6B), unattended"
 	@echo ""
 	@echo "Targets:"
 	@echo "  Phase 0 - Substrate"
@@ -79,6 +83,43 @@ help:
 	@echo "    ./scripts/maintenance on|off|status   - the control CLI"
 	@echo ""
 	@echo "  make lint                         - shellcheck scripts + kubectl dry-run manifests"
+
+setup:
+	./scripts/setup-env.sh
+
+# Runs every phase in the documented build order, unattended, against the
+# .env that `make setup` just built. Stops at the first failure - each phase
+# depends on the one before it, so continuing past a failure just produces a
+# more confusing failure two phases later.
+#
+# 5C (CI/CD + in-cluster registry) is skipped deliberately - see HANDOFF.md.
+# 6A is skipped entirely (not degraded) when no bucket was configured in
+# .env - backup-secrets.sh hard-requires real S3 credentials for even the
+# wiring-only path, so there is no partial mode to fall back to here.
+backbone:
+	@[ -f .env ] || $(MAKE) setup
+	$(MAKE) phase0
+	$(MAKE) phase1
+	$(MAKE) phase2
+	$(MAKE) phase3
+	$(MAKE) phase4
+	$(MAKE) tls
+	$(MAKE) verify-phase5a
+	$(MAKE) promote-admin
+	$(MAKE) obs
+	$(MAKE) verify-phase5b
+	@if [ -n "$$(grep '^BACKUP_S3_BUCKET=' .env | cut -d= -f2-)" ]; then \
+		$(MAKE) phase6a; \
+	else \
+		echo "  No BACKUP_S3_BUCKET set in .env - skipping Phase 6A (backups)."; \
+		echo "  Run 'make setup' again to add a bucket, then 'make phase6a'."; \
+	fi
+	$(MAKE) phase6b
+	@echo ""
+	@echo "  backbone is up. See INSTALL_GUIDE.md for what to check next."
+
+promote-admin: _need-kubeconfig
+	./scripts/promote-admin.sh
 
 cluster:
 	./scripts/cluster-up.sh
@@ -203,7 +244,7 @@ down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance ci/notify.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/setup-env.sh scripts/promote-admin.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance ci/notify.sh || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \

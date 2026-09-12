@@ -472,4 +472,129 @@ live cluster; 5C built but deferred by choice.
 
 ---
 
-*Last updated: 2026-09-11 (Phase 5A + 5B verified on cluster `pavilion`; 5C deferred; Phase 6B verified on `pavilion`)*
+## Bugs found during the first real end-to-end install (2026-09-11/12)
+
+The first time this repo was actually installed start-to-finish by someone
+role-playing a fresh user (not the original developer), on a real AWS EC2
+instance (`t3.large`, single-node k3s), 17 real bugs surfaced. All are fixed
+and merged. Kept here (moved out of the user-facing install guide, which
+only needs to describe how the install works today) as a record of what
+broke and why, for whoever touches these scripts next.
+
+**Phase 0 (substrate)**
+- `.env.example` shipped two unquoted cron expressions
+  (`BACKUP_SCHEDULE_MONGO=0 3 * * *`). `.env` is sourced directly as bash
+  (`scripts/lib.sh`'s `load_env`), so the unquoted `*`s and spaces were
+  parsed as a command line, failing with `3: command not found` (exit 127).
+  Fixed by quoting both values in `.env.example`.
+- `k8s/base/namespaces.yaml` created all 5 namespaces
+  (`platform`/`data`/`app`/`observability`/`ci`) unconditionally at Phase 0,
+  even though `observability` and `ci` are Phase 5B/5C concerns and `ci`
+  wasn't supposed to exist at all (5C deferred). Fixed: Phase 0 now creates
+  only `platform`/`data`/`app`; `bootstrap-observability.sh` creates
+  `observability` itself, idempotently, when Phase 5B actually runs.
+
+**Phase 1 (data layer)**
+- `verify-phase1.sh` failed with `MongoParseError: Password contains
+  unescaped characters`. `openssl rand -base64 24` (the documented way to
+  generate these passwords) routinely produces `+`/`/`, which are
+  structurally significant in a `mongodb://` URI and were being spliced in
+  unescaped. This same pattern existed in four scripts (`verify-phase1.sh`,
+  `verify-phase4.sh`, `verify-phase6a.sh`, `migrate.sh`). Fixed by adding a
+  shared `urlencode()` helper to `scripts/lib.sh`, used everywhere a Mongo
+  URI is built from `.env`/Secret values.
+
+**Phase 2 (edge)**
+- `verify-phase2.sh` failed check `[4/5]` with `Failed to reach /api/ping`
+  even though Kong/ping/frontend were all Ready. The documented install path
+  clones and stays on `master`, which already has every phase's code merged
+  in - including Phase 3's auth middleware on `/api/ping`. So `/api/ping`
+  correctly returned `401`, but the Phase-2-only gate treated any non-200 as
+  "unreachable." Fixed: the gate now accepts both `200` and `401` as a pass,
+  and only fails on a genuinely unreachable endpoint.
+
+**Phase 3 (auth)** - three bugs stacked, each only visible once the previous
+one was fixed:
+1. `scripts/bootstrap-auth.sh` re-implemented its own `docker build` calls
+   instead of using `scripts/build-push.sh`, and built the auth image from
+   `services/auth/` as context instead of the repo root - `services/auth/Dockerfile`
+   needs the repo root (it `COPY`s in `services/common`). Fixed by having
+   `bootstrap-auth.sh` delegate all three builds (auth, ping, frontend) to
+   `build-push.sh`.
+2. Even with the build fixed, the auth Deployment hung at "0 out of 2 new
+   replicas" because `bootstrap-auth.sh` never applied
+   `k8s/app/auth/rbac.yaml`, so the `auth` ServiceAccount its pod spec
+   references never existed. Fixed by applying `rbac.yaml` before the
+   Deployment.
+3. With RBAC fixed, pods crash-looped on `secret "mongodb-credentials" not
+   found` - this repo's docs already noted that Secret must exist in both
+   `data` and `app` namespaces (Secrets don't cross namespaces on their
+   own), but nothing actually did that copy. Fixed by mirroring
+   `mongodb-credentials` and `redis-password` from `data` into `app` inside
+   `bootstrap-auth.sh`, re-read from `data` on every run so a later
+   rotation propagates automatically.
+4. After all three, auth pods still crashed with the *same*
+   `MongoParseError` from Phase 1's bug - the earlier `urlencode()` fix only
+   covered shell scripts, not the application code.
+   `services/auth/src/index.js`, `services/worker/src/index.js`, and
+   `services/jobs-api/src/index.js` all built their own unescaped
+   `mongodb://` URI. Fixed with `encodeURIComponent()` on the username and
+   password in all three files.
+
+**Phase 4 (async jobs)**
+- `jobs-api` went `CrashLoopBackOff`/`Evicted` with `DiskPressure: True` on
+  the node. The actual EBS volume was 6.7GB, not the 20GB the install spec
+  calls for (a launch-wizard default that's easy to miss) - repeated
+  `--no-cache` Docker rebuilds plus k3s's own separate containerd image
+  store (distinct from the standalone Docker daemon; `docker system prune`
+  does not touch it) filled it. Not a code bug, but worth remembering: two
+  independent copies of every image live on one disk in this topology.
+- Even with disk space available, `jobs-api` kept crash-looping with the
+  same MongoParseError, despite the `encodeURIComponent()` fix already being
+  on disk. `kubectl get pod ... -o jsonpath='{...imageID}'` showed the
+  running image's digest was hours old. Cause: `k8s/app/jobs-api/deployment.yaml`
+  and `k8s/app/worker/deployment.yaml` pull `REGISTRY_URL/backbone-jobs-api`
+  / `backbone-worker` (the `backbone-<service>` convention every other
+  service uses), but `scripts/bootstrap-jobs.sh` was building/pushing to
+  `REGISTRY_URL/jobs-api` / `worker` - no prefix, a different image
+  entirely. Every "successful" build was invisible to the Deployment, which
+  kept pulling a stale unrelated image. Fixed by renaming the build/push
+  targets in `bootstrap-jobs.sh` to match.
+- `verify-phase4.sh`'s own cleanup crashed with `line 219: in: unbound
+  variable` - a `mongosh --eval` string used MongoDB's `$in` operator inside
+  a double-quoted bash string, and bash tried to expand it as a shell
+  variable. Fixed by escaping it (`\$in`).
+
+**Phase 5A/5B (TLS, observability)**
+- Transient, not a bug: `verify-phase5b.sh` failed once with `promtail
+  DaemonSet is 0/1 Ready`. On first start, promtail scans every existing pod
+  log file on the node, which briefly delayed it past the readiness probe's
+  deadline while Loki was also still starting (`connection refused` on its
+  first push attempts). Both settled within about a minute; re-running the
+  gate passed clean. No fix - just a startup race worth knowing about.
+
+**Phase 6A (backup / DR)**
+- `verify-phase6a.sh` passed checks `[1]-[3]`, took a real backup, uploaded
+  it, then failed check `[4]` (the actual restore-and-compare test) with
+  "the sentinel document did NOT come back from the restore." The backup
+  object had vanished from the bucket minutes after being uploaded and
+  verified. Cause: the script's own `cleanup()` (`trap cleanup EXIT`)
+  deleted the backup object on *every* exit path, including a failed
+  restore - so the moment the restore check failed and the script exited,
+  its own cleanup destroyed the only evidence needed to debug the failure
+  (and, on a fresh install, the only backup that existed at all). Fixed:
+  cleanup now only deletes the S3 object once the restore has actually been
+  proven to work; on failure it leaves the object in place and says so.
+
+**Operational trap found while testing (not a bug in the scripts)**
+- Every command in the install guide runs on the EC2 instance itself and
+  addresses it via `hostname -I` (the private VPC IP, e.g. `172.31.x.x`).
+  That is correct there, but opening the same URL from an actual external
+  browser needs the instance's **public** IPv4 address instead - the
+  private IP just times out from outside the VPC, which looks identical to
+  a firewall or TLS problem but isn't one. Worth calling out explicitly to
+  future users since the symptom is misleading.
+
+---
+
+*Last updated: 2026-09-12 (added a record of every bug found during the first full external-user install; see above. All fixed and merged to `test`.)*
