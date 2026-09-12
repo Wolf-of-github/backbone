@@ -729,6 +729,16 @@ IP; browsers will warn, but the encryption is real). 5B adds Prometheus
    every other credential this guide has generated, nothing prints or
    regenerates it afterward.
 
+> **Note on which IP to use where:** every `curl`/command in this guide runs
+> *on the EC2 instance itself* and uses `hostname -I` — the instance's
+> **private** VPC IP (e.g. `172.31.x.x`). That's correct there. But opening
+> any of these URLs in a browser **on your own laptop** needs the
+> instance's **public** IPv4 address instead (AWS Console → EC2 →
+> Instances → your instance → "Public IPv4 address" — a different-looking
+> number, e.g. `3.x/34.x/54.x...`). The private IP is only reachable from
+> inside the VPC; from outside, it just times out, which looks identical to
+> a firewall or certificate problem but isn't one.
+
 **Success looks like:** `verify-phase5a.sh` ends with `PHASE 5A OK`;
 `verify-phase5b.sh` ends with `PHASE 5B OK` and reports Prometheus targets
 UP. Confirm by hand:
