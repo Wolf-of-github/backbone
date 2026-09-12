@@ -3,9 +3,6 @@
 A quick, guided install onto a single Linux host. Three commands, one
 interactive setup step, then everything else runs unattended.
 
-For the history of bugs found and fixed while this guide was being written
-(and verified end-to-end on real hardware), see **HANDOFF.md**.
-
 ---
 
 ## What you're building
@@ -188,8 +185,3 @@ Running each phase individually (`make phase0`, `make phase1`, … `make
 phase6b`), rather than all at once via `make backbone`, is also supported —
 useful if you're debugging one phase specifically. Run `make help` for the
 full command list.
-
----
-
-*Bug history and design rationale from building and verifying this install:
-see HANDOFF.md.*
