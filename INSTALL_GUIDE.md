@@ -341,18 +341,41 @@ phases) — plain HTTP.
    newgrp docker          # or log out/in — applies the group change now
    docker version         # confirm it works without sudo
    ```
-2. **Set the registry and authenticate.** Pick Docker Hub or GHCR, set
-   `REGISTRY_URL` in `.env`, and log in:
+2. **Get a place to push images to.** `make phase2` pushes built images to
+   a container registry — it does not run one for you (that's Phase 5). If
+   you don't already have an account on one:
+   - **Docker Hub** (simplest, used below): go to
+     https://hub.docker.com/signup, create a free account, note your
+     **username**. Then create an access token instead of using your account
+     password directly — Account Settings → Security → **New Access
+     Token** → give it Read/Write scope → copy the token (shown once).
+   - GHCR is the alternative if you already have a GitHub account — see the
+     note below.
+
+3. **Put your registry username and credentials in `.env`, without opening
+   an editor** (an interactive editor session is easy to leave unsaved —
+   same reasoning as Steps 2 and 4):
    ```bash
    sed -i "s|^REGISTRY_URL=.*|REGISTRY_URL=docker.io/<your-dockerhub-username>|" .env
    grep REGISTRY_URL .env
-   docker login
    ```
-   (For GHCR instead: `REGISTRY_URL=ghcr.io/<your-github-username>` and
-   `docker login ghcr.io` with a PAT that has `write:packages`.)
-   `REGISTRY_URL` **must be all lowercase** — Docker rejects uppercase
-   repository names at push time.
-3. **Deploy:**
+   Replace `<your-dockerhub-username>` with your actual username — it must
+   be **all lowercase**, or the push fails later with
+   `repository name must be lowercase`.
+
+   `docker login` is separate from `.env` — it's a Docker CLI credential,
+   not something the scripts read — but the same "don't type it into a
+   prompt you might fat-finger" instinct applies. Pass the token on stdin
+   rather than at an interactive prompt:
+   ```bash
+   echo '<your-access-token>' | docker login docker.io -u <your-dockerhub-username> --password-stdin
+   ```
+   **Success looks like:** `Login Succeeded`.
+
+   (For GHCR instead: `REGISTRY_URL=ghcr.io/<your-github-username>`, and
+   `echo '<PAT>' | docker login ghcr.io -u <your-github-username> --password-stdin`
+   with a PAT scoped to `write:packages`.)
+4. **Deploy:**
    ```bash
    make phase2
    ```
