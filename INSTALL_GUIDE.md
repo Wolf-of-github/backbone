@@ -418,6 +418,26 @@ kubectl -n app get deploy,svc ping frontend    # both 2/2 ready
 ./scripts/kongctl.sh routes                    # confirm / and /api/* are wired
 ```
 
+> **Bug found during this install:** `make phase2` (specifically
+> `verify-phase2.sh`) failed at check [4/5] with `Failed to reach /api/ping`,
+> even though Kong, ping, and frontend were all deployed and Ready. Cause:
+> this repo's branches are phased (`phase-0-substrate`, `phase-1-data-layer`,
+> `phase-2-edge`, …), but the documented install path is to clone and stay
+> on `master`/`main` and run each `make phaseN` in order — and `master`
+> already has *every* phase's code merged in, including Phase 3's auth
+> middleware on `/api/ping`. So `curl /api/ping` correctly returned `401
+> Unauthorized`, and the gate — written assuming Phase 2 code has no auth —
+> treated that 401 as "unreachable" instead of "reachable, and correctly
+> enforcing auth that Phase 3 already added." Fixed: `verify-phase2.sh` now
+> accepts both `200` (no auth yet) and `401` (Phase 3's code present) as a
+> pass, and only fails on a genuinely unreachable endpoint. No action needed
+> on your end — re-run `make verify-phase2` after pulling the fix.
+>
+> **If you saw this and haven't pulled the fix yet:** `git pull` then
+> `make verify-phase2`. Registering a real user (Step 6, next) and passing a
+> valid token is the actual proof `/api/ping` works — the 401 alone doesn't
+> confirm auth is wired correctly end-to-end, only that it's present.
+
 ---
 
 *(Next: Step 6 — add authentication with `make phase3`.)*
