@@ -104,16 +104,22 @@ log "Applying Promtail (DaemonSet - covers every node, now and later)..."
 kubectl apply -f "$OBS_DIR/promtail/daemonset.yaml"
 
 # ---------------------------------------------------------------------------
-# 5. Grafana. Root URL follows the domain when there is one, else the node IP,
-#    always under /grafana so no domain is required.
+# 5. Grafana. Root URL follows the domain when there is one, else a browser-
+#    reachable IP - NOT platform_host()/node_ip(), which return the node's
+#    private VPC IP. Grafana checks the request Origin against this root URL
+#    and rejects anything that doesn't match ("origin not allowed"); on AWS,
+#    a user reaching Grafana via the instance's public IP (as the install
+#    guide tells them to) would otherwise always be rejected, since the
+#    private IP baked in here would never match. public_host() tries the
+#    EC2 metadata service for the public IP, falling back to node_ip() where
+#    that doesn't apply (no public IP, non-AWS, or on a real domain anyway).
 # ---------------------------------------------------------------------------
 log "Applying Grafana..."
 HTTPS_PORT="$(svc_nodeport platform kong-proxy proxy-ssl 2>/dev/null || true)"
-HOST="$(platform_host)"
 if has_real_domain; then
-  GRAFANA_ROOT_URL="https://${HOST}/grafana"
+  GRAFANA_ROOT_URL="https://${DOMAIN}/grafana"
 else
-  GRAFANA_ROOT_URL="https://${HOST}:${HTTPS_PORT:-30443}/grafana"
+  GRAFANA_ROOT_URL="https://$(public_host):${HTTPS_PORT:-30443}/grafana"
 fi
 export GRAFANA_ROOT_URL
 

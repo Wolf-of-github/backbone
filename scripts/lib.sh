@@ -64,6 +64,29 @@ node_ip() {
     | head -1
 }
 
+# Address a BROWSER should use to reach this host, as opposed to node_ip()
+# (used for in-cluster/in-VPC addressing, e.g. what workers dial). k3s on AWS
+# never registers a node ExternalIP, so node_ip() always returns the private
+# VPC IP - correct for cluster-internal use, but a browser off the VPC needs
+# the public IP instead, or things whose origin-checking cares (Grafana) will
+# reject requests as coming from an unexpected origin.
+#
+# Tries the EC2 instance metadata service (IMDSv2 - a token is required first)
+# for the public IPv4 address, with a short timeout so this degrades cleanly
+# to node_ip() on non-AWS hosts or instances with no public IP. AWS-specific;
+# add another cloud's metadata endpoint here if this ever needs to run there.
+public_host() {
+  local token ip
+  token=$(curl -s -m 2 -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+  if [ -n "$token" ]; then
+    ip=$(curl -s -m 2 -H "X-aws-ec2-metadata-token: $token" \
+      "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+    [ -n "$ip" ] && { printf '%s' "$ip"; return; }
+  fi
+  node_ip
+}
+
 # NodePort currently assigned to a port of a Service: svc_nodeport <ns> <svc> <portname>
 svc_nodeport() {
   kubectl -n "$1" get svc "$2" \
