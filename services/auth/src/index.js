@@ -68,7 +68,9 @@ async function connectMongoDB() {
 
   const mongoHost = process.env.MONGO_HOST || 'mongodb.data.svc';
   const mongoPort = process.env.MONGO_PORT || 27017;
-  const mongoUri = `mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@${mongoHost}:${mongoPort}/${MONGO_APP_DB}?authSource=${MONGO_APP_DB}`;
+  // MONGO_APP_PASSWORD comes from `openssl rand -base64`, which routinely
+  // produces '+' and '/' - both break an unescaped mongodb:// URI.
+  const mongoUri = `mongodb://${encodeURIComponent(MONGO_APP_USER)}:${encodeURIComponent(MONGO_APP_PASSWORD)}@${mongoHost}:${mongoPort}/${MONGO_APP_DB}?authSource=${MONGO_APP_DB}`;
 
   console.log(`Connecting to MongoDB at ${mongoHost}:${mongoPort}/${MONGO_APP_DB}...`);
 

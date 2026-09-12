@@ -19,7 +19,9 @@ instrumentHttp(app, { serviceName: 'jobs-api' });
 app.use(express.json());
 
 // MongoDB connection
-const MONGO_URI = `mongodb://${process.env.MONGO_APP_USER}:${process.env.MONGO_APP_PASSWORD}@${process.env.MONGO_HOST || 'mongodb.data.svc'}:${process.env.MONGO_PORT || 27017}/${process.env.MONGO_APP_DB}`;
+// MONGO_APP_PASSWORD comes from `openssl rand -base64`, which routinely
+// produces '+' and '/' - both break an unescaped mongodb:// URI.
+const MONGO_URI = `mongodb://${encodeURIComponent(process.env.MONGO_APP_USER)}:${encodeURIComponent(process.env.MONGO_APP_PASSWORD)}@${process.env.MONGO_HOST || 'mongodb.data.svc'}:${process.env.MONGO_PORT || 27017}/${process.env.MONGO_APP_DB}`;
 
 mongoose.connect(MONGO_URI, {
   authSource: process.env.MONGO_APP_DB || 'backbone',
