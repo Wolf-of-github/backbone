@@ -39,8 +39,18 @@ REGISTER_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "${ENDPOINT}/api
 case "$REGISTER_CODE" in
   200|201)
     ok "registered ${ADMIN_EMAIL}"
+    # Saved to .env (like every other credential this platform generates) so
+    # it isn't lost if this terminal's scrollback is - printing it once and
+    # never storing it anywhere was the earlier behavior, and it's exactly
+    # what stranded the operator out of their own admin account.
+    escaped_pw=$(printf '%s' "$ADMIN_PASSWORD" | sed -e 's/[&|\]/\\&/g')
+    if grep -q '^ADMIN_PASSWORD=' "$REPO_ROOT/.env"; then
+      sed -i.bak "s|^ADMIN_PASSWORD=.*|ADMIN_PASSWORD=${escaped_pw}|" "$REPO_ROOT/.env" && rm -f "$REPO_ROOT/.env.bak"
+    else
+      printf 'ADMIN_PASSWORD=%s\n' "$ADMIN_PASSWORD" >> "$REPO_ROOT/.env"
+    fi
     log ""
-    log "*** Save this password now - it is not printed again ***"
+    log "*** Password saved to .env as ADMIN_PASSWORD ***"
     log "  email:    ${ADMIN_EMAIL}"
     log "  password: ${ADMIN_PASSWORD}"
     log ""
