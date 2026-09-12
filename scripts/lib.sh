@@ -82,24 +82,11 @@ platform_host() {
   if has_real_domain; then printf '%s' "$DOMAIN"; else node_ip; fi
 }
 
-# Registry that image names are built from and pulled from. This single function
-# is what makes the Phase 5C cutover one .env variable instead of six manifest
-# edits - build-push.sh and every bootstrap script resolve images through it.
+# Registry that image names are built from and pulled from. build-push.sh
+# and every bootstrap script resolve images through this one function.
 registry_prefix() {
-  case "${REGISTRY_MODE:-external}" in
-    incluster)
-      # Gitea's built-in container registry, addressed in-cluster. Images are
-      # namespaced under the Gitea admin user, which owns the deploy token.
-      printf 'gitea-http.ci.svc:3000/%s' "${GITEA_ADMIN_USER:-gitea_admin}"
-      ;;
-    external)
-      [ -n "${REGISTRY_URL:-}" ] || die "REGISTRY_URL is blank in .env (REGISTRY_MODE=external)"
-      printf '%s' "$REGISTRY_URL"
-      ;;
-    *)
-      die "REGISTRY_MODE must be 'external' or 'incluster', got: ${REGISTRY_MODE}"
-      ;;
-  esac
+  [ -n "${REGISTRY_URL:-}" ] || die "REGISTRY_URL is blank in .env"
+  printf '%s' "$REGISTRY_URL"
 }
 
 # Insert a block of YAML into Kong's declarative config, immediately before the

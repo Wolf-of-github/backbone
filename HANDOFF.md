@@ -311,18 +311,24 @@ Three tracks, each with its own gate. Two adopted, one deferred.
 |---|---|---|
 | 5A TLS | `make tls` / `make verify-phase5a` | ✅ `PHASE 5A OK` (7/7) |
 | 5B Observability | `make obs` / `make verify-phase5b` | ✅ `PHASE 5B OK` (7/7), 15 targets UP |
-| 5C CI/CD + registry | `make ci` / `make verify-phase5c` | ⏸ Deferred by choice — built, not adopted |
+| 5C CI/CD + registry | `phase-5c-cicd` branch only | ⏸ Deferred by choice — built, not adopted, not on `master` |
 
 **5C was deferred deliberately, not abandoned.** For a single operator its value is
 conditional: the CI half automates a `make` flow that isn't a bottleneck, and the registry
 half removes a Docker Hub dependency that isn't currently causing problems — against a
 Gitea StatefulSet, a Drone server + runner, a 20Gi PVC, two credentials, and a manual
-`registries.yaml` edit on every node forever. The `ci` namespace was deleted and
-`REGISTRY_MODE` remains `external`. Revisit when a second person joins or Docker Hub bites.
+`registries.yaml` edit on every node forever. Revisit when a second person joins or Docker
+Hub bites.
 
-One aborted `make ci` run left `gitea-0` in CrashLoopBackOff, undiagnosed (logs never read;
-likely rootless-image paths/ownership — same class as the Kong TLS key fixed in 5A). Anyone
-resuming should start at `kubectl -n ci logs gitea-0`.
+As of 2026-09-12, 5C's code (`ci/`, `k8s/ci/`, `scripts/bootstrap-ci.sh`,
+`scripts/verify-phase5c.sh`, `scripts/gitea-secrets.sh`, `scripts/registry-secret.sh`,
+`scripts/deploy-key.sh`, and the `make ci`/`make verify-phase5c` targets) was removed from
+`master` entirely rather than left dormant, to keep the shipped repo free of dead/unverified
+code paths. It is preserved as-is on the `phase-5c-cicd` branch if it's ever revisited.
+
+One aborted `make ci` run (on that branch) left `gitea-0` in CrashLoopBackOff, undiagnosed
+(logs never read; likely rootless-image paths/ownership — same class as the Kong TLS key
+fixed in 5A). Anyone resuming should start at `kubectl -n ci logs gitea-0`.
 
 ### Operating what's now running
 

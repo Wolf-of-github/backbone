@@ -20,8 +20,7 @@
 # one place that knows how to do it, handles both spellings, and never writes
 # to the tracked manifests.
 #
-# Images resolve through registry_prefix(), so REGISTRY_MODE=incluster works
-# here too (Phase 5C).
+# Images resolve through registry_prefix() in lib.sh, same as build-push.sh.
 
 set -euo pipefail
 
@@ -43,7 +42,7 @@ else
   SERVICES=("${ALL_SERVICES[@]}")
 fi
 
-log "Registry: $REGISTRY (REGISTRY_MODE=${REGISTRY_MODE:-external})"
+log "Registry: $REGISTRY"
 
 for svc in "${SERVICES[@]}"; do
   dir="k8s/app/$svc"

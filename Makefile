@@ -14,7 +14,7 @@ export KUBECONFIG
         build-push apply-app edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
         jobs verify-phase4 phase4 \
-        tls verify-phase5a obs verify-phase5b ci verify-phase5c \
+        tls verify-phase5a obs verify-phase5b \
         verify-phase5 phase5 \
         backup backup-now verify-phase6a phase6a \
         maintenance verify-phase6b phase6b promote-admin
@@ -60,15 +60,14 @@ help:
 	@echo "  make jobs                         - bootstrap jobs-api + worker services"
 	@echo "  make verify-phase4                - run the Phase 4 acceptance gate"
 	@echo ""
-	@echo "  Phase 5 - Operate (three tracks; each has its own gate)"
-	@echo "  make phase5                       - tls -> obs -> ci -> verify-phase5"
+	@echo "  Phase 5 - Operate (two tracks; each has its own gate)"
+	@echo "  make phase5                       - tls -> obs -> verify-phase5"
 	@echo "  make tls                          - 5A: HTTPS at Kong (works with NO domain)"
 	@echo "  make verify-phase5a               - run the Phase 5A gate"
 	@echo "  make obs                          - 5B: Prometheus + Loki + Grafana"
 	@echo "  make verify-phase5b               - run the Phase 5B gate"
-	@echo "  make ci                           - 5C: Gitea + Drone + in-cluster registry"
-	@echo "  make verify-phase5c               - run the Phase 5C gate"
-	@echo "  make verify-phase5                - run all three Phase 5 gates"
+	@echo "  make verify-phase5                - run both Phase 5 gates"
+	@echo "  (5C - CI/CD + in-cluster registry - is not on this branch; see phase-5c-cicd)"
 	@echo ""
 	@echo "  Phase 6A - Backup / DR (set the BACKUP_S3_* vars in .env first)"
 	@echo "  make phase6a                      - backup -> verify-phase6a"
@@ -92,7 +91,8 @@ setup:
 # depends on the one before it, so continuing past a failure just produces a
 # more confusing failure two phases later.
 #
-# 5C (CI/CD + in-cluster registry) is skipped deliberately - see HANDOFF.md.
+# 5C (CI/CD + in-cluster registry) is not on this branch - deferred by
+# choice; see HANDOFF.md and the phase-5c-cicd branch.
 # 6A is skipped entirely (not degraded) when no bucket was configured in
 # .env - backup-secrets.sh hard-requires real S3 credentials for even the
 # wiring-only path, so there is no partial mode to fall back to here.
@@ -208,16 +208,10 @@ obs: _need-kubeconfig
 verify-phase5b: _need-kubeconfig
 	./scripts/verify-phase5b.sh
 
-ci: _need-kubeconfig
-	./scripts/bootstrap-ci.sh
-
-verify-phase5c: _need-kubeconfig
-	./scripts/verify-phase5c.sh
-
 verify-phase5: _need-kubeconfig
 	./scripts/verify-phase5.sh
 
-phase5: tls obs ci verify-phase5
+phase5: tls obs verify-phase5
 
 # --- Phase 6A: Backup / Disaster Recovery ----------------------------------
 backup: _need-kubeconfig
@@ -244,13 +238,13 @@ down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/setup-env.sh scripts/promote-admin.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/gitea-secrets.sh scripts/registry-secret.sh scripts/deploy-key.sh scripts/migrate.sh scripts/bootstrap-ci.sh scripts/verify-phase5c.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance ci/notify.sh || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/setup-env.sh scripts/promote-admin.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/migrate.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/app/ ; \
 	  kubectl apply --dry-run=server -f k8s/platform/kong/ ; \
-	  echo "note: k8s/platform/cert-manager/, k8s/observability/ and k8s/ci/ are"; \
+	  echo "note: k8s/platform/cert-manager/ and k8s/observability/ are"; \
 	  echo "      templates (\$${VAR} placeholders) - they are dry-run from"; \
 	  echo "      .rendered/ by their bootstrap scripts, not from source."; \
 	else \

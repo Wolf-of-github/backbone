@@ -58,9 +58,9 @@ Deployment that actually processes it, and the only piece that autoscales.
   running - resize now if `lsblk` shows less than ~18GB).
 - **Inbound access** on `22/tcp` (SSH), and `30443/tcp` (HTTPS) if you want
   to reach the platform from outside the host's own network.
-- **Docker Hub or GHCR account** - built images get pushed there until you
-  optionally stand up an in-cluster registry later (Phase 5C, not covered
-  here).
+- **Docker Hub or GHCR account** - built images get pushed there. (An
+  in-cluster registry + CI/CD track, Phase 5C, was built and evaluated but
+  is deferred by choice on this branch - see HANDOFF.md.)
 - **An S3-compatible bucket + a scoped access key**, if you want working
   backups (Phase 6A) - optional, can be added later.
 - Basic tools present on stock Ubuntu: `curl`, `git`, `openssl`, `sudo`.

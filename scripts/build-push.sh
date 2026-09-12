@@ -5,10 +5,9 @@
 #
 # usage: build-push.sh [service ...]     (default: every service)
 #
-# The destination comes from registry_prefix() in lib.sh, which resolves
-# REGISTRY_MODE (external -> REGISTRY_URL, incluster -> the Gitea registry from
-# Phase 5C). That indirection is what makes the registry cutover one .env
-# variable instead of an edit to every deployment and script.
+# The destination comes from REGISTRY_URL via registry_prefix() in lib.sh -
+# that indirection is what lets every deployment and script resolve the
+# registry through one place instead of hardcoding it.
 
 set -euo pipefail
 
@@ -33,21 +32,8 @@ else
   SERVICES=("${ALL_SERVICES[@]}")
 fi
 
-log "Registry: $REGISTRY  (REGISTRY_MODE=${REGISTRY_MODE:-external})"
+log "Registry: $REGISTRY"
 log "Tag:      $GIT_SHA"
-
-# Log in when pushing to the in-cluster registry - it is authenticated, and a
-# push without credentials fails with an opaque 401.
-if [ "${REGISTRY_MODE:-external}" = "incluster" ]; then
-  require_vars GITEA_ADMIN_USER GITEA_ADMIN_PASSWORD
-  log "Authenticating to the in-cluster registry..."
-  printf '%s' "$GITEA_ADMIN_PASSWORD" \
-    | docker login "gitea-http.ci.svc:3000" -u "$GITEA_ADMIN_USER" --password-stdin >/dev/null 2>&1 \
-    || die "docker login to the in-cluster registry failed.
-  The registry is a ClusterIP Service, so it is not reachable from outside the
-  cluster by that name. Either build from a node with it in /etc/hosts, or push
-  through Kong at https://<host>/git, or let CI build in-cluster (ci/.drone.example.yml)."
-fi
 
 build_and_push() {
   local service="$1"
