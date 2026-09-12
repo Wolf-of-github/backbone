@@ -170,4 +170,83 @@ make base
 
 ---
 
-*(Next: Step 4 — bring up the data layer with `make phase1`.)*
+## Step 4 — Bring up the data layer
+
+**What:** `make phase1` deploys MongoDB and Redis — the two datastores every
+later phase (auth, job queue) depends on — as single-replica StatefulSets in
+the `data` namespace, each backed by persistent storage. Before it can run,
+it needs six credential values in `.env`. `data-secrets.sh` refuses to
+create anything if any of these are blank, rather than silently generating
+one for you — you're expected to set and record them yourself.
+
+**How:**
+
+Generate and write all six values in one step (don't hand-edit `.env` for
+this — same reasoning as Step 2: an interactive edit is easy to leave
+unsaved):
+```bash
+MONGO_ROOT_PW=$(openssl rand -base64 24)
+MONGO_APP_PW=$(openssl rand -base64 24)
+REDIS_PW=$(openssl rand -base64 24)
+
+sed -i "s|^MONGO_ROOT_PASSWORD=.*|MONGO_ROOT_PASSWORD=$MONGO_ROOT_PW|" .env
+sed -i "s|^MONGO_APP_PASSWORD=.*|MONGO_APP_PASSWORD=$MONGO_APP_PW|" .env
+sed -i "s|^REDIS_PASSWORD=.*|REDIS_PASSWORD=$REDIS_PW|" .env
+
+echo "MONGO_ROOT_PASSWORD=$MONGO_ROOT_PW"
+echo "MONGO_APP_PASSWORD=$MONGO_APP_PW"
+echo "REDIS_PASSWORD=$REDIS_PW"
+```
+**Save that last block's output somewhere safe right now** (a password
+manager, not just your terminal scrollback) — nothing regenerates or prints
+these again, and losing them means losing access to the data.
+
+`MONGO_ROOT_USER`, `MONGO_APP_USER`, and `MONGO_APP_DB` ship with usable
+defaults (`root`, `backbone_app`, `backbone`) — leave them as-is unless you
+have a reason to change them.
+
+Then deploy:
+```bash
+make phase1
+```
+This runs, in order: `data-secrets.sh` (creates the `mongodb-credentials`
+and `redis-password` Kubernetes Secrets from `.env`), the Redis
+StatefulSet, the MongoDB StatefulSet + a one-shot init Job (creates the
+least-privilege app user/DB), then `verify-phase1.sh`.
+
+**Success looks like:** before running `make phase1`, confirm none of the
+six values are blank:
+```bash
+grep -E "^(MONGO_ROOT_USER|MONGO_ROOT_PASSWORD|MONGO_APP_USER|MONGO_APP_PASSWORD|MONGO_APP_DB|REDIS_PASSWORD)=" .env
+```
+Every line should show a real value after `=` — if any is empty,
+`data-secrets.sh` will fail fast with a clear message rather than silently
+skip it.
+
+Then the command ends with, and exits `0`:
+```
+[1/6] StatefulSets Ready          OK redis and mongodb StatefulSets Ready (1/1)
+[2/6] secrets                     OK mongodb-credentials (5 keys) and redis-password (1 key) present
+[3/6] PVCs Bound                  OK data-redis-0 and data-mongodb-0 Bound
+[4/6] Redis auth + round-trip     OK Redis requires AUTH; SET/GET/DEL round-trip works
+[5/6] MongoDB app-user round-trip OK app user does I/O on backbone; cross-DB writes and admin ops denied
+[6/6] data survives a pod restart OK Redis and MongoDB data survived deleting their pods
+
+PHASE 1 OK
+```
+Also confirm the Phase 0 gate still passes (Phase 1 shouldn't regress it):
+```bash
+make verify
+```
+
+**Want to look closer?**
+```bash
+kubectl -n data get statefulset,pod,pvc,secret
+                                  # redis-0 and mongodb-0 Running, both PVCs Bound
+                                  # secrets mongodb-credentials, redis-password present (values hidden)
+kubectl -n data get svc          # headless services: redis, mongodb
+```
+
+---
+
+*(Next: Step 5 — bring up the edge with `make phase2`.)*
