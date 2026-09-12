@@ -71,8 +71,7 @@ Deployment that actually processes it, and the only piece that autoscales.
 - **An S3-compatible bucket + a scoped access key**, if you want working
   backups (Phase 6A) - optional, can be added later.
 - Basic tools present on stock Ubuntu: `curl`, `git`, `openssl`, `sudo`.
-  Docker itself gets installed as part of the guided setup below if it's
-  missing.
+  `make` and Docker are not preinstalled - Step 1 below installs both.
 
 If you're opening any URL from your own browser rather than from the host
 itself, use the host's **public** IP address, not a private/VPC-internal
@@ -81,14 +80,17 @@ inside that network and otherwise just times out.
 
 ---
 
-## Step 1 — Get the code and install Docker
+## Step 1 — Get the code and install Docker + make
 
 ```bash
 git clone https://github.com/Wolf-of-github/backbone.git
 cd backbone
 
-# Docker is needed from here on (k3s itself uses its own separate runtime)
+# make runs every command in this guide; not preinstalled on stock Ubuntu
 sudo apt-get update
+sudo apt install make        # version 4.4.1-3, or newer, is fine
+
+# Docker is needed from here on (k3s itself uses its own separate runtime)
 sudo apt-get install -y docker.io
 sudo usermod -aG docker $USER
 newgrp docker   # or log out/in - applies the group change now
