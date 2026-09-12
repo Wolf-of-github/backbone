@@ -693,4 +693,70 @@ kubectl -n app logs -l app=worker --tail=50    # job pickup/processing activity
 
 ---
 
-*(Next: Step 8 — TLS, observability, and beyond.)*
+## Step 8 — TLS and observability
+
+**What:** Phase 5 has three independent tracks: 5A (TLS), 5B (observability),
+5C (CI/CD + in-cluster registry). This install does **5A and 5B only** — this
+repo's own HANDOFF.md documents 5C as deliberately deferred (it was built,
+tested, and then not adopted: for a single-operator setup it replaces a
+`make` flow that isn't a bottleneck with a Gitea StatefulSet + Drone
+server/runner + a 20Gi PVC + two more credentials, and the one real attempt
+left `gitea-0` in an undiagnosed CrashLoopBackOff). Run the two tracks
+individually rather than `make phase5`, which chains **all three** including
+5C.
+
+5A adds HTTPS at the gateway with a self-signed certificate (no domain
+needed — `TLS_MODE=selfsigned` is the default and works directly on the node
+IP; browsers will warn, but the encryption is real). 5B adds Prometheus
+(metrics), Loki (logs), Grafana (dashboards), and Alertmanager, all in a new
+`observability` namespace.
+
+**How:**
+
+1. TLS needs no new `.env` values — the defaults already work:
+   ```bash
+   make tls
+   make verify-phase5a
+   ```
+2. Observability needs one password:
+   ```bash
+   sed -i "s|^GRAFANA_ADMIN_PASSWORD=.*|GRAFANA_ADMIN_PASSWORD=$(openssl rand -base64 24)|" .env
+   grep GRAFANA_ADMIN_PASSWORD .env
+   make obs
+   make verify-phase5b
+   ```
+   **Save that password somewhere safe** — it's your Grafana login and, like
+   every other credential this guide has generated, nothing prints or
+   regenerates it afterward.
+
+**Success looks like:** `verify-phase5a.sh` ends with `PHASE 5A OK`;
+`verify-phase5b.sh` ends with `PHASE 5B OK` and reports Prometheus targets
+UP. Confirm by hand:
+```bash
+# HTTPS now works (self-signed, so -k skips certificate verification)
+curl -k https://$(hostname -I | awk '{print $1}'):30443/api/ping
+
+# Grafana, through Kong
+# open in a browser: https://<instance-ip>:30443/grafana
+#   user: admin   password: the one you just generated
+```
+
+**Want to look closer?**
+```bash
+kubectl -n platform get certificate,clusterissuer   # cert-manager objects, both Ready
+kubectl -n observability get pods                   # prometheus, loki, grafana, alertmanager, promtail all Running
+kubectl -n observability port-forward svc/prometheus 9090:9090 &
+# then browse http://localhost:9090 from a machine that can reach this instance,
+# or curl it locally on the instance itself
+```
+
+> **Note:** since this is an all-in-one single-node install, `t3.large`'s
+> ~1.5 vCPU/3GB baseline from Step 1 now also carries Prometheus (up to
+> 1 vCPU/2GB at its configured limit) and Loki (up to 1 vCPU/1GB) on top of
+> everything from Phases 1-4. If pods start getting `OOMKilled` or the node
+> shows `MemoryPressure`, that's this — worth knowing before assuming it's a
+> new bug.
+
+---
+
+*(Next: Step 9 — backups and maintenance mode.)*
