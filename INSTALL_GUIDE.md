@@ -196,6 +196,12 @@ make verify                              # re-run Phase 0's health gate
 kubectl get pods -A                      # see everything running
 ```
 
+The public maintenance page has no admin controls on it by design - it's
+served to every visitor with no login in front of it, so anything clickable
+there would reveal that an admin off-switch exists. Turn maintenance off
+from wherever you can reach this repo (SSH into the instance, or `kubectl`
+access) with `./scripts/maintenance off` - not from the page itself.
+
 Running each phase individually (`make phase0`, `make phase1`, … `make
 phase6b`), rather than all at once via `make backbone`, is also supported —
 useful if you're debugging one phase specifically. Run `make help` for the
