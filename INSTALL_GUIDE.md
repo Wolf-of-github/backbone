@@ -454,13 +454,14 @@ image.
 **How:**
 
 1. Set `FRONTEND_URL` to the Kong endpoint from Step 5's output — this is
-   the URL the auth service will treat as the legitimate frontend origin:
+   the URL the auth service will treat as the legitimate frontend origin.
+   Derive it from the instance itself rather than typing an IP by hand (same
+   reasoning as Step 2's `K3S_SERVER_ADDR`):
    ```bash
-   sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=http://172.31.10.228:30080|" .env
+   MY_IP=$(hostname -I | awk '{print $1}')
+   sed -i "s|^FRONTEND_URL=.*|FRONTEND_URL=http://$MY_IP:30080|" .env
    grep FRONTEND_URL .env
    ```
-   Replace the IP if your instance's is different — check with
-   `hostname -I | awk '{print $1}'` if unsure.
    `JWT_ACCESS_EXPIRY` (`15m`) and `JWT_REFRESH_EXPIRY` (`7d`) already ship
    with usable defaults — no change needed unless you want different token
    lifetimes.
@@ -491,7 +492,7 @@ PHASE 3 OK
 
 Confirm by hand — register, log in, and hit the now-working `/api/ping`:
 ```bash
-ENDPOINT=http://172.31.10.228:30080
+ENDPOINT="http://$(hostname -I | awk '{print $1}'):30080"
 
 curl -X POST $ENDPOINT/api/auth/register \
   -H "Content-Type: application/json" \
@@ -505,9 +506,10 @@ curl $ENDPOINT/api/ping -H "Authorization: Bearer $TOKEN"
 # now returns 200, unlike the 401 you saw in Step 5
 ```
 
-Or just open `http://172.31.10.228:30080/` in a browser — you should see a
-login/register page; register, log in, and the page should show the ping
-result with your email attached.
+Or just open `http://<your-instance-ip>:30080/` in a browser (the same IP
+`FRONTEND_URL` was set to above) — you should see a login/register page;
+register, log in, and the page should show the ping result with your email
+attached.
 
 **Want to look closer?**
 ```bash
