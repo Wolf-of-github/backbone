@@ -330,18 +330,24 @@ until Phase 5 stands up an in-cluster registry, images go to a registry you
 already have an account on (Docker Hub or GHCR). No auth or TLS yet (later
 phases) — plain HTTP.
 
+> **Stop — do this before anything else in this step.** Nothing before
+> Phase 2 needed Docker (Phases 0/1 only touch k3s/kubectl), so it is almost
+> certainly not installed yet. Install it now:
+> ```bash
+> sudo apt-get update
+> sudo apt-get install -y docker.io
+> sudo usermod -aG docker $USER
+> newgrp docker          # or log out/in — applies the group change now
+> ```
+> **Success looks like:** `docker version` prints both a Client and Server
+> section with no error, and no `sudo` was needed to run it. If you see
+> `Command 'docker' not found`, the block above wasn't run (or wasn't run on
+> this instance) — do it now before continuing; the registry login and
+> `make phase2` below both fail without it.
+
 **How:**
 
-1. **Install Docker.** Nothing before this step needed it — Phases 0/1 only
-   touched k3s/kubectl — so if you haven't already:
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y docker.io
-   sudo usermod -aG docker $USER
-   newgrp docker          # or log out/in — applies the group change now
-   docker version         # confirm it works without sudo
-   ```
-2. **Get a place to push images to.** `make phase2` pushes built images to
+1. **Get a place to push images to.** `make phase2` pushes built images to
    a container registry — it does not run one for you (that's Phase 5). If
    you don't already have an account on one:
    - **Docker Hub** (simplest, used below): go to
@@ -352,7 +358,7 @@ phases) — plain HTTP.
    - GHCR is the alternative if you already have a GitHub account — see the
      note below.
 
-3. **Put your registry username and credentials in `.env`, without opening
+2. **Put your registry username and credentials in `.env`, without opening
    an editor** (an interactive editor session is easy to leave unsaved —
    same reasoning as Steps 2 and 4):
    ```bash
@@ -375,7 +381,7 @@ phases) — plain HTTP.
    (For GHCR instead: `REGISTRY_URL=ghcr.io/<your-github-username>`, and
    `echo '<PAT>' | docker login ghcr.io -u <your-github-username> --password-stdin`
    with a PAT scoped to `write:packages`.)
-4. **Deploy:**
+3. **Deploy:**
    ```bash
    make phase2
    ```
