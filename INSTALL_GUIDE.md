@@ -89,7 +89,22 @@ gateway, auth, workers, monitoring). We provision that host first.
 
 **Success looks like:** you have an SSH session open on the instance, and
 both `curl --version` and `sudo -v` return without errors (no install
-needed on stock Ubuntu).
+needed on stock Ubuntu). **Also confirm the disk is actually 20GB** before
+moving on — a launch wizard defaulting back to 8GB is easy to miss, and it
+will not cause a visible failure until several phases later (Phase 4's
+`--no-cache` rebuilds are what finally filled an undersized disk during
+this install, four steps after it was provisioned):
+```bash
+lsblk
+```
+The root disk (commonly `nvme0n1`) should show ~20G, not 8G. If it doesn't,
+fix it now — in the AWS Console: EC2 → Volumes → find this instance's
+volume → Modify Volume → 20GB+ → Apply. Then on the instance:
+```bash
+sudo growpart /dev/nvme0n1 1   # device name from lsblk - may differ
+sudo resize2fs /dev/nvme0n1p1
+df -h /                        # should now show ~20G
+```
 
 > **Dev note:** README.md's stated minimum (1 vCPU/1GB) covers bare Phase 0
 > only. Full stack requests ~1.5 vCPU/3GB before overhead — update that line
@@ -628,6 +643,53 @@ kubectl -n app get deploy jobs-api worker      # jobs-api 2/2, worker >=1
 kubectl -n app get hpa worker-hpa              # current/target CPU, replica range
 kubectl -n app logs -l app=worker --tail=50    # job pickup/processing activity
 ```
+
+> **Bug found during this install (the disk really does need to be 20GB):**
+> `make phase4` left `jobs-api` stuck `CrashLoopBackOff`/`Evicted` in a way
+> that had nothing to do with the application. `kubectl describe node` showed
+> `DiskPressure: True`, and the actual disk (`df -h /`) was only **6.7GB
+> total** — not the 20GB this guide's Step 1 specifies. Repeated `--no-cache`
+> Docker builds (needed for the cache-busting fix below) plus k3s's own
+> separate containerd image store, sharing one small root volume with the
+> OS and Kubernetes PVC data, filled it completely; `docker system prune`
+> didn't help because k3s uses its own containerd, not the standalone Docker
+> daemon you build images with — two independent copies of every image on
+> one disk. **If you provisioned the EC2 instance with a smaller root volume
+> than Step 1 specifies** (check with `lsblk` — if the disk shows less than
+> ~18GB, this is you), fix it now rather than waiting to hit this later:
+> resize the EBS volume to 20GB+ in the AWS Console (EC2 → Volumes → Modify
+> Volume), then on the instance:
+> ```bash
+> sudo growpart /dev/nvme0n1 1   # device name may differ - check with lsblk
+> sudo resize2fs /dev/nvme0n1p1
+> df -h /
+> ```
+
+> **Bug found during this install (the actual application bug):** even with
+> disk space available, `jobs-api` kept crash-looping with the same
+> `MongoParseError: Password contains unescaped characters` from Step 4/6 —
+> despite the source fix (`encodeURIComponent`) already being on disk and
+> the image rebuilding without errors. `kubectl get pod ... -o
+> jsonpath='{.items[0].status.containerStatuses[0].imageID}'` revealed why:
+> the running image's digest was hours old, unrelated to anything just
+> built. Cause: `k8s/app/jobs-api/deployment.yaml` and
+> `k8s/app/worker/deployment.yaml` pull `REGISTRY_URL/backbone-jobs-api` and
+> `REGISTRY_URL/backbone-worker` (the same `backbone-<service>` naming every
+> other service uses), but `scripts/bootstrap-jobs.sh` was building and
+> pushing to `REGISTRY_URL/jobs-api` and `REGISTRY_URL/worker` — no prefix,
+> a completely different image name. Every "successful" build/push was
+> invisible to the actual Deployment, which kept pulling whatever stale
+> image already existed at the `backbone-jobs-api` tag. Fixed by renaming
+> the build/push targets in `bootstrap-jobs.sh` to match. No action needed
+> on your end — re-run `make phase4` after pulling the fix.
+
+> **Bug found during this install (a small one, in cleanup):**
+> `make verify-phase4` passed all 7 real checks and then crashed during its
+> own test-user cleanup step with `line 219: in: unbound variable`. The
+> cleanup's `mongosh --eval` string uses MongoDB's `$in` operator inside a
+> double-quoted bash string; bash tried to expand `$in` as a shell variable
+> instead of passing it through literally. Fixed by escaping it (`\$in`). No
+> action needed on your end.
 
 ---
 
