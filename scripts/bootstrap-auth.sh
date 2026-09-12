@@ -65,6 +65,13 @@ ok "Auth service image built and pushed"
 # Step 5: Deploy auth service
 log "[5/7] Deploying auth service..."
 
+# ServiceAccount + RBAC first - the Deployment's pod spec references the
+# "auth" ServiceAccount, and without it the ReplicaSet controller can't even
+# create the pods ("serviceaccount \"auth\" not found"), so this must exist
+# before the Deployment is applied. rbac.yaml also grants the narrow rights
+# the maintenance-mode off-switch needs (see the file's own header comment).
+kubectl apply -f "${REPO_ROOT}/k8s/app/auth/rbac.yaml"
+
 # Update deployment with registry URL
 sed "s|REGISTRY_URL|${REGISTRY_URL}|g" "${REPO_ROOT}/k8s/app/auth/deployment.yaml" | kubectl apply -f -
 kubectl apply -f "${REPO_ROOT}/k8s/app/auth/service.yaml"
