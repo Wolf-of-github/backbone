@@ -63,12 +63,33 @@ ok "Kong proxy endpoint: $ENDPOINT"
 log "[4/5] Testing end-to-end HTTP routing from outside the cluster..."
 
 # Create a temporary curl pod to test from within the cluster (simulates external access via NodePort)
+#
+# /api/ping's expected response depends on what's actually deployed: on a
+# repo checked out at the Phase 2 branch, ping has no auth yet and returns
+# 200 {"status":"ok"}. On master (or any checkout with Phase 3's code
+# already merged in), the SAME ping service requires a bearer token and
+# correctly returns 401 - that is Kong routing working, not a failure.
+# This check accepts either shape, since both mean "Kong reached ping and
+# ping responded correctly for the code that's actually running."
 log "  Testing /api/ping..."
-PING_RESPONSE=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
-  curl -sf "$ENDPOINT/api/ping" 2>/dev/null || fail "Failed to reach /api/ping")
+PING_HTTP_CODE=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
+  curl -s -o /tmp/ping_body -w "%{http_code}" "$ENDPOINT/api/ping" 2>/dev/null) \
+  || fail "Failed to reach /api/ping"
 
-echo "$PING_RESPONSE" | grep -q '"status":"ok"' || fail "/api/ping did not return expected response"
-ok "/api/ping returns ok"
+case "$PING_HTTP_CODE" in
+  200)
+    PING_RESPONSE=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
+      curl -sf "$ENDPOINT/api/ping" 2>/dev/null || fail "Failed to reach /api/ping")
+    echo "$PING_RESPONSE" | grep -q '"status":"ok"' || fail "/api/ping returned 200 but not the expected body"
+    ok "/api/ping returns ok (no auth deployed yet)"
+    ;;
+  401)
+    ok "/api/ping reachable and correctly requires auth (Phase 3 code is present in this checkout)"
+    ;;
+  *)
+    fail "/api/ping returned unexpected HTTP $PING_HTTP_CODE"
+    ;;
+esac
 
 log "  Testing frontend (/)..."
 FRONTEND_RESPONSE=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
