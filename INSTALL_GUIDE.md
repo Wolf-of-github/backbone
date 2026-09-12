@@ -42,11 +42,6 @@ Your host -- single-node k3s cluster
 
   [ namespace: observability ]
     Prometheus / Loki / Grafana / Alertmanager / Promtail
-
-  StorageClass: local-path (default) -- backs every PVC above
-============================================================
-Not deployed: `ci` namespace (Gitea + Drone, Phase 5C) -- deferred by
-choice; see HANDOFF.md.
 ```
 
 Kong is the only thing anything outside the cluster ever talks to; it does
