@@ -168,9 +168,22 @@ if [ "$NO_S3" = true ]; then
 fi
 
 # [3/7] S3 reachable
+#
+# Retried: this has been observed failing on the very first attempt right
+# after a fresh bootstrap, then succeeding immediately on a second, unchanged
+# run - a brief pod/DNS startup race (the throwaway pod's networking not
+# fully warmed up yet), not a real credentials or bucket problem. A single
+# immediate attempt can't tell that apart from an actually wrong bucket/key,
+# so retry a few times before treating it as a real failure.
 log "[3/7] Bucket reachability"
-s3_exec 'aws $EP s3api head-bucket --bucket "$bucket" && echo REACHABLE' 2>/dev/null | grep -q REACHABLE \
-  || fail "cannot reach the backup bucket - check BACKUP_S3_* in .env"
+reachable=false
+for _ in $(seq 1 5); do
+  s3_exec 'aws $EP s3api head-bucket --bucket "$bucket" && echo REACHABLE' 2>/dev/null | grep -q REACHABLE \
+    && { reachable=true; break; }
+  sleep 6
+done
+[ "$reachable" = true ] \
+  || fail "cannot reach the backup bucket after several attempts - check BACKUP_S3_* in .env"
 ok "bucket reachable with the configured credentials"
 
 # [4/7] THE REAL TEST: write -> back up -> destroy -> restore -> compare
