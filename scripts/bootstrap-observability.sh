@@ -20,9 +20,12 @@ need envsubst
 RENDER_DIR="$REPO_ROOT/.rendered/observability"
 OBS_DIR="k8s/observability"
 
-kubectl get ns observability >/dev/null 2>&1 \
-  || die "namespace 'observability' missing - run 'make base' first
-  (Phase 5 uncommented it in k8s/base/namespaces.yaml)"
+kubectl get ns platform data app >/dev/null 2>&1 \
+  || die "core namespaces missing - run 'make base' first"
+
+kubectl create namespace observability \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl label namespace observability backbone.dev/tier=observability --overwrite >/dev/null
 
 require_vars GRAFANA_ADMIN_USER GRAFANA_ADMIN_PASSWORD
 
