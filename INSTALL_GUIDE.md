@@ -7,6 +7,64 @@ to do it, and **what success looks like** before moving on.
 
 ---
 
+## What you're building
+
+Everything below runs on **one EC2 instance** acting as a single-node k3s
+cluster. Inside it, workloads are split into namespaces by role. This
+diagram reflects Phases 0-4 (substrate through async jobs) — later phases
+(TLS, observability, backup, maintenance mode) layer on top without changing
+this shape.
+
+```
+EC2 instance (t3.large, Ubuntu) -- single-node k3s cluster
+============================================================
+
+  internet
+    |
+    | :30080
+    v
+  [ namespace: platform ]
+    Kong (API gateway)
+      - route  /       -> frontend
+      - route  /api/*  -> ping / auth / jobs-api  (by path)
+    |
+    v
+  [ namespace: app ]
+    frontend   (React/NGINX, serves the SPA)
+    auth       (JWT issue + verify)
+    ping       (example protected endpoint)
+    jobs-api   (enqueues jobs)          --enqueues-->  worker
+    worker     (BullMQ consumer, HPA 1-10 replicas)
+    |
+    v
+  [ namespace: data ]
+    MongoDB  (StatefulSet, 1 replica, PVC)  -- users, job records
+    Redis    (StatefulSet, 1 replica, PVC)  -- sessions, BullMQ queue
+
+  StorageClass: local-path (default) -- backs every PVC above
+
+============================================================
+Not yet in this picture (later phases):
+  platform ns   += cert-manager (5A/TLS), maintenance page (6B)
+  observability ns -- Prometheus / Loki / Grafana / Alertmanager (5B)
+  ci ns         -- Gitea + Drone (5C, deferred by choice -- not deployed)
+```
+
+**Reading it:**
+- One arrow in from the internet, on Kong's NodePort (`:30080`). Kong is the
+  *only* thing anything outside the cluster ever talks to.
+- Kong routes `/` to `frontend` and `/api/*` to whichever backend service
+  owns that path — it does **not** check JWTs itself (see Phase 3 note in
+  README); each backend service verifies its own tokens.
+- `worker` is a separate Deployment from `jobs-api` — `jobs-api` only
+  enqueues jobs into Redis; `worker` is what actually pulls and runs them,
+  and it's the one thing that autoscales (HPA, 1-10 replicas).
+- Everything that needs to persist state (MongoDB, Redis) lives in the
+  `data` namespace on its own PVC, backed by the `local-path` StorageClass
+  from Phase 0 — nothing else in the diagram writes to disk.
+
+---
+
 ## Step 1 — Provision the EC2 instance
 
 **What:** backbone needs a real Linux host to install onto — a control-plane
@@ -246,6 +304,20 @@ kubectl -n data get statefulset,pod,pvc,secret
                                   # secrets mongodb-credentials, redis-password present (values hidden)
 kubectl -n data get svc          # headless services: redis, mongodb
 ```
+
+> **Bug found during this install:** `make verify-phase1` failed at check
+> [5/6] with `MongoParseError: Password contains unescaped characters`, even
+> though `data-secrets.sh` and the MongoDB init Job both succeeded. Cause:
+> `openssl rand -base64 24` (the exact command this guide's Step 4 tells you
+> to run) routinely produces `+` and `/`, and every script that builds a
+> `mongodb://user:pass@host` connection string was splicing the raw password
+> in unescaped — those characters are structurally significant in a URI, so
+> MongoDB's driver correctly rejected it. This wasn't a one-off: the same
+> pattern existed in four scripts (`verify-phase1.sh`, `verify-phase4.sh`,
+> `verify-phase6a.sh`, `migrate.sh`). Fixed by adding a shared `urlencode()`
+> helper to `scripts/lib.sh` and using it everywhere a Mongo URI is built
+> from `.env`/Secret values. No action needed on your end — re-run
+> `make verify-phase1` after pulling the fix.
 
 ---
 

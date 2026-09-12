@@ -52,15 +52,14 @@ trap cleanup EXIT
 mongo_eval() {
   local expr="$1"
   local overrides
-  overrides=$(jq -nc --arg expr "$expr" '{
+  local mongo_uri="mongodb://$(urlencode "$MONGO_ROOT_USER"):$(urlencode "$MONGO_ROOT_PASSWORD")@mongodb.data.svc:27017/admin"
+  overrides=$(jq -nc --arg expr "$expr" --arg uri "$mongo_uri" '{
     spec: { containers: [{
       name: "m", image: "mongo:7.0",
       command: ["/bin/bash","-c"],
-      args: ["mongosh --quiet \"mongodb://$MONGO_ROOT_USER:$MONGO_ROOT_PASSWORD@mongodb.data.svc:27017/admin\" --eval \"$MONGO_EVAL\""],
+      args: ["mongosh --quiet \"\($uri)\" --eval \"$MONGO_EVAL\""],
       env: [
-        {name: "MONGO_EVAL", value: $expr},
-        {name: "MONGO_ROOT_USER", valueFrom: {secretKeyRef: {name: "mongodb-credentials", key: "root-username"}}},
-        {name: "MONGO_ROOT_PASSWORD", valueFrom: {secretKeyRef: {name: "mongodb-credentials", key: "root-password"}}}
+        {name: "MONGO_EVAL", value: $expr}
       ]
     }]}
   }')

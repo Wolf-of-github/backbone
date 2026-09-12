@@ -71,12 +71,24 @@ spec:
       containers:
       - name: migrate
         image: mongo:7.0
-        command: ["mongosh"]
+        # MONGO_APP_PASSWORD comes from `openssl rand -base64`, which routinely
+        # produces '+' and '/' - both break an unescaped mongodb:// URI. Build
+        # the URI in-container with encodeURIComponent instead of splicing the
+        # raw secret value into the connection string via $(VAR) substitution.
+        command: ["/bin/bash", "-c"]
         args:
-          - "--quiet"
-          - "mongodb://\$(MONGO_APP_USER):\$(MONGO_APP_PASSWORD)@mongodb.data.svc/\$(MONGO_APP_DB)"
-          - "--eval"
           - |
+            MONGO_URI="mongodb://$(node -e 'process.stdout.write(encodeURIComponent(process.env.MONGO_APP_USER))'):$(node -e 'process.stdout.write(encodeURIComponent(process.env.MONGO_APP_PASSWORD))')@mongodb.data.svc/$MONGO_APP_DB"
+            exec mongosh --quiet "$MONGO_URI" --eval "$MONGO_EVAL"
+        env:
+        - name: MONGO_APP_USER
+          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-username } }
+        - name: MONGO_APP_PASSWORD
+          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-password } }
+        - name: MONGO_APP_DB
+          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-db } }
+        - name: MONGO_EVAL
+          value: |
             const fs = require('fs');
             const dir = '/migrations';
             const cmd = '${COMMAND}';
@@ -114,13 +126,6 @@ spec:
               }
               quit(0);
             }
-        env:
-        - name: MONGO_APP_USER
-          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-username } }
-        - name: MONGO_APP_PASSWORD
-          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-password } }
-        - name: MONGO_APP_DB
-          valueFrom: { secretKeyRef: { name: mongodb-credentials, key: app-db } }
         volumeMounts:
         - name: migrations
           mountPath: /migrations

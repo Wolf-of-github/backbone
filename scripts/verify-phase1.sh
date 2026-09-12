@@ -38,7 +38,7 @@ run_in_pod() {
     --command -- sh -s
 }
 
-MONGO_URI="mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongodb.data.svc:27017/${MONGO_APP_DB}"
+MONGO_URI="mongodb://$(urlencode "$MONGO_APP_USER"):$(urlencode "$MONGO_APP_PASSWORD")@mongodb.data.svc:27017/${MONGO_APP_DB}"
 
 # 1. Both StatefulSets Ready (1/1).
 log "[1/6] StatefulSets Ready"

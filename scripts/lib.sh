@@ -34,6 +34,23 @@ require_vars() {
 
 need() { command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"; }
 
+# Percent-encode a string for safe use inside a mongodb:// URI userinfo
+# segment (username or password). MONGO_*_PASSWORD values come from
+# `openssl rand -base64`, which routinely produces '+' and '/' - both are
+# URI-significant and break MongoDB's connection-string parser if not
+# escaped ("Password contains unescaped characters").
+urlencode() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 # --- Phase 5 helpers ---------------------------------------------------------
 
 # IP of the first Ready node. Verification and bootstrap scripts address the
