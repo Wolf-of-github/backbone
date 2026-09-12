@@ -685,7 +685,18 @@
       restore and compares content - a backup that has never been restored is a hypothesis.
       Deliberately excludes Mongo HA and point-in-time recovery; see the plan for why.
     - 6B Maintenance page (`make phase6b`; gate: verify-phase6b.sh -> "PHASE 6B OK") - IMPLEMENTED
-      2026-09-11, statically validated, NOT yet run against a cluster.
+      2026-09-11, VERIFIED on cluster `pavilion` 2026-09-11: `./scripts/verify-phase6b.sh
+      --i-know-this-causes-downtime` -> "PHASE 6B OK" (6/6), including the disruptive on/off cycle
+      against the live gateway. Two real bugs only surfaced by actually running it:
+        - `make build-push` reused a stale Docker layer for `services/auth/src`, so the auth image
+          it pushed was missing `routes/maintenance.js` entirely - `make build-push` reported
+          success while shipping stale code. Worked around with `docker build --no-cache`;
+          `build-push.sh` itself still has no cache-busting (open item, see README troubleshooting).
+        - The gate's ACME-bypass check curled `cm-acme-http-solver` live, which only has a real
+          upstream mid-challenge; on this cluster (TLS_MODE=selfsigned) it doesn't exist between
+          renewals, so Kong 503s on it for an unrelated reason (no upstream) and the check
+          false-failed. Fixed to assert the route is present in Kong's applied config instead of
+          probing it live.
       The 5C dependencies were designed out rather than worked around:
         - No built image. The page is a ConfigMap (HTML + nginx.conf) mounted into stock
           nginx:1.25-alpine, so there is no Dockerfile, no build-push, and no registry - and

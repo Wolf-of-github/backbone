@@ -1048,6 +1048,26 @@ That's the run that actually proves maintenance mode can be turned **off** —
 worth doing once, deliberately, rather than discovering the answer during an
 incident.
 
+**Verified on the live cluster (`pavilion`, 2026-09-11):**
+
+```
+[1/6] Maintenance page deployment            OK
+[2/6] 503 + Retry-After, /healthz stays 200  OK
+[3/6] Auth RBAC narrowly scoped              OK
+[4/6] ON: public 503s, bypass paths answer   OK
+[5/6] OFF: routing restored intact           OK
+[6/6] State hygiene (saved config cleared)   OK
+
+PHASE 6B OK
+```
+
+Two real bugs surfaced only by running this against a live cluster (see
+"Troubleshooting" below): a stale Docker build cache silently shipped an auth
+image missing `maintenance.js`, and the gate's ACME bypass check originally
+probed `cm-acme-http-solver` live, which only exists mid-challenge and 503s
+otherwise for an unrelated reason. The gate now asserts the ACME route is
+present in Kong's applied config instead of hitting it live.
+
 ### Editing the page
 
 The HTML lives in a ConfigMap, not an image:
@@ -1065,4 +1085,4 @@ kubectl -n platform rollout restart deployment/maintenance
 | `maintenance off` fails | `kubectl -n platform get cm maintenance-state -o jsonpath='{.data.saved_kong_config}'` — if empty, re-apply Kong's config by hand and restart it |
 | Stuck at 503 after `off` | Kong may still be restarting: `kubectl -n platform rollout status deploy/kong` |
 | HTTP off-switch returns 403 | The account lacks the `admin` role |
-| HTTP off-switch returns 500 | Auth image predates Phase 6B — `make build-push && make apply-app` |
+| HTTP off-switch returns 500, or `find /app -name maintenance.js` in the auth pod comes up empty | Auth image predates Phase 6B, or `make build-push` reused a stale Docker layer for `services/auth/src` — rebuild that image with `docker build --no-cache` and `kubectl -n app rollout restart deployment/auth` |

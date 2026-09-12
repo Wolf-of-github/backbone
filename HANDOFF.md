@@ -1,10 +1,10 @@
 # Backbone Project Handoff
 
 **Date:** 2026-09-11
-**Status:** Phase 5A (TLS) + 5B (Observability) verified on the live cluster; 5C (CI/CD) deferred by choice
-**Branch:** master (phase-5-operate merged 2026-09-11)
+**Status:** Phase 5A (TLS) + 5B (Observability) verified on the live cluster; 5C (CI/CD) deferred by choice; Phase 6B (Maintenance mode) verified on the live cluster
+**Branch:** phase-6b-maintenance (not yet merged to master)
 **Tag:** phase-4-complete (pending)
-**Last Verified:** Phase 0, 1, 3, 4 gates passing; Phase 5A + 5B verified 2026-09-11.
+**Last Verified:** Phase 0, 1, 3, 4 gates passing; Phase 5A + 5B verified 2026-09-11; Phase 6B verified 2026-09-11.
 `verify-phase2` is knowingly broken - see "Still open".
 
 ---
@@ -357,11 +357,47 @@ certificate and changes nothing else.
 - **`verify-phase2` is knowingly broken** — fails because Phase 3 auth-protected `/api/ping`
   and 5A moved the scheme to https. Left as-is by decision; update or retire it.
 - **Phase 5C**, as above.
-- **Phase 6** (`architecture.txt`): backup/DR, maintenance page, Terraform worker fleet.
+- **Phase 6A (Backup/DR)** — PARTIAL only: `verify-phase6a --no-s3` passes checks [1]-[2], but
+  [3]-[7] (bucket reachability, actual backup/restore round trip, retention, freshness) are
+  unrun for want of a real S3 bucket. The backup guarantee is unproven; data is still
+  single-copy. See `architecture.txt` "Files (Phase 6 - Resilience & lifecycle)".
+- **Phase 6C** — Terraform-provisioned worker fleet, not planned.
+- **`scripts/build-push.sh` has no Docker cache-busting** — surfaced during Phase 6B testing:
+  it can report success while silently pushing an image built from a stale cached layer. Not
+  yet fixed at the script level; see README Phase 6B troubleshooting for the manual workaround.
 - **HA** — still single-replica MongoDB/Redis, single k3s server.
 
 See `architecture.txt` for the full Phase 5 plan, the deviations taken during implementation,
 and the seven bugs that only surfaced on real hardware.
+
+---
+
+## Phase 6B — Maintenance mode (verified 2026-09-11)
+
+`make phase6b` -> `./scripts/verify-phase6b.sh --i-know-this-causes-downtime` -> **PHASE 6B OK**
+(6/6) on cluster `pavilion`, including the disruptive on/off cycle against the live gateway.
+
+- A static 503 page (ConfigMap mounted into stock nginx — no image, no registry dependency)
+  fronts the platform during maintenance; toggling is a Kong declarative-config swap, not a pod
+  start, so the page is always running and warm.
+- Bypass list (`/api/auth/login`, `/internal/maintenance`, the ACME challenge path) keeps you
+  from locking yourself out — the gate asserts this explicitly.
+- `POST /internal/maintenance/off` on the auth service (admin-role-gated) gives a browser-based
+  off-switch; there's deliberately no HTTP way to turn maintenance ON.
+- `./scripts/maintenance on|off|status|resume-queues` is the CLI; `--pause-queues` pauses BullMQ
+  globally via Redis so HPA-started workers are covered too.
+
+**Two real bugs only surfaced by running the gate against the live cluster:**
+1. `make build-push` silently shipped a stale auth image — a Docker layer cache reused
+   `services/auth/src` from before `routes/maintenance.js` existed, so the build reported
+   success but the deployed image was missing the route entirely. Fixed for this run with
+   `docker build --no-cache`; the script itself is unpatched (see "Still open").
+2. The gate's ACME-bypass check originally curled `cm-acme-http-solver` live. That service only
+   exists while cert-manager is mid-challenge; on a self-signed cluster it's absent, so Kong
+   503'd for lacking an upstream — indistinguishable from maintenance actually blocking the
+   route. Fixed in `57d645a` to assert the route's presence in Kong's applied config instead.
+
+Not yet merged to master — currently on `phase-6b-maintenance`.
 
 ---
 
@@ -436,4 +472,4 @@ live cluster; 5C built but deferred by choice.
 
 ---
 
-*Last updated: 2026-09-11 (Phase 5A + 5B verified on cluster `pavilion`; 5C deferred)*
+*Last updated: 2026-09-11 (Phase 5A + 5B verified on cluster `pavilion`; 5C deferred; Phase 6B verified on `pavilion`)*
