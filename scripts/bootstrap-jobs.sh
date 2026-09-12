@@ -32,8 +32,15 @@ TAG="$(git rev-parse --short HEAD 2>/dev/null || echo 'latest')"
 log "Building and pushing images (tag: $TAG)..."
 
 # Build jobs-api
+#
+# --no-cache: the legacy Docker builder has repeatedly reused a stale COPY
+# layer here even when the copied source content changed (same bug HANDOFF.md
+# recorded for Phase 6B's auth image - "make build-push reused a stale
+# Docker layer... reported success while shipping stale code"). That is
+# worse than a slower build: it fails silently. Force a clean build instead
+# of trusting the cache.
 log "  Building jobs-api..."
-docker build \
+docker build --no-cache \
   -t "$REGISTRY_URL/jobs-api:$TAG" \
   -t "$REGISTRY_URL/jobs-api:latest" \
   -f services/jobs-api/Dockerfile \
@@ -45,7 +52,7 @@ docker push "$REGISTRY_URL/jobs-api:latest" || die "Failed to push jobs-api:late
 
 # Build worker
 log "  Building worker..."
-docker build \
+docker build --no-cache \
   -t "$REGISTRY_URL/worker:$TAG" \
   -t "$REGISTRY_URL/worker:latest" \
   -f services/worker/Dockerfile \

@@ -71,7 +71,12 @@ build_and_push() {
   esac
 
   log "Building $service (context: ${context#"$REPO_ROOT"/})..."
-  docker build \
+  # --no-cache: the legacy Docker builder has been observed reusing a stale
+  # COPY layer even when the copied source changed (HANDOFF.md documents
+  # this for Phase 6B's auth image, and it recurred independently on Phase
+  # 4's jobs-api build) - it fails silently, reporting a successful build
+  # of stale code, which is worse than the extra build time costs.
+  docker build --no-cache \
     -f "$dockerfile" \
     -t "${REGISTRY}/backbone-${service}:${GIT_SHA}" \
     -t "${REGISTRY}/backbone-${service}:latest" \
