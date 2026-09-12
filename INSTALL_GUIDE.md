@@ -321,4 +321,74 @@ kubectl -n data get svc          # headless services: redis, mongodb
 
 ---
 
-*(Next: Step 5 — bring up the edge with `make phase2`.)*
+## Step 5 — Bring up the edge
+
+**What:** Phase 2 adds **Kong** as the single public entry point, plus a
+minimal **ping** backend and the **React frontend**, both served through
+Kong. This is the first phase that builds and pushes container images —
+until Phase 5 stands up an in-cluster registry, images go to a registry you
+already have an account on (Docker Hub or GHCR). No auth or TLS yet (later
+phases) — plain HTTP.
+
+**How:**
+
+1. **Install Docker.** Nothing before this step needed it — Phases 0/1 only
+   touched k3s/kubectl — so if you haven't already:
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y docker.io
+   sudo usermod -aG docker $USER
+   newgrp docker          # or log out/in — applies the group change now
+   docker version         # confirm it works without sudo
+   ```
+2. **Set the registry and authenticate.** Pick Docker Hub or GHCR, set
+   `REGISTRY_URL` in `.env`, and log in:
+   ```bash
+   sed -i "s|^REGISTRY_URL=.*|REGISTRY_URL=docker.io/<your-dockerhub-username>|" .env
+   grep REGISTRY_URL .env
+   docker login
+   ```
+   (For GHCR instead: `REGISTRY_URL=ghcr.io/<your-github-username>` and
+   `docker login ghcr.io` with a PAT that has `write:packages`.)
+   `REGISTRY_URL` **must be all lowercase** — Docker rejects uppercase
+   repository names at push time.
+3. **Deploy:**
+   ```bash
+   make phase2
+   ```
+   This builds and pushes the `ping` and `frontend` images, then applies
+   Kong (2 replicas, DB-less declarative routing, NodePort `30080`), the
+   `ping` service, and the `frontend` service, then runs the verification
+   gate.
+
+**Success looks like:**
+```
+[1/5] Checking Kong deployment...              OK Kong deployment ready (2/2)
+[2/5] Checking ping and frontend deployments...OK Ping and frontend deployments ready (2/2 each)
+[3/5] Checking Kong proxy Service...           OK Kong proxy endpoint: http://<node-ip>:30080
+[4/5] Testing end-to-end HTTP routing...       OK /api/ping returns ok
+                                                OK Frontend (/) returns HTML
+[5/5] Verifying Kong Admin API is ClusterIP... OK Kong Admin API is accessible from inside the cluster
+
+PHASE 2 OK
+```
+Then open `http://<instance-public-ip>:30080/` in a browser — you should see
+the React frontend with a green "Backend status: ok (pong)" message. If the
+instance's security group still only allows `22/tcp` (from Step 1), you'll
+need to open inbound `30080/tcp` first, or use `curl` from the instance
+itself:
+```bash
+curl http://localhost:30080/
+curl http://localhost:30080/api/ping
+```
+
+**Want to look closer?**
+```bash
+kubectl -n platform get deploy,svc kong        # 2/2 ready, proxy NodePort 30080
+kubectl -n app get deploy,svc ping frontend    # both 2/2 ready
+./scripts/kongctl.sh routes                    # confirm / and /api/* are wired
+```
+
+---
+
+*(Next: Step 6 — add authentication with `make phase3`.)*
