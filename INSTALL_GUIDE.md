@@ -518,6 +518,20 @@ kubectl -n app logs -l app=auth --tail=50   # registration/login activity
 ls .secrets/jwt/                            # the generated keypair (gitignored)
 ```
 
+> **Bug found during this install:** `make phase3` failed at
+> `[4/7] Building and pushing auth service image...` with
+> `COPY services/auth/package*.json ./: no source files were specified`.
+> Cause: `scripts/bootstrap-auth.sh` re-implemented its own `docker build`
+> calls instead of using `scripts/build-push.sh` (despite its header saying
+> it depends on that script), and got the auth build wrong — it built from
+> `services/auth/` as the context, but `services/auth/Dockerfile` needs the
+> **repo root** as context (it `COPY`s in `services/common`, which only
+> exists there). `build-push.sh` already handled this correctly per
+> service; `bootstrap-auth.sh` just wasn't calling it. Fixed by having
+> `bootstrap-auth.sh` delegate all three builds (auth, ping, frontend) to
+> `build-push.sh`. No action needed on your end — re-run `make phase3`
+> after pulling the fix.
+
 ---
 
 *(Next: Step 7 — add async jobs with `make phase4`.)*
