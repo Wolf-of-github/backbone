@@ -72,9 +72,14 @@ log "[4/5] Testing end-to-end HTTP routing from outside the cluster..."
 # This check accepts either shape, since both mean "Kong reached ping and
 # ping responded correctly for the code that's actually running."
 log "  Testing /api/ping..."
-PING_HTTP_CODE=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
-  curl -s -o /tmp/ping_body -w "%{http_code}" "$ENDPOINT/api/ping" 2>/dev/null) \
+PING_RAW=$(kubectl run verify-phase2-curl --rm -i --restart=Never --image=curlimages/curl:latest -- \
+  curl -s -o /tmp/ping_body -w "HTTPCODE:%{http_code}" "$ENDPOINT/api/ping" 2>/dev/null) \
   || fail "Failed to reach /api/ping"
+# kubectl run --rm can append its own status text (e.g. `pod "..." deleted`)
+# to the same stdout stream once the pod exits, so extract the code by its
+# marker rather than trusting the whole captured string is just the code.
+PING_HTTP_CODE=$(printf '%s' "$PING_RAW" | grep -o 'HTTPCODE:[0-9]\{3\}' | head -1 | cut -d: -f2)
+[ -n "$PING_HTTP_CODE" ] || fail "Could not determine HTTP status for /api/ping (raw output: $PING_RAW)"
 
 case "$PING_HTTP_CODE" in
   200)
