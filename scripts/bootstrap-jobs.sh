@@ -56,6 +56,18 @@ docker push "$REGISTRY_URL/worker:$TAG" || die "Failed to push worker:$TAG"
 docker push "$REGISTRY_URL/worker:latest" || die "Failed to push worker:latest"
 
 # Update image references in manifests
+#
+# These are tracked files, temporarily mutated in place. Any `die` between
+# here and the manual restore below (a rollout timeout, a failed kubectl
+# apply) would otherwise skip the restore and leave the real registry URL
+# permanently baked into a file git thinks is just the REGISTRY_URL
+# placeholder. The trap makes the restore unconditional.
+restore_manifests() {
+  [ -f k8s/app/jobs-api/deployment.yaml.bak ] && mv k8s/app/jobs-api/deployment.yaml.bak k8s/app/jobs-api/deployment.yaml
+  [ -f k8s/app/worker/deployment.yaml.bak ] && mv k8s/app/worker/deployment.yaml.bak k8s/app/worker/deployment.yaml
+}
+trap restore_manifests EXIT
+
 log "Updating image references in manifests..."
 sed -i.bak "s|REGISTRY_URL|$REGISTRY_URL|g" k8s/app/jobs-api/deployment.yaml
 sed -i.bak "s|REGISTRY_URL|$REGISTRY_URL|g" k8s/app/worker/deployment.yaml
@@ -76,9 +88,8 @@ kubectl apply -f k8s/app/worker/hpa.yaml || die "Failed to apply worker HPA"
 log "Waiting for worker rollout..."
 kubectl -n app rollout status deployment/worker --timeout=120s || die "worker rollout failed"
 
-# Restore manifests
-mv k8s/app/jobs-api/deployment.yaml.bak k8s/app/jobs-api/deployment.yaml
-mv k8s/app/worker/deployment.yaml.bak k8s/app/worker/deployment.yaml
+# Manifests are restored by the EXIT trap (restore_manifests) set above,
+# whether this script succeeds or dies from here on.
 
 # Update Kong config
 log "Updating Kong configuration..."
