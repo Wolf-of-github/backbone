@@ -1,0 +1,23 @@
+# staging-pvc.yaml
+# Purpose: Scratch space where a dump is written before upload. STAGING ONLY -
+#          the durable copy lives in external S3.
+# depends_on: [k8s/base/storageclass.yaml]
+#
+# TEMPLATE: BACKUP_STAGING_SIZE is substituted by scripts/bootstrap-backup.sh.
+#
+# Deliberately not the backup destination. This PVC is local-path, which means
+# it sits on the same physical disk as MongoDB - so a copy here survives a
+# dropped collection but not the disk failure that actually ends the platform.
+# The CronJobs dump here, upload, verify the remote object, then delete the
+# local file. Verify-then-delete: never remove the only copy before proving
+# the remote one exists.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backup-staging
+  namespace: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: ${BACKUP_STAGING_SIZE}

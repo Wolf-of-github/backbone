@@ -1,0 +1,31 @@
+# state-configmap.yaml
+# Purpose: Records whether maintenance mode is on, so the state survives pod
+#          and Kong restarts.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# WHY STATE LIVES HERE
+# Kong runs DB-less: its whole config is a ConfigMap, and a restart reloads
+# whatever that ConfigMap says. If maintenance were only a live Admin API edit,
+# a Kong restart mid-maintenance would silently restore normal routing and send
+# traffic at a database you are still migrating. Keeping the flag alongside the
+# routing means both move together.
+#
+# scripts/maintenance writes this; it is the source of truth for
+# `maintenance status`. Not edited by hand - the CLI keeps it in step with the
+# Kong config, and editing one without the other is how they drift.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maintenance-state
+  namespace: platform
+  labels:
+    app: maintenance
+data:
+  # "on" or "off"
+  enabled: "off"
+  # Set when maintenance is enabled, for `maintenance status` and so anyone
+  # finding the cluster later can tell how long it has been down.
+  since: ""
+  reason: ""
+  # Whether --pause-queues was used, so `maintenance off` knows to resume them.
+  queues_paused: "false"

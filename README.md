@@ -836,3 +836,253 @@ kubectl -n data run redis-cli --rm -it --restart=Never --image=redis:7.2-alpine 
 ```
 
 ---
+
+---
+
+## Phase 6A — Backup / Disaster Recovery
+
+Nightly **MongoDB** and **Redis** snapshots uploaded to **external S3-compatible
+storage**, with restore scripts and retention pruning. Plus PodDisruptionBudgets
+so node drains don't take services to zero.
+
+External storage is the whole point. A backup on the same disk as the database
+survives a dropped collection, but not the disk dying — which is the failure that
+actually ends the platform. MongoDB here is a single replica on node-bound
+`local-path`, so until this phase there was no copy of your data anywhere.
+
+### 1. Create the bucket first
+
+`make backup` does **not** create it. On your provider (AWS S3, Backblaze B2,
+Cloudflare R2 — anything speaking the S3 API):
+
+1. **Create a bucket**, and turn on **object versioning** with a lifecycle rule
+   to expire old versions. Without versioning, anything that can write to the
+   bucket can also destroy history by overwriting it.
+2. **Issue an access key scoped to that bucket only**, with `s3:PutObject`,
+   `GetObject`, `ListBucket`, `DeleteObject`. Never a root or admin key — it
+   lives in the cluster and is only as safe as the cluster is.
+
+### 2. Configure
+
+Fill the **Phase 6A** block in `.env`:
+
+| Variable | Notes |
+|---|---|
+| `BACKUP_S3_BUCKET` | Required. Must already exist. |
+| `BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY` | The scoped key from step 1 |
+| `BACKUP_S3_ENDPOINT` | Blank for AWS; required for B2/R2/MinIO |
+| `BACKUP_S3_REGION` | Some providers reject a mismatched region |
+| `BACKUP_RETENTION_DAYS` | Default 30 |
+| `BACKUP_SCHEDULE_MONGO` / `_REDIS` | Cron, UTC. Redis runs an hour later — both use one RWO staging volume |
+
+### 3. Deploy
+
+```bash
+make phase6a          # backup -> verify-phase6a
+```
+
+`make backup` preflights the bucket before creating anything, so a typo'd name
+or wrong key fails immediately rather than silently at 03:00.
+
+**Expect:**
+
+```
+[1/7] Secret, staging volume and CronJobs   OK
+[2/7] PodDisruptionBudgets                  OK
+[3/7] Bucket reachability                   OK
+[4/7] Mongo backup and restore round trip   OK
+[5/7] Redis backup                          OK
+[6/7] Retention pruning                     OK
+[7/7] Backup freshness                      OK
+
+PHASE 6A OK
+```
+
+Check **[4]** is the one that matters: it writes a sentinel document, backs up,
+**drops it**, restores from S3, and confirms it came back. A backup that has
+never been restored is a hypothesis.
+
+### Taking a backup now
+
+```bash
+./scripts/backup-now.sh mongo        # or redis, or all
+```
+
+Do this before a migration or a bulk delete. Scheduled backups mean an **RPO of
+up to 24 hours** — anything written since the last run is not recoverable.
+
+### Restoring
+
+```bash
+./scripts/mongo-restore.sh list
+./scripts/mongo-restore.sh restore <key> --target restore_check
+```
+
+The default restores **beside** your live data into a named database, so you can
+inspect it and copy across only what you need. Overwriting production needs two
+explicit flags:
+
+```bash
+./scripts/mongo-restore.sh restore <key> --overwrite-production --confirm
+```
+
+**Redis is different.** It holds refresh tokens and the job queue, so restoring
+it revives sessions that were revoked at logout and replays jobs that already
+ran. Use `inspect` to look without touching production:
+
+```bash
+./scripts/redis-restore.sh inspect <key>
+```
+
+### Practise the restore
+
+Do this once, now, from these instructions alone — not from the scripts:
+
+1. `./scripts/backup-now.sh mongo`
+2. `./scripts/mongo-restore.sh list`
+3. `./scripts/mongo-restore.sh restore <newest-key> --target drill`
+4. Connect and confirm your data is in `drill`, then `db.dropDatabase()`
+
+If these steps aren't enough to recover without reading the source, the docs are
+wrong — fix them while it's a drill rather than an incident.
+
+### What this does NOT cover
+
+- **Point-in-time recovery.** Nightly dumps only; RPO is up to 24h.
+- **High availability.** Backups answer "the disk died", not "stay up while it
+  dies". MongoDB is still single-replica.
+- **Cluster objects** (Deployments, ConfigMaps) — those are in git and rebuilt
+  with `make`. Only the data is irreplaceable.
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `make backup` fails at preflight | Bucket name, key, and `BACKUP_S3_ENDPOINT` for non-AWS providers |
+| Job fails at upload | The staging copy is **kept** on failure — nothing is lost. `kubectl -n data logs job/<name> --all-containers` |
+| `kubectl drain` hangs | A PDB on a single-replica workload. `k8s/base/pdb.yaml` explains why mongodb/redis have none |
+| Backups stop appearing | `kubectl -n data get cronjob` — check `LAST SCHEDULE`; a CronJob that works manually but not on schedule usually means a bad cron expression |
+
+---
+
+## Phase 6B — Maintenance mode
+
+A static **503 page** you can put in front of the platform during migrations or
+risky deploys, toggled by swapping Kong's routing rather than stopping services.
+
+```bash
+./scripts/maintenance status
+./scripts/maintenance on --reason "database migration"
+./scripts/maintenance off
+```
+
+### How it works
+
+Kong is DB-less — one ConfigMap holds every route. `maintenance on` rewrites it
+so public traffic goes to the maintenance service, **stashes the original**, and
+restarts Kong. `maintenance off` puts the original back.
+
+Swapping routing rather than stopping services means the real services stay up
+and warm throughout, so ending maintenance is one Kong restart rather than a
+cold start of everything.
+
+### The bypass list
+
+These stay reachable during maintenance, by design:
+
+| Path | Why |
+|---|---|
+| `/api/auth/login` | Otherwise nobody can authenticate to turn maintenance **off** |
+| `/internal/maintenance` | The off-switch itself |
+| `/.well-known/acme-challenge` | Otherwise cert renewal fails and you return to an expired certificate |
+
+Locking yourself out is the classic maintenance-mode failure. The gate tests
+this explicitly.
+
+### Two ways out
+
+**CLI** (normal): `./scripts/maintenance off`
+
+**Browser** (when you're away from a machine with kubectl): the maintenance page
+has an "Administrator access" control that logs in and calls
+`POST /internal/maintenance/off`. It requires the **`admin` role** — a normal
+account gets a 403.
+
+There is deliberately **no HTTP way to turn maintenance on** — that would put a
+"take the platform down" button behind only a password.
+
+Promote a user to admin:
+
+```bash
+kubectl -n data exec -it statefulset/mongodb -- mongosh \
+  "mongodb://<root-user>:<pw>@localhost/backbone?authSource=admin" \
+  --eval 'db.users.updateOne({email:"you@example.com"},{$addToSet:{roles:"admin"}})'
+```
+
+### Pausing background jobs
+
+```bash
+./scripts/maintenance on --pause-queues     # workers stop taking new jobs
+```
+
+Off by default — a frontend deploy has no reason to stop background work, but a
+database migration does. In-flight jobs finish rather than being killed, and the
+pause is global, so a worker the HPA starts mid-maintenance is paused too.
+`maintenance off` resumes them automatically.
+
+### Deploying
+
+```bash
+make phase6b          # maintenance -> verify-phase6b
+```
+
+The gate's on/off cycle is **disruptive** (~60s of 503s while Kong restarts
+twice), so it's skipped by default and prints `PHASE 6B PARTIAL`. To run it
+fully:
+
+```bash
+./scripts/verify-phase6b.sh --i-know-this-causes-downtime
+```
+
+That's the run that actually proves maintenance mode can be turned **off** —
+worth doing once, deliberately, rather than discovering the answer during an
+incident.
+
+**Verified on the live cluster (`pavilion`, 2026-09-11):**
+
+```
+[1/6] Maintenance page deployment            OK
+[2/6] 503 + Retry-After, /healthz stays 200  OK
+[3/6] Auth RBAC narrowly scoped              OK
+[4/6] ON: public 503s, bypass paths answer   OK
+[5/6] OFF: routing restored intact           OK
+[6/6] State hygiene (saved config cleared)   OK
+
+PHASE 6B OK
+```
+
+Two real bugs surfaced only by running this against a live cluster (see
+"Troubleshooting" below): a stale Docker build cache silently shipped an auth
+image missing `maintenance.js`, and the gate's ACME bypass check originally
+probed `cm-acme-http-solver` live, which only exists mid-challenge and 503s
+otherwise for an unrelated reason. The gate now asserts the ACME route is
+present in Kong's applied config instead of hitting it live.
+
+### Editing the page
+
+The HTML lives in a ConfigMap, not an image:
+
+```bash
+$EDITOR k8s/platform/maintenance/page-configmap.yaml
+kubectl apply -f k8s/platform/maintenance/page-configmap.yaml
+kubectl -n platform rollout restart deployment/maintenance
+```
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `maintenance off` fails | `kubectl -n platform get cm maintenance-state -o jsonpath='{.data.saved_kong_config}'` — if empty, re-apply Kong's config by hand and restart it |
+| Stuck at 503 after `off` | Kong may still be restarting: `kubectl -n platform rollout status deploy/kong` |
+| HTTP off-switch returns 403 | The account lacks the `admin` role |
+| HTTP off-switch returns 500, or `find /app -name maintenance.js` in the auth pod comes up empty | Auth image predates Phase 6B, or `make build-push` reused a stale Docker layer for `services/auth/src` — rebuild that image with `docker build --no-cache` and `kubectl -n app rollout restart deployment/auth` |

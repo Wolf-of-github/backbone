@@ -684,9 +684,36 @@
       losing that disk loses every account, token and job record. The gate performs an ACTUAL
       restore and compares content - a backup that has never been restored is a hypothesis.
       Deliberately excludes Mongo HA and point-in-time recovery; see the plan for why.
-    - 6B Maintenance page (static 503 + maintenance CLI + ConfigMap state) - NOT PLANNED.
-      Needs rework before it can be built: its bootstrap assumed Phase 5C's notify.sh and image
-      registry, and 5C is deferred. A convenience until there are users to apologise to.
+    - 6B Maintenance page (`make phase6b`; gate: verify-phase6b.sh -> "PHASE 6B OK") - IMPLEMENTED
+      2026-09-11, VERIFIED on cluster `pavilion` 2026-09-11: `./scripts/verify-phase6b.sh
+      --i-know-this-causes-downtime` -> "PHASE 6B OK" (6/6), including the disruptive on/off cycle
+      against the live gateway. Two real bugs only surfaced by actually running it:
+        - `make build-push` reused a stale Docker layer for `services/auth/src`, so the auth image
+          it pushed was missing `routes/maintenance.js` entirely - `make build-push` reported
+          success while shipping stale code. Worked around with `docker build --no-cache`;
+          `build-push.sh` itself still has no cache-busting (open item, see README troubleshooting).
+        - The gate's ACME-bypass check curled `cm-acme-http-solver` live, which only has a real
+          upstream mid-challenge; on this cluster (TLS_MODE=selfsigned) it doesn't exist between
+          renewals, so Kong 503s on it for an unrelated reason (no upstream) and the check
+          false-failed. Fixed to assert the route is present in Kong's applied config instead of
+          probing it live.
+      The 5C dependencies were designed out rather than worked around:
+        - No built image. The page is a ConfigMap (HTML + nginx.conf) mounted into stock
+          nginx:1.25-alpine, so there is no Dockerfile, no build-push, and no registry - and
+          editing the page is `kubectl apply` instead of a rebuild.
+        - No notify.sh. Maintenance is a deliberate operator action, not an alert.
+      Design points worth keeping: the page pod runs ALWAYS (toggling is a Kong routing swap, not a
+      pod start - an image pull is the wrong thing to find broken when you need the site down); the
+      state ConfigMap stores the SAVED Kong config, so `off` restores exactly what was there rather
+      than rebuilding routes and silently dropping grafana/git; and the bypass list
+      (/api/auth/login, /internal/maintenance, ACME) is the anti-lockout guarantee that the gate
+      tests explicitly. The auth service gained an admin-role-gated POST /internal/maintenance/off
+      backed by RBAC scoped to two named ConfigMaps plus restarting Kong - the gate asserts that SA
+      cannot read secrets in app/data/platform. There is deliberately no HTTP way to turn
+      maintenance ON. Queue pausing is opt-in (--pause-queues), global via Redis so HPA-started
+      workers are covered, and lets in-flight jobs finish.
+      The gate's on/off cycle is disruptive (~60s of 503s) and skipped unless
+      --i-know-this-causes-downtime is passed; without it it prints PHASE 6B PARTIAL.
     - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
       NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
   - Cross-cutting (from commit #1, never "done")
@@ -2853,9 +2880,45 @@
 
 - Files (Phase 6 - Resilience & lifecycle)
   Format: file_name | file_path | description | depends_on[]
-  STATUS: Track A is planned in detail above (Phase 6A - Backup / Disaster Recovery) and supersedes
-  the Track A entries below where they conflict - specifically: backups go to EXTERNAL S3, not to a
-  local PVC or in-cluster MinIO (minio-statefulset.yaml and the PVC-as-destination design are
+  STATUS: Track A is IMPLEMENTED (2026-09-11). PARTIALLY VERIFIED on cluster `pavilion`:
+  `verify-phase6a.sh --no-s3` -> "PHASE 6A PARTIAL" (checks [1]-[2] pass - secret, staging PVC,
+  CronJob schedules/concurrency, and the PDB assertions including the negative one). Checks [3]-[7]
+  are UNRUN: no S3 bucket is configured, so it is NOT established that a dump can be taken,
+  uploaded, pruned, or restored. The backup guarantee is therefore unproven and the platform's data
+  is still single-copy on one disk. Do not tag `phase-6a-complete` on this.
+  The CronJobs were left installed against a placeholder bucket and will fail on schedule - suspend
+  them (`kubectl -n data patch cronjob mongo-backup -p '{"spec":{"suspend":true}}'`) or supply real
+  BACKUP_S3_* values.
+  Prior status line, for the record: not yet run against a cluster. Every Phase 6A file
+  exists with real content; all scripts pass `bash -n` and `shellcheck -S warning`; the CronJob and
+  PDB manifests parse as YAML with their templates rendered. Step 10 (a live `make phase6a`, a
+  naturally-fired scheduled run, and the manual restore drill) still needs a cluster with an S3
+  bucket configured before tagging `phase-6a-complete`.
+
+  Implementation notes / deviations:
+   - Restore Jobs use an aws-cli initContainer that fetches onto a shared emptyDir, then the
+     mongo:7.0 container restores from it. Installing the AWS CLI into the mongo image at run time
+     would need internet egress on every restore and add a minute to the one operation performed
+     under pressure.
+   - mongorestore is invoked with --nsFrom/--nsTo so a dump taken from the live database lands in
+     the scratch one. Without that rewrite mongorestore writes back to the database the dump came
+     from, silently ignoring --target - which would turn a "safe" restore into an overwrite.
+   - Redis has no safe in-place restore (no namespace to redirect into), so redis-restore.sh offers
+     `inspect` as the default path - it loads the RDB into a throwaway Redis on port 6399 and
+     reports DBSIZE and sample keys. The actual restore uses MIGRATE rather than a GET/SET loop, so
+     TTLs survive; a naive copy would turn expiring refresh tokens into permanent ones.
+   - verify-phase6a builds its kubectl --overrides with jq rather than string interpolation. The
+     mongosh expressions contain quotes and braces, and hand-rolled escaping through shell -> JSON
+     -> mongosh is exactly where Phase 5's template bugs came from.
+   - Check [2] asserts a NEGATIVE: that no PDB exists for mongodb/redis. minAvailable on a
+     1-replica workload makes the node permanently undrainable, and the failure mode (drain hangs
+     forever with no clear reason) is worth a gate.
+   - Both CronJobs verify the remote object's size against the local file BEFORE deleting the local
+     copy, so a truncated upload leaves the dump recoverable by hand.
+
+  Supersedes the older Track A entries below where they conflict - specifically: backups go to
+  EXTERNAL S3, not a local PVC or in-cluster MinIO (minio-statefulset.yaml and the
+  PVC-as-destination design are
   dropped; the PVC survives only as upload staging), and redis-persistence-patch.yaml is dropped
   because Phase 1's conf-configmap.yaml already sets AOF + RDB. Tracks B and C are NOT planned or
   built; both need rework first, since Track B's bootstrap assumed Phase 5C's notify.sh and image

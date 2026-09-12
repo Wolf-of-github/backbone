@@ -22,6 +22,10 @@ spec:
       labels:
         app: auth
     spec:
+      # Phase 6B: the maintenance off-endpoint calls the Kubernetes API with
+      # this ServiceAccount's token. Its permissions are in k8s/app/auth/rbac.yaml
+      # and are limited to two named ConfigMaps plus restarting Kong.
+      serviceAccountName: auth
       containers:
       - name: auth
         image: REGISTRY_URL/backbone-auth:latest
