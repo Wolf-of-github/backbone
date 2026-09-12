@@ -1,0 +1,89 @@
+# deployment.yaml
+# Purpose: Notes CRUD demo async worker. Consumes the "notes" BullMQ queue
+# and performs the actual MongoDB write for a note create.
+# depends_on: [services/notes-worker/Dockerfile, k8s/base/namespaces.yaml]
+#
+# Self-contained on purpose (own queue name "notes", own Deployment) rather
+# than extending Phase 4's services/worker - keeps this demo app fully
+# removable without touching the reference implementation. See
+# INSTALL_GUIDE.md's Notes CRUD demo notes for the reasoning.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-worker
+  namespace: app
+  labels:
+    app: notes-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notes-worker
+  template:
+    metadata:
+      labels:
+        app: notes-worker
+    spec:
+      containers:
+      - name: notes-worker
+        image: REGISTRY_URL/backbone-notes-worker:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: WORKER_CONCURRENCY
+          value: "5"
+        - name: MONGO_HOST
+          value: "mongodb.data.svc"
+        - name: MONGO_PORT
+          value: "27017"
+        - name: MONGO_APP_USER
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-username
+        - name: MONGO_APP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-password
+        - name: MONGO_APP_DB
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-db
+        - name: REDIS_HOST
+          value: "redis.data.svc"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-password
+              key: password
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "96Mi"
+          limits:
+            cpu: "200m"
+            memory: "192Mi"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+      terminationGracePeriodSeconds: 30

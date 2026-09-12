@@ -14,6 +14,7 @@ export KUBECONFIG
         build-push apply-app edge verify-phase2 phase2 \
         jwt-keys auth verify-phase3 phase3 \
         jobs verify-phase4 phase4 \
+        notes verify-notes notes-demo \
         tls verify-phase5a obs verify-phase5b \
         verify-phase5 phase5 \
         backup backup-now verify-phase6a phase6a \
@@ -60,6 +61,11 @@ help:
 	@echo "  make phase4                       - jobs -> verify-phase4"
 	@echo "  make jobs                         - bootstrap jobs-api + worker services"
 	@echo "  make verify-phase4                - run the Phase 4 acceptance gate"
+	@echo ""
+	@echo "  Notes CRUD demo (requires Phase 0-3 complete; not a numbered phase)"
+	@echo "  make notes-demo                   - notes -> verify-notes"
+	@echo "  make notes                        - bootstrap notes-api + notes-worker (Python/Flask/BullMQ)"
+	@echo "  make verify-notes                 - run the Notes demo acceptance gate"
 	@echo ""
 	@echo "  Phase 5 - Operate (two tracks; each has its own gate)"
 	@echo "  make phase5                       - tls -> obs -> verify-phase5"
@@ -218,6 +224,17 @@ verify-phase4: _need-kubeconfig
 
 phase4: jobs verify-phase4
 
+# --- Notes CRUD demo (not a numbered phase - a standalone test app proving
+# backbone hosts an arbitrary container on the existing gateway/database/
+# queue infra; see INSTALL_GUIDE.md) --------------------------------------
+notes: _need-kubeconfig
+	./scripts/bootstrap-notes.sh
+
+verify-notes: _need-kubeconfig
+	./scripts/verify-notes.sh
+
+notes-demo: notes verify-notes
+
 # --- Phase 5: Operate ------------------------------------------------------
 # Three tracks, gated independently. Order matters: 5B's cert-expiry alert
 # consumes 5A, and 5C is served over 5A's TLS listener.
@@ -263,7 +280,7 @@ down:
 	./scripts/cluster-down.sh
 
 lint:
-	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/setup-env.sh scripts/promote-admin.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/migrate.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance || echo "shellcheck not installed - skipping"
+	@command -v shellcheck >/dev/null && shellcheck scripts/lib.sh scripts/setup-env.sh scripts/promote-admin.sh scripts/cluster-up.sh scripts/cluster-down.sh scripts/node-join.sh scripts/create-secrets.sh scripts/verify-phase0.sh scripts/data-secrets.sh scripts/bootstrap-data.sh scripts/verify-phase1.sh scripts/build-push.sh scripts/bootstrap-edge.sh scripts/kongctl.sh scripts/verify-phase2.sh scripts/jwt-keys.sh scripts/bootstrap-auth.sh scripts/verify-phase3.sh scripts/bootstrap-jobs.sh scripts/verify-phase4.sh scripts/bootstrap-notes.sh scripts/verify-notes.sh scripts/cert-manager-install.sh scripts/bootstrap-tls.sh scripts/verify-phase5a.sh scripts/bootstrap-observability.sh scripts/verify-phase5b.sh scripts/migrate.sh scripts/verify-phase5.sh scripts/apply-app-manifests.sh scripts/backup-secrets.sh scripts/bootstrap-backup.sh scripts/backup-now.sh scripts/mongo-restore.sh scripts/redis-restore.sh scripts/verify-phase6a.sh scripts/bootstrap-maintenance.sh scripts/verify-phase6b.sh scripts/maintenance || echo "shellcheck not installed - skipping"
 	@if [ -f ./kubeconfig ]; then \
 	  kubectl apply --dry-run=server -f k8s/base/ ; \
 	  kubectl apply --dry-run=server -R -f k8s/data/ ; \

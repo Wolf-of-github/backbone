@@ -1,0 +1,6 @@
+flask==3.0.3
+pymongo==4.8.0
+redis==5.0.8
+bullmq==2.4.0
+pyjwt[crypto]==2.9.0
+gunicorn==23.0.0

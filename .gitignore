@@ -20,6 +20,10 @@ htpasswd
 # Node dependencies (every service under /services)
 node_modules/
 
+# Python bytecode cache (notes-api, notes-worker)
+__pycache__/
+*.pyc
+
 # Build / scratch output
 /build/
 /dist/

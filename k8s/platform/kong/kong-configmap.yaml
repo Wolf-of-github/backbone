@@ -43,3 +43,11 @@ data:
             paths:
               - /api/jobs
             strip_path: false
+
+      - name: notes-api-service
+        url: http://notes-api.app.svc:80
+        routes:
+          - name: notes-api-route
+            paths:
+              - /api/notes
+            strip_path: false

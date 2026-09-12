@@ -1,0 +1,97 @@
+# deployment.yaml
+# Purpose: Notes CRUD demo API Deployment (Flask). Enqueues creates via
+# BullMQ/Redis instead of writing MongoDB inline - see services/notes-api.
+# depends_on: [services/notes-api/Dockerfile, k8s/base/namespaces.yaml]
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-api
+  namespace: app
+  labels:
+    app: notes-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: notes-api
+  template:
+    metadata:
+      labels:
+        app: notes-api
+    spec:
+      containers:
+      - name: notes-api
+        image: REGISTRY_URL/backbone-notes-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: PORT
+          value: "3000"
+        - name: MONGO_HOST
+          value: "mongodb.data.svc"
+        - name: MONGO_PORT
+          value: "27017"
+        - name: MONGO_APP_USER
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-username
+        - name: MONGO_APP_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-password
+        - name: MONGO_APP_DB
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-credentials
+              key: app-db
+        - name: REDIS_HOST
+          value: "redis.data.svc"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-password
+              key: password
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "96Mi"
+          limits:
+            cpu: "200m"
+            memory: "192Mi"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        # See k8s/app/ping/deployment.yaml for why this mount is required:
+        # without it, JWT signatures are never actually verified.
+        - name: jwt-public-key
+          mountPath: /app/src/jwt-public-key.pem
+          subPath: jwt-public-key.pem
+          readOnly: true
+      volumes:
+      - name: jwt-public-key
+        secret:
+          secretName: jwt-public-key
+          items:
+          - key: public-key
+            path: jwt-public-key.pem
