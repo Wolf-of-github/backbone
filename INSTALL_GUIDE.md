@@ -574,4 +574,61 @@ ls .secrets/jwt/                            # the generated keypair (gitignored)
 
 ---
 
-*(Next: Step 7 — add async jobs with `make phase4`.)*
+## Step 7 — Add async jobs
+
+**What:** deploys **jobs-api** (enqueues background jobs, auth-protected)
+and **worker** (a separate Deployment that actually pulls jobs off Redis and
+runs them, auto-scaling 1–10 replicas via HPA). This proves the full async
+pattern: API enqueues → Redis queue (BullMQ) → worker processes → result
+written to MongoDB → API can report status. No new `.env` values needed —
+it reuses the MongoDB/Redis credentials from Step 4.
+
+**How:**
+```bash
+make phase4
+```
+This builds and pushes the `jobs-api` and `worker` images, deploys both
+(worker with its HPA), adds the `/api/jobs` route to Kong, restarts Kong,
+then runs the verification gate.
+
+**Success looks like:**
+```
+[1/7] Deployments and services       OK jobs-api (2/2) and worker (>=1 replicas) ready, HPA configured
+[2/7] End-to-end job creation        OK Job created: <job-id>
+[3/7] Job completion polling          OK Job completed successfully with correct result
+[4/7] Failing job retry               OK Failing job retried and failed as expected
+[5/7] Job ownership (IDOR prevention) OK IDOR prevention works
+[6/7] Worker resilience               OK Worker resilience verified
+[7/7] List jobs                       OK Job listing works
+
+PHASE 4 OK
+```
+
+Confirm by hand — create a job as an authenticated user and poll it:
+```bash
+ENDPOINT="http://$(hostname -I | awk '{print $1}'):30080"
+
+TOKEN=$(curl -s -X POST $ENDPOINT/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"testpass123"}' | jq -r '.accessToken')
+
+JOB_ID=$(curl -s -X POST $ENDPOINT/api/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"hello-world","data":{"name":"World"}}' | jq -r '.jobId')
+
+sleep 3
+curl $ENDPOINT/api/jobs/$JOB_ID -H "Authorization: Bearer $TOKEN"
+# status should be "completed", with a result.greeting field
+```
+
+**Want to look closer?**
+```bash
+kubectl -n app get deploy jobs-api worker      # jobs-api 2/2, worker >=1
+kubectl -n app get hpa worker-hpa              # current/target CPU, replica range
+kubectl -n app logs -l app=worker --tail=50    # job pickup/processing activity
+```
+
+---
+
+*(Next: Step 8 — TLS, observability, and beyond.)*
