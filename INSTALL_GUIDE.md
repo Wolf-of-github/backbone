@@ -122,6 +122,25 @@ kubectl get nodes        # one node, STATUS = Ready
 kubectl get ns           # platform, data, app present
 ```
 
+**Want to look closer?** If you're curious what Phase 0 actually put on the
+machine (not required to proceed — just for understanding what you now have):
+```bash
+kubectl get nodes -o wide        # the one node: role, k3s version, internal IP
+kubectl get ns                   # should show only platform, data, app
+                                  #   (plus default / kube-system / kube-public / kube-node-lease)
+                                  #   observability and ci do NOT exist yet — they're created in Phase 5
+kubectl get pods -A              # system pods only: coredns, local-path-provisioner, metrics-server
+                                  #   no application pods yet — that starts in Phase 1
+kubectl get sc                   # local-path, marked (default)
+```
+If `kubectl get ns` shows `observability` or `ci` at this point, that's stale
+state from before a namespace-manifest fix made during this install — clean
+it up with:
+```bash
+kubectl delete ns observability ci
+make base
+```
+
 > **Known hiccup (documented in README):** if `make cluster` fails with `no
 > matching resources found`, the node object just hadn't registered yet when
 > the check ran — the cluster is fine. Re-run `make base && make verify`.
@@ -138,6 +157,16 @@ kubectl get ns           # platform, data, app present
 > sed -i 's/^BACKUP_SCHEDULE_REDIS=0 4 \* \* \*/BACKUP_SCHEDULE_REDIS="0 4 * * *"/' .env
 > ```
 > then re-run `make phase0`.
+
+> **Bug found during this install:** `kubectl get ns` after a clean Phase 0
+> showed `observability` and `ci` namespaces already present — both should
+> only exist starting Phase 5, and `ci` in particular shouldn't exist at all
+> right now (Phase 5C/CI-CD was deferred by choice; see HANDOFF.md).
+> `k8s/base/namespaces.yaml` was creating all 5 namespaces unconditionally.
+> Fixed: Phase 0 now only creates `platform`/`data`/`app`; Phase 5B creates
+> its own `observability` namespace when it runs. If you already ran Phase 0
+> before this fix, clean up the extra namespaces (see "Want to look closer?"
+> above).
 
 ---
 
