@@ -3240,3 +3240,23 @@ needed: a guided setup wizard and a single unattended install command.
   with a descriptive message; see `git log master` for the exact list, or
   HANDOFF.md for the fuller per-bug writeups carried over from the install
   guide.
+
+9. Two smaller fixes, same session:
+     - The admin password promote-admin.sh generates was print-once and
+       never stored anywhere - exactly the credential this session's
+       operator then lost, requiring a manual delete-and-re-register
+       recovery. Now also written to .env as ADMIN_PASSWORD, consistent
+       with every other credential this platform generates.
+     - SECURITY: the maintenance page's public 503 HTML (this file's own
+       earlier notes above call it a "login-gated control on the
+       maintenance page") had a visible, if collapsed, "Administrator
+       access" login form calling POST /internal/maintenance/off - served
+       to EVERY anonymous visitor with no auth in front of it. Even
+       collapsed, it tells any visitor an admin role and an HTTP off-switch
+       exist, which is free reconnaissance for no operational gain (the
+       CLI, `./scripts/maintenance off`, already ends maintenance with no
+       HTTP form needed). Removed the form and its now-dead CSS from
+       k8s/platform/maintenance/page-configmap.yaml; the page is now just
+       the plain 503 message. The backend endpoint itself (POST
+       /internal/maintenance/off) is untouched and still exercised by
+       verify-phase6b.sh - only the public link to it was removed.

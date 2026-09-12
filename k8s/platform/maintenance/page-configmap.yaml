@@ -65,7 +65,6 @@ data:
         @media (prefers-color-scheme: dark) {
           body { background: #131313; color: #e8e8e8; }
           .card { background: #1c1c1c; border-color: #2e2e2e; }
-          input { background: #131313; color: #e8e8e8; border-color: #333; }
         }
         .card {
           max-width: 32rem; margin: 1.5rem; padding: 2.5rem;
@@ -74,17 +73,6 @@ data:
         h1 { margin: 0 0 .75rem; font-size: 1.5rem; letter-spacing: -.01em; }
         p  { margin: 0 0 1rem; color: #666; }
         @media (prefers-color-scheme: dark) { p { color: #999; } }
-        details { margin-top: 2rem; font-size: .875rem; }
-        summary { cursor: pointer; color: #888; }
-        form { margin-top: 1rem; display: flex; flex-direction: column; gap: .5rem; }
-        input, button {
-          padding: .55rem .7rem; font: inherit; font-size: .875rem;
-          border: 1px solid #ddd; border-radius: 6px;
-        }
-        button { background: #1a1a1a; color: #fff; border-color: #1a1a1a; cursor: pointer; }
-        button:disabled { opacity: .5; cursor: default; }
-        .msg { font-size: .8125rem; min-height: 1.2em; }
-        .err { color: #c0392b; } .okmsg { color: #27835a; }
       </style>
     </head>
     <body>
@@ -93,59 +81,18 @@ data:
         <p>We're making some changes and will be back shortly. Existing data is
            safe — this is planned work, not an outage.</p>
         <p>Please try again in a little while.</p>
-
-        <details>
-          <summary>Administrator access</summary>
-          <form id="f">
-            <input type="email" id="email" placeholder="Email" autocomplete="username" required>
-            <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
-            <button type="submit" id="btn">End maintenance</button>
-            <div class="msg" id="m"></div>
-          </form>
-        </details>
       </div>
 
-      <script>
-        // Logs in, then calls the auth service's admin-only off endpoint.
-        // Both paths are on the gateway's maintenance bypass list, so they stay
-        // reachable while everything else returns 503.
-        const f = document.getElementById('f');
-        const m = document.getElementById('m');
-        const btn = document.getElementById('btn');
-
-        f.addEventListener('submit', async (e) => {
-          e.preventDefault();
-          btn.disabled = true;
-          m.className = 'msg';
-          m.textContent = 'Working…';
-          try {
-            const login = await fetch('/api/auth/login', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                email: document.getElementById('email').value,
-                password: document.getElementById('password').value,
-              }),
-            });
-            if (!login.ok) throw new Error('Invalid credentials');
-            const { accessToken } = await login.json();
-
-            const off = await fetch('/internal/maintenance/off', {
-              method: 'POST',
-              headers: { 'Authorization': 'Bearer ' + accessToken },
-            });
-            if (off.status === 403) throw new Error('That account is not an administrator');
-            if (!off.ok) throw new Error('Could not end maintenance');
-
-            m.className = 'msg okmsg';
-            m.textContent = 'Maintenance ended. Reloading…';
-            setTimeout(() => location.reload(), 2500);
-          } catch (err) {
-            m.className = 'msg err';
-            m.textContent = err.message;
-            btn.disabled = false;
-          }
-        });
-      </script>
+      <!--
+        No admin login form here on purpose. This page is served to every
+        visitor with no auth in front of it - a visible "Administrator
+        access" control (even collapsed) tells an anonymous visitor an admin
+        role and an off-switch endpoint exist, which is free reconnaissance
+        for no real gain (the CLI - ./scripts/maintenance off - already ends
+        maintenance without needing any HTTP form). The backend endpoint
+        this used to call (POST /internal/maintenance/off, still exercised
+        by verify-phase6b.sh) is untouched - only the public link to it was
+        removed.
+      -->
     </body>
     </html>
