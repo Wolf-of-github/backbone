@@ -121,25 +121,30 @@ kubectl apply -f "$OBS_DIR/promtail/daemonset.yaml"
 #    "origin not allowed" on every datasource query with domain=localhost.
 #
 #    ROOT_URL and DOMAIN together were STILL not enough behind Kong's
-#    NodePort (a non-standard port, not :443): every API call still hard-403'd
-#    with the same "origin not allowed", confirmed via the browser's Network
-#    tab reaching Grafana's backend and being rejected there (Prometheus's own
-#    logs never saw the request). Grafana's CSRF-origin check
-#    (security.csrf_trusted_origins) validates against an explicit origin
-#    list, separate from ROOT_URL/DOMAIN - GRAFANA_ROOT_URL_ORIGIN below is
-#    the scheme+host+port with no path, which is the form that setting wants.
+#    NodePort: every API call still hard-403'd with the same "origin not
+#    allowed", confirmed via the browser's Network tab reaching Grafana's
+#    backend and being rejected there (Prometheus's own logs never saw the
+#    request). Root-caused by reading Grafana's own source
+#    (pkg/middleware/csrf/csrf.go, (*CSRF).check() at v11.2.0): the CSRF
+#    origin check parses the incoming Origin header down to its BARE
+#    HOSTNAME (scheme and port both stripped via originURL.Hostname()) and
+#    does a plain string comparison against csrf_trusted_origins - so a value
+#    of "https://<host>:<port>" (which every piece of Grafana's own docs and
+#    every other origin-shaped setting in this deployment uses) NEVER matches
+#    the bare hostname Grafana actually compares against, no matter how
+#    correct ROOT_URL/DOMAIN are. GF_SECURITY_CSRF_TRUSTED_ORIGINS must be the
+#    bare host/IP alone - GRAFANA_HOST already is exactly that form.
 # ---------------------------------------------------------------------------
 log "Applying Grafana..."
 HTTPS_PORT="$(svc_nodeport platform kong-proxy proxy-ssl 2>/dev/null || true)"
 if has_real_domain; then
   GRAFANA_HOST="$DOMAIN"
-  GRAFANA_ROOT_URL_ORIGIN="https://${GRAFANA_HOST}"
+  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}/grafana"
 else
   GRAFANA_HOST="$(public_host)"
-  GRAFANA_ROOT_URL_ORIGIN="https://${GRAFANA_HOST}:${HTTPS_PORT:-30443}"
+  GRAFANA_ROOT_URL="https://${GRAFANA_HOST}:${HTTPS_PORT:-30443}/grafana"
 fi
-GRAFANA_ROOT_URL="${GRAFANA_ROOT_URL_ORIGIN}/grafana"
-export GRAFANA_HOST GRAFANA_ROOT_URL GRAFANA_ROOT_URL_ORIGIN
+export GRAFANA_HOST GRAFANA_ROOT_URL
 
 kubectl apply -f "$OBS_DIR/grafana/configmap.yaml"
 
@@ -150,7 +155,7 @@ kubectl -n observability create configmap grafana-dashboards \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 render_template "$OBS_DIR/grafana/deployment.yaml" \
-  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL GRAFANA_HOST GRAFANA_ROOT_URL_ORIGIN'
+  "$RENDER_DIR/grafana-deployment.yaml" 'GRAFANA_ROOT_URL GRAFANA_HOST'
 kubectl apply -f "$RENDER_DIR/grafana-deployment.yaml"
 
 # ---------------------------------------------------------------------------

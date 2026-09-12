@@ -17,6 +17,15 @@
 # against DOMAIN, not just ROOT_URL - leaving it unset produced a genuine
 # "origin not allowed" on every query even with ROOT_URL fully correct.
 #
+# GF_SECURITY_CSRF_TRUSTED_ORIGINS is ALSO required, and specifically as a
+# BARE hostname/IP - no scheme, no port. Root-caused from Grafana's own
+# source (pkg/middleware/csrf/csrf.go, (*CSRF).check(), v11.2.0): it parses
+# the incoming Origin header down to originURL.Hostname() (scheme and port
+# both discarded) and does a plain string match against this list. A value
+# shaped like "https://host:port" - which is what ROOT_URL and every other
+# origin-shaped setting here use - can never match that bare hostname, so
+# setting this to anything but the bare host silently never trusts it.
+#
 # Anonymous access is off. Prometheus, Alertmanager and Loki have no public route
 # at all - reach them with kubectl port-forward.
 apiVersion: v1
@@ -73,12 +82,9 @@ spec:
           value: ${GRAFANA_HOST}
         - name: GF_SERVER_SERVE_FROM_SUB_PATH
           value: "true"
-        # ROOT_URL/DOMAIN alone were not sufficient in practice - every API call
-        # still hard-403'd with "origin not allowed" behind Kong's NodePort (a
-        # non-standard port, not :443). Grafana's newer CSRF-origin check
-        # validates against this explicit list, separately from ROOT_URL/DOMAIN.
+        # Bare host/IP, no scheme or port - see the file header comment for why.
         - name: GF_SECURITY_CSRF_TRUSTED_ORIGINS
-          value: ${GRAFANA_ROOT_URL_ORIGIN}
+          value: ${GRAFANA_HOST}
         - name: GF_AUTH_ANONYMOUS_ENABLED
           value: "false"
         - name: GF_USERS_ALLOW_SIGN_UP
