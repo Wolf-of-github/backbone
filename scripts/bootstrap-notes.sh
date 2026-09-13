@@ -68,6 +68,23 @@ log "  Pushing notes-worker..."
 docker push "$REGISTRY_URL/backbone-notes-worker:$TAG" || die "Failed to push notes-worker:$TAG"
 docker push "$REGISTRY_URL/backbone-notes-worker:latest" || die "Failed to push notes-worker:latest"
 
+# The Notes UI lives inside the existing frontend (a Notes tab added to
+# services/frontend/src, not a separate service - see the branch history
+# for why: a second SPA under a Kong sub-path breaks on its own absolute
+# asset paths). That means frontend must be rebuilt for the tab to exist at
+# all, even though frontend is otherwise a reference service this demo
+# doesn't touch. Context is the service's own directory - it's the one
+# service with no services/common dependency (see build-push.sh).
+log "  Building frontend (adds the Notes tab)..."
+docker build --no-cache \
+  -t "$REGISTRY_URL/backbone-frontend:$TAG" \
+  -t "$REGISTRY_URL/backbone-frontend:latest" \
+  services/frontend || die "Failed to build frontend image"
+
+log "  Pushing frontend..."
+docker push "$REGISTRY_URL/backbone-frontend:$TAG" || die "Failed to push frontend:$TAG"
+docker push "$REGISTRY_URL/backbone-frontend:latest" || die "Failed to push frontend:latest"
+
 # These are tracked files, temporarily mutated in place - see
 # bootstrap-jobs.sh for why the restore must be unconditional (a trap on
 # EXIT), not a manual step after the last kubectl call.
@@ -94,6 +111,10 @@ kubectl apply -f k8s/app/notes-worker/deployment.yaml || die "Failed to apply no
 log "Waiting for notes-worker rollout..."
 kubectl -n app rollout status deployment/notes-worker --timeout=120s || die "notes-worker rollout failed"
 
+log "Restarting frontend to pick up the Notes tab..."
+kubectl -n app rollout restart deployment/frontend || die "Failed to restart frontend"
+kubectl -n app rollout status deployment/frontend --timeout=120s || die "frontend rollout failed"
+
 # Manifests are restored by the EXIT trap set above, whether this script
 # succeeds or dies from here on.
 
@@ -115,9 +136,14 @@ log ""
 log "Services deployed:"
 log "  - notes-api: 2 replicas in app namespace"
 log "  - notes-worker: 1 replica in app namespace"
+log "  - frontend: rebuilt with a new 'Notes' tab"
 log ""
 log "Kong routes:"
 log "  POST/GET /api/notes - Notes CRUD demo (requires auth)"
+log ""
+log "Try it in a browser: open http://<node-ip>:30080/, log in, click the"
+log "'Notes' tab - create a note and watch it go pending -> completed as"
+log "notes-worker processes it."
 log ""
 log "Next: run scripts/verify-notes.sh, or test by hand:"
 log "  TOKEN=\$(curl -s -X POST \$ENDPOINT/api/auth/login -H 'Content-Type: application/json' -d '{\"email\":\"you@example.com\",\"password\":\"...\"}' | jq -r '.accessToken')"

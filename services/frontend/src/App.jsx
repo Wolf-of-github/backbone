@@ -5,6 +5,7 @@
 import { useState, useEffect } from 'react';
 import Login from './components/Login';
 import Register from './components/Register';
+import NotesApp from './components/NotesApp';
 
 // Helper: Fetch with auth and auto-refresh
 async function authFetch(url, options = {}) {
@@ -63,6 +64,7 @@ function App() {
   const [backendStatus, setBackendStatus] = useState('Loading...');
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('ping');
 
   // Check authentication on mount
   useEffect(() => {
@@ -185,17 +187,57 @@ function App() {
         </div>
       </div>
       <p>Authenticated React frontend with JWT tokens</p>
-      <div style={{ marginTop: '2rem', padding: '1rem', background: '#f0f0f0', borderRadius: '4px' }}>
-        {error ? (
-          <p style={{ color: 'red' }}>{error}</p>
-        ) : (
-          <p style={{ color: 'green' }}>{backendStatus}</p>
-        )}
+
+      <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1.5rem', borderBottom: '1px solid #ddd' }}>
+        <button
+          onClick={() => setActiveTab('ping')}
+          style={{
+            padding: '0.5rem 1rem',
+            background: 'none',
+            border: 'none',
+            borderBottom: activeTab === 'ping' ? '2px solid #007bff' : '2px solid transparent',
+            fontWeight: activeTab === 'ping' ? 'bold' : 'normal',
+            cursor: 'pointer'
+          }}
+        >
+          Ping
+        </button>
+        <button
+          onClick={() => setActiveTab('notes')}
+          style={{
+            padding: '0.5rem 1rem',
+            background: 'none',
+            border: 'none',
+            borderBottom: activeTab === 'notes' ? '2px solid #007bff' : '2px solid transparent',
+            fontWeight: activeTab === 'notes' ? 'bold' : 'normal',
+            cursor: 'pointer'
+          }}
+        >
+          Notes
+        </button>
       </div>
-      <p style={{ marginTop: '2rem', color: '#666', fontSize: '0.9rem' }}>
-        This page proves end-to-end authentication: Kong routes requests, auth service issues JWT tokens,
-        and backend services (like /api/ping) require valid tokens.
-      </p>
+
+      {activeTab === 'ping' && (
+        <>
+          <div style={{ marginTop: '2rem', padding: '1rem', background: '#f0f0f0', borderRadius: '4px' }}>
+            {error ? (
+              <p style={{ color: 'red' }}>{error}</p>
+            ) : (
+              <p style={{ color: 'green' }}>{backendStatus}</p>
+            )}
+          </div>
+          <p style={{ marginTop: '2rem', color: '#666', fontSize: '0.9rem' }}>
+            This page proves end-to-end authentication: Kong routes requests, auth service issues JWT tokens,
+            and backend services (like /api/ping) require valid tokens.
+          </p>
+        </>
+      )}
+
+      {activeTab === 'notes' && (
+        <div style={{ marginTop: '1.5rem' }}>
+          <NotesApp authFetch={authFetch} />
+        </div>
+      )}
     </div>
   );
 }
