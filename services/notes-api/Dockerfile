@@ -16,7 +16,12 @@ RUN addgroup --gid 1001 appgroup && \
 WORKDIR /app
 
 COPY --from=build --chown=appuser:appgroup /app/deps /app/deps
+# `pip install --target` puts importable packages at the target root but
+# console-script executables (gunicorn included) under <target>/bin/ - only
+# setting PYTHONPATH leaves that binary unreachable ("gunicorn: executable
+# file not found in $PATH").
 ENV PYTHONPATH=/app/deps
+ENV PATH=/app/deps/bin:$PATH
 
 COPY --chown=appuser:appgroup services/notes-api/src ./src
 
