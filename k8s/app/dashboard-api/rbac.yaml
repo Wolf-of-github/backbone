@@ -1,0 +1,154 @@
+# rbac.yaml
+# Purpose: Cluster read access + narrowly scoped write access for dashboard-api.
+# depends_on: [k8s/base/namespaces.yaml]
+#
+# SCOPE
+# Reads are cluster-wide and unavoidably so: a dashboard's whole job is to
+# enumerate every pod on every node, and Kubernetes does not permit
+# resourceNames on `list` or `watch` (see k8s/app/auth/rbac.yaml, which
+# documents the same constraint). Scoping therefore comes from limiting
+# RESOURCES and VERBS, not names.
+#
+# WHAT IS DELIBERATELY ABSENT
+#   secrets      - never, in any namespace. A dashboard that can read secrets
+#                  is a credential exfiltration tool, and this service is
+#                  reachable from the internet through Kong. This is the single
+#                  most important omission in the file.
+#   configmaps   - not needed for the views we render, and the Kong declarative
+#                  config and maintenance state both live in ConfigMaps that
+#                  the auth service alone is trusted to touch.
+#   create       - no verb anywhere lets this service make new workloads.
+#   exec / attach - pods/exec would turn the dashboard into a remote shell on
+#                  every container. Logs are read-only; exec is not, so it is
+#                  out until there is a reason and a separate decision.
+#
+# Writes are a SEPARATE, namespaced Role bound in three namespaces, so the
+# blast radius of the read credential and the write credential differ. Note
+# `data` is NOT among them: mongodb-0 and redis-0 are StatefulSet pods bound to
+# node-local PVCs and deleting one is a real outage. This omission is the one
+# write-side guardrail that ships now rather than being deferred (see
+# issues.txt AVAIL-2) - it costs nothing and it is the irreversible case.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dashboard-api
+  namespace: app
+---
+# --- READ (cluster-wide) -----------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dashboard-read
+rules:
+# Core objects the dashboard lists and watches.
+- apiGroups: [""]
+  resources:
+  - pods
+  - nodes
+  - namespaces
+  - events
+  - services
+  verbs: ["get", "list", "watch"]
+# Pod logs are a subresource of pods and need their own rule. These routinely
+# contain tokens and connection strings, which is why every route in this
+# service is admin-gated rather than merely authenticated.
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+# Workload controllers, for replica counts and rollout state.
+- apiGroups: ["apps"]
+  resources:
+  - deployments
+  - replicasets
+  - statefulsets
+  - daemonsets
+  verbs: ["get", "list", "watch"]
+# Live CPU/memory from metrics-server. `watch` is absent on purpose: the
+# metrics API does not support it, so asking for it would be a lie in the
+# manifest. The dashboard polls this one endpoint.
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dashboard-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dashboard-read
+subjects:
+- kind: ServiceAccount
+  name: dashboard-api
+  namespace: app
+---
+# --- WRITE (namespaced, three bindings) --------------------------------------
+# One ClusterRole definition reused by three RoleBindings. A ClusterRole bound
+# by a RoleBinding grants its rules ONLY within the binding's namespace - this
+# is the standard way to avoid maintaining three identical Role objects, and it
+# does not grant anything cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dashboard-write
+rules:
+# Delete a pod. There is no `create`: deleting a Deployment-managed pod makes
+# the ReplicaSet create its replacement, which is the intended mechanism.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+# Rollout restart = patching the pod template's restartedAt annotation, which
+# is exactly what `kubectl rollout restart` does.
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "patch"]
+# Scale is its own subresource.
+- apiGroups: ["apps"]
+  resources: ["deployments/scale"]
+  verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dashboard-write
+  namespace: app
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dashboard-write
+subjects:
+- kind: ServiceAccount
+  name: dashboard-api
+  namespace: app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dashboard-write
+  namespace: platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dashboard-write
+subjects:
+# The pod lives in `app`; the grant applies in `platform`. A RoleBinding in the
+# target namespace referencing a ServiceAccount from another is the correct way
+# to cross that boundary - same pattern as k8s/app/auth/rbac.yaml.
+- kind: ServiceAccount
+  name: dashboard-api
+  namespace: app
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dashboard-write
+  namespace: observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dashboard-write
+subjects:
+- kind: ServiceAccount
+  name: dashboard-api
+  namespace: app

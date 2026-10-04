@@ -33,6 +33,26 @@ SECURITY
               signal). The blast radius is every service importing the shared
               module, and it grows the moment a service can do more than read:
               Phase 7's dashboard-api can delete pods and scale deployments.
+
+              CONFIRMED LIVE 2026-10-04, worse than first written. The fallback
+              is not a rare edge case - it is the ONLY path in production:
+                - authContext.js looks for the key at `../jwt-public-key.pem`
+                  relative to its own directory. Nothing mounts a file at that
+                  path. The real key is at /secrets/jwt/public-key (secret
+                  `jwt-keypair`), which is where services/auth/src/passport.js
+                  correctly reads it from.
+                - Only k8s/app/auth/deployment.yaml mounts jwt-keypair at all.
+                  jobs-api and ping mount no JWT key whatsoever.
+              So every service importing authContext - ping and jobs-api today -
+              is verifying nothing and trusting Kong. Whether Kong actually
+              verifies RS256 JWTs on those routes is UNCONFIRMED; if it does
+              not, any self-signed token with roles:['admin'] is currently
+              accepted platform-wide.
+    Also:     Fix the path, not just the fallback. Pointing authContext.js at
+              /secrets/jwt/public-key and mounting jwt-keypair into jobs-api and
+              ping would make local verification actually happen - at which
+              point the fallback stops being load-bearing and can be removed
+              safely.
     Fix:      Decide whether the fallback should exist at all. Options:
               (a) remove it - require the key in every service, fail closed;
               (b) keep it but make it opt-in per service via an explicit env
