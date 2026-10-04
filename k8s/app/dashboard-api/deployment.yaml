@@ -1,0 +1,96 @@
+# deployment.yaml
+# Purpose: dashboard-api Deployment (Phase 7)
+# depends_on: [services/dashboard-api/Dockerfile, k8s/app/dashboard-api/rbac.yaml,
+#              secret jwt-keypair (scripts/jwt-keys.sh)]
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dashboard-api
+  namespace: app
+  labels:
+    app: dashboard-api
+spec:
+  # One replica deliberately. A dashboard is not on the serving path, and each
+  # replica opens its own set of Kubernetes watches - two replicas means twice
+  # the API-server watch load for a tool with one user. It also keeps SSE
+  # simple: with >1 replica and no sticky routing, a browser's /snapshot and
+  # /stream could land on different pods, and the stream would resume from a
+  # resourceVersion the other pod never listed.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dashboard-api
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+      labels:
+        app: dashboard-api
+    spec:
+      # This is what grants the pod its cluster read access; without it the pod
+      # gets the namespace `default` ServiceAccount and every list 403s.
+      serviceAccountName: dashboard-api
+      containers:
+      - name: dashboard-api
+        image: ${REGISTRY_URL}/backbone-dashboard-api:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: PORT
+          value: "3000"
+        volumeMounts:
+        # The JWT public key. src/auth.js THROWS at module load if this is
+        # absent, so a missing mount produces CrashLoopBackOff rather than an
+        # admin API that verifies nothing - see issues.txt SEC-1.
+        - name: jwt-keys
+          mountPath: /secrets/jwt
+          readOnly: true
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          # /healthz returns 503 until at least one watch is established, so
+          # readiness also covers "running but blind to the cluster".
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          requests:
+            # Higher than ping/jobs-api: the watch layer holds the trimmed
+            # state of every pod, node and deployment in memory, plus one
+            # listener set per connected browser.
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+      volumes:
+      - name: jwt-keys
+        secret:
+          # Same secret the auth service mounts. Only the public key is read
+          # here; `items` restricts the projection so the PRIVATE key is never
+          # present in this container's filesystem at all - a dashboard has no
+          # business being able to mint tokens.
+          secretName: jwt-keypair
+          items:
+          - key: public-key
+            path: public-key
+      # SSE streams are long-lived, and shutdown stops the watches first so
+      # those responses can finish. 30s is ample for that; the default 30 is
+      # stated explicitly because the correct value here is a decision, not a
+      # default.
+      terminationGracePeriodSeconds: 30

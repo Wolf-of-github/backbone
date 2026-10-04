@@ -177,9 +177,14 @@ router.post('/deployments/:namespace/:name/restart', async (req, res) => {
     res.json({
       status: 'ok',
       replicas,
-      note: replicas < 2
-        ? 'Only one replica - expect a brief outage while it is replaced.'
-        : 'Rolling restart; a replica stays up throughout.',
+      // Zero is its own case: restarting a scaled-to-zero Deployment changes
+      // the template but starts nothing, so reporting "brief outage" would be
+      // wrong in both directions - there is nothing running to interrupt.
+      note: replicas === 0
+        ? 'Deployment is scaled to zero - the template was updated but no pods will start.'
+        : replicas === 1
+          ? 'Only one replica - expect a brief outage while it is replaced.'
+          : 'Rolling restart; a replica stays up throughout.',
     });
   } catch (err) {
     audit(req, 'restart', target, { result: 'error', error: err.message });

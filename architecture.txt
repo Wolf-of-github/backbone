@@ -726,7 +726,28 @@
     - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
       NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
   - Phase 7 - Cluster dashboard  (`make phase7`; gate: verify-phase7.sh -> "PHASE 7 OK")
-    - PLANNED 2026-10-04, not yet implemented. A first-party admin-only web dashboard for live
+    - IMPLEMENTED 2026-10-04 on branch `phase-7-dashboard`. NOT YET RUN AGAINST A CLUSTER - every
+      file exists with real content, all JS passes `node --check`, the frontend passes `vite build`,
+      both scripts pass shellcheck, and all manifests parse. What has actually been PROVEN is
+      everything testable off-cluster, against a mock Kubernetes API server and a real RSA keypair:
+        - the auth gate, 10/10 cases including alg:none, HS256 alg-confusion (the public key used
+          as an HMAC secret), a token signed by a different RSA key, and expiry;
+        - fail-closed boot, 4/4: missing key, empty file, non-PEM content all refuse to start,
+          and a valid key loads;
+        - the watch layer's two hard paths: a 410 forces a re-LIST with a fresh resourceVersion,
+          and a normal stream close resumes from the last-seen version WITHOUT re-listing;
+        - the live SSE path end to end - a scale issued through the API arrived as a MODIFIED
+          event on a connected stream (this is gate check [5], the one that separates a working
+          dashboard from one that renders once and silently goes stale);
+        - all three write actions, their 400/403/404 paths, and the audit log recording
+          from/to on a scale;
+        - log streaming, including the refusal to guess a container on a multi-container pod;
+        - no SSE listener leak across 15 connect/disconnect cycles.
+      UNPROVEN until it runs on the cluster: RBAC (the `kubectl auth can-i` negatives in gate
+      check [2]), the Kong route and its SSE timeouts, the image build, and multi-node (see
+      issues.txt UNVER-1 - the cluster is single-node, so Phase 7's cross-node criterion cannot
+      be met as things stand).
+    - Originally PLANNED 2026-10-04. A first-party admin-only web dashboard for live
       cluster state (nodes, pods, deployments, events, usage) plus three write actions (delete
       pod, scale, rollout restart). New `dashboard-api` service in `app` + views in the existing
       React frontend, routed at /api/cluster.

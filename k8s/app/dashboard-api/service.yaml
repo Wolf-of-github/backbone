@@ -1,0 +1,21 @@
+# service.yaml
+# Purpose: ClusterIP Service fronting dashboard-api, reached by Kong at
+#          http://dashboard-api.app.svc
+# depends_on: [k8s/app/dashboard-api/deployment.yaml]
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: dashboard-api
+  namespace: app
+  labels:
+    app: dashboard-api
+spec:
+  type: ClusterIP
+  selector:
+    app: dashboard-api
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP

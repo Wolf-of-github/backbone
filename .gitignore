@@ -23,6 +23,9 @@ node_modules/
 # Build / scratch output
 /build/
 /dist/
+# Vite build output. The leading-slash patterns above only match the repo root,
+# so a `vite build` in services/frontend was not covered.
+services/*/dist/
 *.tmp
 *.log
 

@@ -35,7 +35,9 @@ need kubectl
 
 REGISTRY="$(registry_prefix)"
 
-ALL_SERVICES=(ping frontend auth jobs-api worker)
+# Duplicated in scripts/build-push.sh - add new services to BOTH, the failure
+# is silent. See issues.txt BUILD-2.
+ALL_SERVICES=(ping frontend auth jobs-api worker dashboard-api)
 if [ "$#" -gt 0 ]; then
   SERVICES=("$@")
 else

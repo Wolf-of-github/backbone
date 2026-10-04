@@ -5,6 +5,7 @@
 import { useState, useEffect } from 'react';
 import Login from './components/Login';
 import Register from './components/Register';
+import ClusterView from './components/cluster/ClusterView';
 
 // Helper: Fetch with auth and auto-refresh
 async function authFetch(url, options = {}) {
@@ -63,6 +64,13 @@ function App() {
   const [backendStatus, setBackendStatus] = useState('Loading...');
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [showCluster, setShowCluster] = useState(false);
+
+  // Roles come from /api/auth/me, not from decoding the token client-side:
+  // a browser cannot verify a signature, so anything read out of the token
+  // locally is an unauthenticated claim. It only drives whether the button
+  // renders - dashboard-api enforces the role itself on every request.
+  const isAdmin = !!(user && (user.roles || []).includes('admin'));
 
   // Check authentication on mount
   useEffect(() => {
@@ -192,6 +200,27 @@ function App() {
           <p style={{ color: 'green' }}>{backendStatus}</p>
         )}
       </div>
+
+      {/* Phase 7: the cluster dashboard, admin-only.
+          Hidden for non-admins rather than shown-and-failing: dashboard-api
+          returns 403 to them regardless, so rendering a view that can only
+          error is noise. The real gate is server-side - this is presentation
+          only, and hiding a button is never the security boundary. */}
+      {isAdmin && (
+        <div style={{ marginTop: '2rem' }}>
+          <button
+            onClick={() => setShowCluster((v) => !v)}
+            style={{
+              padding: '0.4rem 0.9rem', fontSize: '0.85rem', cursor: 'pointer',
+              marginBottom: showCluster ? '1rem' : 0,
+            }}
+          >
+            {showCluster ? 'Hide' : 'Show'} cluster dashboard
+          </button>
+          {showCluster && <ClusterView authFetch={authFetch} />}
+        </div>
+      )}
+
       <p style={{ marginTop: '2rem', color: '#666', fontSize: '0.9rem' }}>
         This page proves end-to-end authentication: Kong routes requests, auth service issues JWT tokens,
         and backend services (like /api/ping) require valid tokens.

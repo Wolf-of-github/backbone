@@ -24,7 +24,11 @@ GIT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "dev")
 
 # Every service with a Dockerfile. jobs-api and worker arrived in Phase 4 but
 # were never added here, so `make build-push` silently skipped them.
-ALL_SERVICES=(ping frontend auth jobs-api worker)
+# dashboard-api added in Phase 7. NOTE this list is duplicated in
+# scripts/apply-app-manifests.sh and a new service must be added to BOTH - the
+# failure is silent (the service simply never builds or deploys, with no
+# error). See issues.txt BUILD-2.
+ALL_SERVICES=(ping frontend auth jobs-api worker dashboard-api)
 
 if [ "$#" -gt 0 ]; then
   SERVICES=("$@")

@@ -75,10 +75,15 @@ SECURITY
     Fix:      Use fetch() + ReadableStream for the SSE stream instead of
               EventSource - it accepts headers normally. Costs a hand-rolled
               reconnect (EventSource reconnects for free), which is the only
-              reason the query-param route is tempting. Decided in favour of
-              fetch-streaming in the plan; revisit only if reconnect logic
-              proves painful.
-    Status:   OPEN (design decision recorded, not yet implemented)
+              reason the query-param route is tempting.
+    Fixed:    2026-10-04. Both SSE consumers use fetch() + ReadableStream with
+              an Authorization header - useClusterStream.js for the cluster
+              stream and LogViewer.jsx for log tailing. No token ever appears
+              in a URL, so none reaches Kong's access logs or Loki. The
+              hand-rolled reconnect is in useClusterStream.js (exponential
+              backoff capped at 30s, and it does NOT retry a 403, which a
+              non-admin would otherwise loop on forever).
+    Status:   FIXED (2026-10-04) - avoided by design rather than mitigated.
 
 -------------------------------------------------------------------------------
 AVAILABILITY / CORRECTNESS
@@ -111,15 +116,25 @@ AVAILABILITY / CORRECTNESS
               only route to the dashboard that issued the command - recovery is
               CLI-only (`kubectl -n platform scale deploy/kong --replicas=2`).
               Scaling auth to 0 breaks the admin login the dashboard depends
-              on, with the same outcome. Also unguarded: the `data` namespace is
-              reachable, so deleting mongodb-0 or redis-0 is possible and those
-              are StatefulSet pods bound to node-local PVCs; and there is no
-              replica ceiling, so a mistyped 500 schedules until the node
-              fills.
-    Fix:      Namespace allowlist (app / platform / observability only), a
-              replica cap, and refuse to scale kong or auth below 1.
-    Status:   DEFERRED BY CHOICE (2026-10-04) - accepted for a single-operator
-              tool; close before anyone else uses it.
+              on, with the same outcome. There is also no replica ceiling, so a
+              mistyped 500 schedules until the node fills.
+    Update:   2026-10-04, at implementation. The `data` namespace concern named
+              in the original entry is CLOSED, by RBAC rather than by code:
+              k8s/app/dashboard-api/rbac.yaml binds the write ClusterRole in
+              app / platform / observability only, so a delete against ns data
+              is refused by the API server with 403 regardless of what the
+              service asks for. That guardrail shipped because deleting
+              mongodb-0 is irreversible in a way nothing else here is, and
+              omitting a RoleBinding costs nothing. verify-phase7.sh check [2]
+              asserts it, and check [6] asserts the 403 over HTTP.
+              Still open, as decided: scale-to-zero on kong/auth/frontend is
+              permitted. The UI confirm dialog names the lockout and gives the
+              exact kubectl recovery command, but nothing blocks it.
+    Fix:      A replica cap, and refuse to scale kong or auth below 1. (The
+              namespace allowlist is already effectively enforced by RBAC.)
+    Status:   PARTIALLY CLOSED (2026-10-04) - ns data refused by RBAC; the
+              scale-to-zero lockout remains DEFERRED BY CHOICE. Close the rest
+              before anyone else uses it.
 
 [AVAIL-3] MEDIUM | cluster / docs | A deleted node leaves ghost pods and
         noisy 502s until the node object is removed
@@ -282,3 +297,61 @@ UNVERIFIED CLAIMS
               groups need rules in BOTH directions - see the 2026-09-12 session
               notes in architecture.txt, item 8.
     Status:   OPEN
+
+-------------------------------------------------------------------------------
+PHASE 7 FOLLOW-UPS (added 2026-10-04 during implementation)
+-------------------------------------------------------------------------------
+
+[P7-1] MEDIUM | services/frontend | The dashboard is bolted onto App.jsx with a
+        toggle button, not routed
+    Found:    2026-10-04, wiring ClusterView into the existing app.
+    Detail:   There is no router in this frontend (no react-router, no history
+              handling), so the dashboard is a conditionally rendered block
+              behind a "Show cluster dashboard" button. Consequences: no
+              deep-link to the dashboard, no browser back/forward, and the
+              toggle state is lost on refresh. Fine for one operator; wrong if
+              this grows a second view.
+    Fix:      Add react-router and give the dashboard its own path (/cluster),
+              gated on the admin role.
+    Status:   OPEN
+
+[P7-2] LOW | services/dashboard-api | One WatchManager is shared process-wide,
+        which pins the Deployment to one replica
+    Found:    2026-10-04, by design, recorded so the constraint is visible.
+    Detail:   The manager is a module-level singleton and the Deployment is
+              replicas: 1. That is deliberate (N replicas = N times the watch
+              load on the API server, for a single-user tool), but it also
+              means scaling dashboard-api above 1 would break the client
+              contract: with no sticky routing a browser's /snapshot and
+              /stream can land on different pods, and the stream would resume
+              from a resourceVersion the other pod never listed.
+    Fix:      Leave at 1. If HA is ever wanted, the stream needs sticky
+              sessions or the snapshot's resourceVersion passed to /stream as
+              a parameter so any pod can resume from it.
+    Status:   OPEN (accepted constraint, documented)
+
+[P7-3] MEDIUM | k8s/app/dashboard-api | Pod logs are readable cluster-wide,
+        including from the `data` namespace
+    Found:    2026-10-04, reviewing the read ClusterRole.
+    Detail:   `pods/log` is granted cluster-wide because the dashboard lists
+              pods cluster-wide, and Kubernetes does not allow resourceNames on
+              list/watch. So an admin can read mongodb-0's and redis-0's logs
+              through the dashboard. Those logs can contain query contents and
+              connection details. This is strictly less exposure than reading
+              the secrets themselves (which is refused), and the route is
+              admin-only, but it is more than the dashboard needs.
+    Fix:      If tightened: drop pods/log from the ClusterRole and grant it via
+              namespaced Roles in app/platform/observability only, matching how
+              the write grants are already scoped. Costs the ability to read
+              datastore logs from the dashboard.
+    Status:   OPEN
+
+[P7-4] LOW | .gitignore | Only root-level /dist/ was ignored, so a frontend
+        build left untracked output
+    Found:    2026-10-04, after running `vite build` in services/frontend.
+    Detail:   .gitignore had `/dist/` and `/build/`, whose leading slash
+              anchors them to the repo root. services/frontend/dist/ was
+              therefore untracked-but-not-ignored and showed up in
+              `git status`, one `git add -A` away from being committed.
+    Fix:      FIXED 2026-10-04 - added `services/*/dist/`.
+    Status:   FIXED (2026-10-04)

@@ -1,6 +1,14 @@
 # kong-configmap.yaml
 # Purpose: Kong declarative config (kong.yaml)
 # depends_on: [k8s/base/namespaces.yaml]
+#
+# CAUTION - MAINTENANCE MODE OVERWRITES THIS WHOLESALE
+# `scripts/maintenance on` saves this entire ConfigMap into the
+# maintenance-state ConfigMap, and `maintenance off` restores that saved copy
+# verbatim. A route added here WHILE MAINTENANCE IS ON is therefore discarded
+# the moment maintenance ends: the apply succeeds, Kong reloads, and the route
+# silently disappears later for no locally visible reason. Always edit this
+# with maintenance OFF. See issues.txt BUILD-3.
 
 apiVersion: v1
 kind: ConfigMap
@@ -42,4 +50,30 @@ data:
           - name: jobs-api-route
             paths:
               - /api/jobs
+            strip_path: false
+
+      # Phase 7 - cluster dashboard. Two routes rather than one, because the
+      # SSE endpoints need a read timeout measured in hours while the regular
+      # JSON endpoints should fail fast like every other service here.
+      - name: dashboard-api-service
+        url: http://dashboard-api.app.svc:80
+        # Kong's default read_timeout is 60s. An SSE stream is deliberately
+        # idle between cluster events, so with the default the gateway closes
+        # it every minute: the UI appears to work, then stops updating, and the
+        # browser's reconnect masks it as intermittent slowness. The service
+        # also sends a 15s heartbeat, which keeps the connection active - both
+        # halves are needed, since the heartbeat alone cannot survive a
+        # timeout shorter than its interval.
+        read_timeout: 3600000
+        write_timeout: 3600000
+        connect_timeout: 5000
+        routes:
+          - name: dashboard-stream-route
+            paths:
+              - /api/cluster/stream
+              - /api/cluster/logs
+            strip_path: false
+          - name: dashboard-api-route
+            paths:
+              - /api/cluster
             strip_path: false
