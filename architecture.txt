@@ -725,6 +725,19 @@
       --i-know-this-causes-downtime is passed; without it it prints PHASE 6B PARTIAL.
     - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
       NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
+  - Phase 7 - Cluster dashboard  (`make phase7`; gate: verify-phase7.sh -> "PHASE 7 OK")
+    - PLANNED 2026-10-04, not yet implemented. A first-party admin-only web dashboard for live
+      cluster state (nodes, pods, deployments, events, usage) plus three write actions (delete
+      pod, scale, rollout restart). New `dashboard-api` service in `app` + views in the existing
+      React frontend, routed at /api/cluster.
+    - Built on Kubernetes WATCHES streamed to the browser over SSE, not polling - that is the
+      point of the exercise. Reuses Phase 3's requireRole('admin') rather than adding a second
+      credential, and must fail closed if the JWT public key is missing.
+    - Complements Phase 5B rather than replacing it: Grafana answers "what has been happening",
+      this answers "what is true right now".
+    - Write-side guardrails DEFERRED BY CHOICE - scale-to-zero is permitted, and scaling kong to
+      zero will take down the gateway and the dashboard with it. See the Phase 7 plan for the
+      full hazard list and the planned closure.
   - Cross-cutting (from commit #1, never "done")
     - Security guidelines: enable security-guidance plugin + CI checks (secret scanning,
       no exec(), parameterized queries) as soon as a repo exists
@@ -3096,6 +3109,218 @@
           a test Deployment schedules pods onto them; `make workers-destroy` -> nodes gone from `kubectl get nodes` and instances terminated.
       | depends_on: [bootstrap-dr.sh, bootstrap-maintenance.sh, makefile-workers]
 
+  - Phase 7 - Cluster dashboard: develop from 0 -> 100 (instantiate every file, then code it, then verify)
+    - Scope: a first-party, admin-only web dashboard showing LIVE cluster state (nodes, pods,
+      deployments, events, resource usage) across every machine, plus three write actions
+      (delete pod, scale deployment, rollout restart). A new `dashboard-api` service in the `app`
+      namespace talks to the Kubernetes API with its own ServiceAccount; the existing React
+      frontend grows the UI. Routed through Kong at /api/cluster like every other service.
+    - Why build this rather than adopt k9s / Headlamp / the Grafana stack: this is a learning
+      project and the Kubernetes watch API is the thing worth learning. The off-the-shelf options
+      were surveyed first (2026-10-04) and all three would work - the official Kubernetes
+      Dashboard is NOT among them, it was archived in January 2026 and SIG UI now points to
+      Headlamp. Recorded so the decision is visible as a choice, not an oversight.
+    - Relationship to Phase 5B: this does NOT replace the PLG stack. Prometheus/Loki/Grafana
+      answer "what has been happening" (time series, trends, alerts); this dashboard answers
+      "what is true right now" (live object state). Different shapes, both wanted. The dashboard
+      reads CPU/memory from metrics-server, not from Prometheus.
+
+    - Runtime decision: SSE (Server-Sent Events), not WebSockets, for the live stream. The data
+      flows one way (cluster -> browser), EventSource reconnects on its own, and SSE needs no
+      Kong protocol-upgrade config. Requires `proxy_buffering off` equivalent on the Kong route
+      so events are not held in a buffer.
+    - Runtime decision: Kubernetes WATCHES, not polling. A watch is a long-lived HTTP stream of
+      ADDED / MODIFIED / DELETED events from the API server - the same mechanism k9s and Headlamp
+      use. The real engineering is in the failure modes, which polling hides:
+        - A watch expires on its own after a few minutes; it must be re-established from the last
+          `resourceVersion` seen, not from scratch.
+        - HTTP 410 Gone means that resourceVersion has aged out of the API server's history
+          window. The ONLY correct response is to re-LIST (full snapshot) and start a fresh watch
+          from the list's resourceVersion. Retrying the watch with the same version loops forever.
+        - Events can arrive out of order relative to a concurrent list, so the snapshot's
+          resourceVersion is the authoritative starting point for the watch that follows it.
+      The browser therefore gets: one /snapshot (full state) -> /stream (deltas applied to it).
+
+    - SECURITY MODEL (the part that matters most - this service can delete things)
+      - Auth: every /api/cluster/* route is gated on `requireRole('admin')` from
+        services/common/authContext.js - the same gate as POST /internal/maintenance/off. There
+        is deliberately NO separate dashboard password: a second credential would be a parallel
+        auth system with no rotation, no expiry, and no identity in the audit log, and it would
+        bypass the RS256/bcrypt/refresh-rotation machinery Phase 3 already provides. The
+        "password" is the operator's admin account (ADMIN_PASSWORD in .env, created by
+        promote-admin.sh).
+      - FAIL CLOSED on the JWT public key. authContext.js currently falls back to `jwt.decode()`
+        WITHOUT signature verification when services/jwt-public-key.pem is absent, trusting Kong
+        to have verified upstream. That fallback is acceptable for read-only /api/ping; it is NOT
+        acceptable here, because a forged token claiming roles:['admin'] would then be honoured
+        and could delete pods. dashboard-api MUST assert the public key is present at boot and
+        exit non-zero if it is not. This is the single most important line in the service.
+      - RBAC: reads need `get/list/watch` cluster-wide (a ClusterRole - note that Kubernetes does
+        not permit resourceNames on list/watch, as k8s/app/auth/rbac.yaml already documents, so
+        scoping comes from limiting RESOURCES and VERBS, not names). Writes are a separate,
+        namespaced Role. NO access to secrets in any namespace, ever - a dashboard that can read
+        secrets is a credential exfiltration tool.
+      - Audit: every write action logs structured JSON including `actor: req.user.email`, matching
+        the pattern in services/auth/src/routes/maintenance.js.
+      - Pod logs are themselves sensitive (tokens, connection strings routinely appear in them).
+        The admin gate is what protects them; this is why the dashboard is not merely requireAuth.
+
+    - DEFERRED BY CHOICE (2026-10-04): write-side validation. The operator's explicit decision was
+      to allow scale-to-zero and ship with a brief UI confirmation only, deferring guardrails.
+      Known hazards accepted for now, to be closed before this is used by anyone else:
+        - SCALING kong TO ZERO TAKES DOWN THE GATEWAY, which includes the dashboard that did it.
+          Recovery is CLI-only: `kubectl -n platform scale deploy/kong --replicas=2`. Same for
+          scaling `auth` to zero, which breaks the admin login the dashboard depends on.
+        - No namespace allowlist, so `data` is reachable: deleting mongodb-0 or redis-0 is a real
+          outage, and those are StatefulSet pods bound to node-local PVCs.
+        - No replica ceiling, so a fat-fingered 500 schedules until the node fills.
+      Planned closure: namespace allowlist (app / platform / observability only), a replica cap,
+      and a refusal to scale kong or auth below 1.
+
+    - Step 0 - Repo skeleton (instantiate only)
+      - New directories: /services/dashboard-api/src/routes, /k8s/app/dashboard-api,
+        /services/frontend/src/components/cluster
+      - Instantiate headered stubs:
+        /services/dashboard-api/{package.json,Dockerfile},
+        /services/dashboard-api/src/index.js,
+        /services/dashboard-api/src/k8s.js            (API client + watch manager)
+        /services/dashboard-api/src/routes/{read.js,actions.js,logs.js},
+        /k8s/app/dashboard-api/{deployment.yaml,service.yaml,rbac.yaml},
+        /services/frontend/src/components/cluster/{ClusterView.jsx,PodList.jsx,NodeList.jsx,
+          DeploymentList.jsx,LogViewer.jsx,useClusterStream.js},
+        /scripts/verify-phase7.sh
+      - `chmod +x scripts/verify-phase7.sh`.
+
+    - Step 1 - RBAC (k8s/app/dashboard-api/rbac.yaml)
+      - ServiceAccount `dashboard-api` in ns app.
+      - ClusterRole `dashboard-read`: get/list/watch on
+          ""           -> pods, pods/log, nodes, namespaces, events, services
+          apps         -> deployments, replicasets, statefulsets, daemonsets
+          metrics.k8s.io -> pods, nodes          (metrics-server; read usage)
+        and NOTHING else. Explicitly no `secrets`, no `configmaps`.
+      - Role `dashboard-write` (ns app, platform, observability - one Role + RoleBinding each):
+          ""     -> pods          verbs: delete
+          apps   -> deployments   verbs: get, patch          (scale + rollout restart)
+          apps   -> deployments/scale verbs: get, update, patch
+      - ClusterRoleBinding for the read ClusterRole; one RoleBinding per write namespace.
+      - Verify: `kubectl auth can-i --as=system:serviceaccount:app:dashboard-api` -
+        `list pods -A` yes; `get secrets -n data` NO; `delete pods -n data` NO (no Role there).
+
+    - Step 2 - Kubernetes client + watch manager (services/dashboard-api/src/k8s.js)
+      - Use @kubernetes/client-node (`loadFromCluster()` picks up the SA token + CA automatically,
+        the same credentials maintenance.js reads by hand). Unlike maintenance.js's two hand-rolled
+        https calls, this service needs lists, watches, logs and patches - the client library earns
+        its dependency here.
+      - `snapshot()`: parallel LIST of nodes/pods/deployments/events; returns the objects plus the
+        highest resourceVersion seen, trimmed to the fields the UI needs (name, ns, node, phase,
+        ready, restarts, age, images, replicas). Trimming matters: a full pod object is ~15KB and
+        the browser needs ~300 bytes of it.
+      - `WatchManager`: one watch per resource type, each with its own resourceVersion; emits
+        normalized {type, kind, object} events. Handles expiry by re-watching, and 410 Gone by
+        re-listing (see the runtime decision above). Backoff on connection errors so a flapping
+        API server is not hammered.
+      - Verify: unit-level - kill a watch, confirm it re-establishes; feed a 410, confirm a
+        re-list happens rather than a retry loop.
+
+    - Step 3 - Read routes (services/dashboard-api/src/routes/read.js)
+      - `GET /api/cluster/snapshot`   -> the trimmed full state + resourceVersion.
+      - `GET /api/cluster/stream`     -> SSE. On connect, subscribes to WatchManager and forwards
+        normalized events. Sends a comment heartbeat (`:ping`) every 15s so idle connections are
+        not reaped by Kong. Cleans up its subscription on client disconnect (an SSE leak is the
+        classic bug here - every reconnect adds a listener and memory climbs).
+      - `GET /api/cluster/metrics`    -> metrics-server usage for pods + nodes, so the UI can show
+        live CPU/memory. Degrades to nulls (not a 500) if metrics-server is unavailable.
+      - All three behind requireRole('admin').
+
+    - Step 4 - Log streaming (services/dashboard-api/src/routes/logs.js)
+      - `GET /api/cluster/logs/:ns/:pod?container=&tail=200` -> SSE. Uses the client's `Log` API
+        with follow:true, piping lines through as they arrive; aborts the upstream request when
+        the browser disconnects.
+      - Multi-container pods: `container` is required when the pod has more than one, mirroring
+        kubectl's behaviour rather than silently picking the first.
+
+    - Step 5 - Write actions (services/dashboard-api/src/routes/actions.js)
+      - `DELETE /api/cluster/pods/:ns/:name`                  -> delete the pod.
+      - `POST   /api/cluster/deployments/:ns/:name/scale`     -> body {replicas}; 0 IS ALLOWED
+        (operator's decision - see DEFERRED BY CHOICE above).
+      - `POST   /api/cluster/deployments/:ns/:name/restart`   -> patch the pod-template
+        `kubectl.kubernetes.io/restartedAt` annotation, which is exactly what `kubectl rollout
+        restart` does (maintenance.js already does this to Kong).
+      - Each returns the resulting object state and logs {actor, action, target, result}.
+      - requireRole('admin') on all three.
+
+    - Step 6 - Container + manifests
+      - package.json: express, @kubernetes/client-node, jsonwebtoken, prom-client.
+      - Dockerfile: multi-stage node:20-alpine, non-root 1001 appuser, COPY services/common into
+        ./src/common, HEALTHCHECK on /healthz - identical in shape to services/jobs-api/Dockerfile.
+        Build context is the REPO ROOT (it copies services/common), as the Phase 3 build-context
+        bug already taught us.
+      - deployment.yaml: 1 replica (a dashboard is not on the critical path), the
+        prometheus.io/scrape pod-template annotations per docs/metrics-scraping.md,
+        `serviceAccountName: dashboard-api`, readiness/liveness on /healthz, requests
+        100m/128Mi - watches hold more memory than a request/response service.
+      - service.yaml: ClusterIP :80 -> 3000, named `dashboard-api` so Kong reaches it at
+        http://dashboard-api.app.svc.
+      - Add `dashboard-api` to ALL_SERVICES in BOTH scripts/build-push.sh and
+        scripts/apply-app-manifests.sh - those lists are hardcoded and a new service is invisible
+        to the build until it is added to both.
+
+    - Step 7 - Kong route (k8s/platform/kong/kong-configmap.yaml)
+      - New service `dashboard-api-service` -> http://dashboard-api.app.svc:80, route
+        `/api/cluster`, strip_path false (matching every other route here).
+      - The SSE routes need response buffering off and a long read timeout (the stream is
+        deliberately never-ending); set read_timeout high on this service.
+      - CAUTION: maintenance mode saves and restores this ConfigMap wholesale. Adding a route
+        while maintenance is ON would be reverted by `maintenance off` restoring the saved copy.
+        Apply this with maintenance off.
+
+    - Step 8 - Frontend (services/frontend/src/components/cluster/*)
+      - `useClusterStream.js`: fetches /snapshot, opens an EventSource on /stream, applies
+        ADDED/MODIFIED/DELETED to local state. Re-snapshots on a stream error rather than trusting
+        partial state. NOTE: EventSource cannot set an Authorization header - so either the stream
+        route accepts the token as a query param (and Kong must not log it) or the app uses
+        fetch + ReadableStream instead. Decide in implementation; fetch-streaming is the safer of
+        the two and avoids tokens in access logs.
+      - ClusterView: node list, pod table (ns, name, node, status, restarts, CPU, mem, age),
+        deployment table with replica counts. Sortable, filterable by namespace.
+      - Actions: a brief confirm dialog (operator's choice - not type-the-name), then the call.
+      - LogViewer: streams a pod's logs into a scrolling pane.
+      - Reuse the existing `authFetch` from App.jsx for token refresh - do not re-implement it.
+
+    - Step 9 - Verification (scripts/verify-phase7.sh) - the gate
+      - [1] dashboard-api Deployment Available, pod Ready.
+      - [2] RBAC negative tests via `kubectl auth can-i --as=system:serviceaccount:app:dashboard-api`:
+            list pods -A -> yes; get secrets -n data -> NO; delete pods -n data -> NO.
+            A dashboard that can read secrets fails this gate.
+      - [3] unauthenticated GET /api/cluster/snapshot -> 401; a NON-admin user's token -> 403.
+      - [4] an admin token -> 200 and the payload contains this cluster's real node name.
+      - [5] /stream yields at least one event within 30s (create a throwaway pod to force one),
+            proving the watch path works end to end rather than just the snapshot.
+      - [6] actions round-trip: scale a throwaway test Deployment 1 -> 2 -> 1 through the API and
+            confirm via kubectl; delete one of its pods and confirm it is replaced.
+      - [7] the JWT fail-closed assertion: with the public key absent the service must NOT start.
+      - Print "PHASE 7 OK" only if all seven pass.
+
+    - Step 10 - Makefile wiring
+      - `make dashboard`        -> scripts/bootstrap-dashboard.sh (build-push dashboard-api,
+                                   apply rbac + manifests, patch the Kong ConfigMap, restart Kong)
+      - `make verify-phase7`    -> scripts/verify-phase7.sh
+      - `make phase7`           -> dashboard verify-phase7
+      - Add phase7 to `make backbone`'s chain (after phase6b) and a stamp under .backbone-state/.
+
+    - Definition of done (Phase 7)
+      - Every file above exists with real content (no STUB markers).
+      - `make phase7` -> "PHASE 7 OK" on a cluster that has passed phases 0-6.
+      - The browser shows live pod state across EVERY node, updating within ~2s of a
+        `kubectl delete pod` run from a terminal - without a page refresh. This is the actual
+        acceptance test: if it needs a refresh, the watch path is not working and polling has
+        crept in.
+      - A non-admin account gets 403 on every /api/cluster route.
+      - The service refuses to boot without the JWT public key.
+      - Multi-node is genuinely exercised: with a second node joined, pods on BOTH nodes appear.
+        Note the cluster this was developed against (2026-10-04) is single-node, so this
+        specific criterion is UNPROVEN until a worker is rejoined - do not tag it done on one node.
+
 ===============================================================================
 SESSION UPDATE (2026-09-12) - first real external-user install, end to end
 ===============================================================================
@@ -3260,3 +3485,80 @@ needed: a guided setup wizard and a single unattended install command.
        the plain 503 message. The backend endpoint itself (POST
        /internal/maintenance/off) is untouched and still exercised by
        verify-phase6b.sh - only the public link to it was removed.
+
+===============================================================================
+SESSION UPDATE (2026-10-04) - cluster restart findings + Phase 7 planned
+===============================================================================
+This session restarted the EC2 control plane after ~21 days down, established
+what actually came back, and planned Phase 7 (cluster dashboard). No
+implementation yet - the Phase 7 section above is a plan, not a status.
+
+1. CLUSTER STATE ON RESTART. k3s server came up clean on the control plane
+   (ip-172-31-24-106): 27 pods Running across platform / app / data /
+   observability / cert-manager / kube-system, etcd compacting normally,
+   and a mongo-backup CronJob fired on boot and Completed - Phase 6A works
+   unattended after a cold start.
+
+2. A DEAD NODE LEAVES GHOSTS, AND THEY ARE NOISY. The previously-joined
+   worker (ip-172-31-27-158) was gone, and its 10 pods sat in Terminating
+   indefinitely - with no kubelet left to confirm deletion, the API server
+   holds them forever. Symptoms worth recognising next time:
+     - `k3s[736]: level=error msg="Sending HTTP 502 ... failed to find Session
+       for client ip-172-31-27-158"` repeating every ~30s in journalctl. That
+       is the apiserver's kubelet tunnel retrying against a node that no
+       longer exists, not a problem with any workload.
+     - A DaemonSet pod (promtail) still REPORTING Running on the dead node,
+       because nothing can update its status.
+   `kubectl delete node <name>` resolves all three at once (ghosts, stale
+   status, 502 spam) by letting the API server garbage-collect everything
+   bound to that node.
+
+3. REPLICAS DO NOT SURVIVE LOSING THE MACHINE THEY SHARE. Every one of those
+   10 Terminating pods was the second copy of a service whose first copy was
+   on the surviving node - so the platform stayed up, but the redundancy was
+   notional: all replicas of each service had been co-located per node, and
+   the node was the failure domain. Nothing is wired to prevent that today -
+   no topologySpreadConstraints and no podAntiAffinity anywhere in k8s/app/.
+   Worth adding when a second node is rejoined, otherwise replica counts
+   overstate the actual availability.
+
+4. ONE POD UNSCHEDULABLE. `ping` had been scaled to 9 replicas at some point
+   (not from any manifest - k8s/app/ping/deployment.yaml says 2), and with
+   one node gone the 9th had nowhere to go. Pending, harmless, but a reminder
+   that live `kubectl scale` drifts from the repo and the next
+   apply-app-manifests.sh run silently reverts it.
+
+5. UNDOCUMENTED SERVICES FOUND RUNNING. `notes-api` (2 replicas) and
+   `notes-worker` (1) are live in the `app` namespace but exist in NO phase,
+   NO manifest under k8s/app/, and NO Kong route in kong-declarative-config.
+   They appear to come from the `feature/notes-crud-demo` branch and were
+   applied by hand. A `make backbone` run will not recreate them; conversely
+   nothing in the repo will clean them up. Reconcile or remove.
+
+6. PHASE 7 DECISIONS (operator, this session):
+     - Build the dashboard from scratch rather than adopting k9s / Headlamp /
+       a Grafana import, because the project is a learning exercise. The
+       alternatives were surveyed before deciding; notably the official
+       Kubernetes Dashboard is archived as of January 2026 and is not an
+       option. Recorded in the Phase 7 plan so this reads as a choice.
+     - Option B (read + write actions), not read-only.
+     - Scale-to-zero ALLOWED; write-side validation explicitly deferred.
+       The accepted hazards - including that scaling kong to zero kills the
+       gateway and the dashboard together - are listed under DEFERRED BY
+       CHOICE in the Phase 7 plan.
+     - Brief confirm dialog on actions, not type-the-resource-name.
+     - No separate dashboard password: gate on Phase 3's existing
+       requireRole('admin'). A second credential would mean no rotation, no
+       expiry, and no actor identity in the audit log.
+     - Work proceeds on branch `phase-7-dashboard`.
+
+7. SECURITY ISSUE IDENTIFIED IN EXISTING CODE (not yet fixed).
+   services/common/authContext.js falls back to `jwt.decode()` WITHOUT
+   signature verification whenever services/jwt-public-key.pem is missing,
+   on the assumption Kong verified the token upstream. Any service using that
+   fallback will honour a FORGED token - including one claiming
+   roles:['admin']. Tolerable for read-only /api/ping; not tolerable for a
+   service that can delete pods and scale deployments. Phase 7's dashboard-api
+   must assert the key is present at boot and exit non-zero otherwise, and its
+   gate (check [7]) tests exactly that. The broader question - whether the
+   fallback should exist at all in a shared module - is open.
