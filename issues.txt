@@ -1,0 +1,264 @@
+===============================================================================
+backbone - KNOWN ISSUES / OPEN ITEMS
+===============================================================================
+A running list of things known to be wrong, drifted, or deferred. Each entry is
+something real that was observed or decided, not a speculative improvement.
+
+Format:
+  [ID] SEVERITY | AREA | one-line summary
+    Found:    when / how it surfaced
+    Detail:   what is actually wrong
+    Fix:      what closing it looks like
+    Status:   OPEN | DEFERRED BY CHOICE | FIXED (date)
+
+Severity:  CRITICAL  exploitable or data-losing
+           HIGH      breaks or silently misleads in normal operation
+           MEDIUM    drift, noise, or a trap that costs debugging time
+           LOW       cosmetic, cleanup, or docs
+
+-------------------------------------------------------------------------------
+SECURITY
+-------------------------------------------------------------------------------
+
+[SEC-1] CRITICAL | services/common/authContext.js | JWT verification silently
+        falls back to unverified decode
+    Found:    2026-10-04, while planning Phase 7's admin gate.
+    Detail:   authContext() reads services/jwt-public-key.pem at load time. If
+              the file is absent, `publicKey` stays null and the code path
+              switches to `jwt.decode(token)` - which parses the token WITHOUT
+              checking its signature - on the assumption that Kong verified it
+              upstream. Any service on that path will therefore trust a FORGED
+              token, including one claiming roles:['admin']. It fails open, and
+              it fails open silently (a console.warn at boot is the only
+              signal). The blast radius is every service importing the shared
+              module, and it grows the moment a service can do more than read:
+              Phase 7's dashboard-api can delete pods and scale deployments.
+    Fix:      Decide whether the fallback should exist at all. Options:
+              (a) remove it - require the key in every service, fail closed;
+              (b) keep it but make it opt-in per service via an explicit env
+                  var (TRUST_KONG_JWT=true) so it can never be reached by
+                  accident, and log loudly at boot when active.
+              Either way, confirm whether Kong is in fact verifying JWTs today
+              - the fallback's whole premise is unverified. Phase 7's
+              dashboard-api asserts the key at boot and exits non-zero without
+              it; verify-phase7.sh check [7] tests that specifically.
+    Status:   OPEN
+
+[SEC-2] MEDIUM | Phase 7 dashboard | EventSource cannot send an Authorization
+        header, so the obvious workaround leaks tokens into logs
+    Found:    2026-10-04, planning Phase 7 Step 8.
+    Detail:   The browser's EventSource API has no way to set request headers,
+              so the usual shortcut is passing the access token as a query
+              parameter (?token=...). Query strings land in Kong access logs,
+              Promtail ships those logs to Loki, and the token is then sitting
+              in searchable log storage for its full lifetime.
+    Fix:      Use fetch() + ReadableStream for the SSE stream instead of
+              EventSource - it accepts headers normally. Costs a hand-rolled
+              reconnect (EventSource reconnects for free), which is the only
+              reason the query-param route is tempting. Decided in favour of
+              fetch-streaming in the plan; revisit only if reconnect logic
+              proves painful.
+    Status:   OPEN (design decision recorded, not yet implemented)
+
+-------------------------------------------------------------------------------
+AVAILABILITY / CORRECTNESS
+-------------------------------------------------------------------------------
+
+[AVAIL-1] HIGH | k8s/app/* | Replicas are co-located, so redundancy is
+        notional - nothing spreads pods across nodes
+    Found:    2026-10-04, after the previously-joined worker disappeared.
+    Detail:   No manifest under k8s/app/ sets topologySpreadConstraints or
+              podAntiAffinity. The scheduler is free to place every replica of
+              a service on one node, and did: when ip-172-31-27-158 went away,
+              10 pods went Terminating at once (frontend, notes-api,
+              notes-worker, ping x5, kong, maintenance). The platform stayed up
+              only because each of those services also had a copy on the
+              surviving node - which was luck, not design. A replica count of 2
+              currently reads as "survives a pod crash", NOT "survives losing a
+              machine", and the manifests do not say so anywhere.
+    Fix:      Add topologySpreadConstraints with topologyKey
+              kubernetes.io/hostname (maxSkew 1, ScheduleAnyway so a
+              single-node cluster still schedules) to the stateless
+              Deployments. Only meaningful once a second node is rejoined, so
+              land it together with that.
+    Status:   OPEN
+
+[AVAIL-2] MEDIUM | Phase 7 dashboard | Scale-to-zero on kong or auth is a
+        self-lockout
+    Found:    2026-10-04, deciding Phase 7 scope.
+    Detail:   Write actions ship with no validation by explicit operator
+              choice. Scaling kong to 0 takes down the gateway, which is the
+              only route to the dashboard that issued the command - recovery is
+              CLI-only (`kubectl -n platform scale deploy/kong --replicas=2`).
+              Scaling auth to 0 breaks the admin login the dashboard depends
+              on, with the same outcome. Also unguarded: the `data` namespace is
+              reachable, so deleting mongodb-0 or redis-0 is possible and those
+              are StatefulSet pods bound to node-local PVCs; and there is no
+              replica ceiling, so a mistyped 500 schedules until the node
+              fills.
+    Fix:      Namespace allowlist (app / platform / observability only), a
+              replica cap, and refuse to scale kong or auth below 1.
+    Status:   DEFERRED BY CHOICE (2026-10-04) - accepted for a single-operator
+              tool; close before anyone else uses it.
+
+[AVAIL-3] MEDIUM | cluster / docs | A deleted node leaves ghost pods and
+        noisy 502s until the node object is removed
+    Found:    2026-10-04, on restarting the control plane after ~21 days.
+    Detail:   With the worker gone, its 10 pods sat in Terminating
+              indefinitely - no kubelet remains to confirm deletion, so the API
+              server holds them. Two misleading side effects:
+              (a) journalctl fills with `level=error msg="Sending HTTP 502
+                  ... failed to find Session for client ip-172-31-27-158"` every
+                  ~30s, which is the apiserver's kubelet tunnel retrying against
+                  a node that no longer exists - it looks like a workload fault
+                  and is not;
+              (b) a DaemonSet pod (promtail) keeps REPORTING Running on the
+                  dead node, because nothing can update its status.
+              `kubectl delete node <name>` clears all three at once.
+    Fix:      Document in README troubleshooting. Consider having
+              node-join.sh's counterpart (or a `make node-remove`) do the
+              delete, so removing a machine is as one-command as adding one.
+    Status:   OPEN
+
+-------------------------------------------------------------------------------
+DRIFT - live cluster vs repo
+-------------------------------------------------------------------------------
+
+[DRIFT-1] MEDIUM | app namespace | notes-api and notes-worker run in the
+        cluster but exist nowhere in the repo
+    Found:    2026-10-04, `kubectl get pods -A`.
+    Detail:   notes-api (2 replicas) and notes-worker (1) are Running in `app`,
+              but there is no manifest under k8s/app/, no Kong route in
+              kong-declarative-config, and no phase that mentions them. They
+              appear to originate from branch feature/notes-crud-demo and were
+              applied by hand. Consequences both ways: `make backbone` will not
+              recreate them, and nothing in the repo will ever clean them up.
+              They are also unreachable from outside the cluster, having no
+              Kong route.
+    Fix:      Decide whether they are part of the platform. If yes, land the
+              manifests + route on master and add them to the ALL_SERVICES
+              lists. If no, delete the Deployments from the cluster.
+    Status:   OPEN
+
+[DRIFT-2] LOW | k8s/app/ping | ping was live-scaled to 9 replicas against a
+        manifest that says 2
+    Found:    2026-10-04. One replica was Pending (unschedulable) after the
+              worker was lost.
+    Detail:   k8s/app/ping/deployment.yaml declares replicas: 2; the live
+              Deployment wanted 9. Nothing in the repo asked for that, so it
+              came from a manual `kubectl scale` - presumably a scale test that
+              was never undone. The next apply-app-manifests.sh run will revert
+              it silently, which is the right outcome but worth knowing.
+    Fix:      `kubectl -n app scale deploy/ping --replicas=2`, or just let the
+              next apply reconcile it.
+    Status:   OPEN
+
+-------------------------------------------------------------------------------
+BUILD / TOOLING
+-------------------------------------------------------------------------------
+
+[BUILD-1] HIGH | scripts/build-push.sh | No cache-busting: a stale Docker
+        layer can ship old code while reporting success
+    Found:    2026-09-11 (Phase 6B), carried over from the earlier session
+              notes - still open.
+    Detail:   `make build-push` reused a stale layer for services/auth/src, so
+              the auth image it pushed was missing routes/maintenance.js
+              entirely. The build reported success while shipping stale code,
+              which is the worst failure mode available: nothing looks wrong
+              until the missing route 404s. Worked around at the time with a
+              manual `docker build --no-cache`; build-push.sh itself is
+              unchanged.
+    Fix:      Either bust the cache on the COPY of service source (a build arg
+              carrying the git SHA), or stop tagging :latest and tag by SHA so
+              a stale layer cannot masquerade as the current build.
+    Status:   OPEN
+
+[BUILD-2] MEDIUM | scripts/{build-push,apply-app-manifests}.sh | ALL_SERVICES
+        is hardcoded in two places
+    Found:    2026-10-04, planning Phase 7's new service.
+    Detail:   Both scripts carry their own `ALL_SERVICES=(ping frontend auth
+              jobs-api worker)`. A new service is invisible to the build and to
+              the apply until it is added to BOTH, and the failure is silent -
+              the service simply never builds or deploys, with no error.
+    Fix:      Derive the list from the filesystem (services/*/Dockerfile) or
+              put it in lib.sh as one shared definition.
+    Status:   OPEN
+
+[BUILD-3] MEDIUM | k8s/platform/kong | Editing the Kong ConfigMap while
+        maintenance is ON gets silently reverted
+    Found:    2026-10-04, planning Phase 7's route.
+    Detail:   Maintenance mode saves the whole kong-declarative-config
+              ConfigMap into maintenance-state and restores it wholesale on
+              `maintenance off`. Any route added while maintenance is ON is
+              therefore discarded the moment maintenance ends - the apply
+              succeeds, Kong reloads, and the route vanishes later for no
+              locally visible reason.
+    Fix:      At minimum document it at the top of kong-configmap.yaml.
+              Better: have `maintenance off` merge rather than overwrite, or
+              refuse to save/restore if the live config changed while
+              maintenance was on.
+    Status:   OPEN
+
+-------------------------------------------------------------------------------
+INFRASTRUCTURE
+-------------------------------------------------------------------------------
+
+[INFRA-1] MEDIUM | AWS | No Elastic IP, so the public address changes on every
+        stop/start and invalidates baked-in config
+    Found:    2026-10-04, restarting the control plane.
+    Detail:   The control-plane instance has no Elastic IP. Every stop/start
+              assigns a new public IPv4, which breaks three things that recorded
+              the old one: K3S_SERVER_ADDR in .env, the --tls-san baked into the
+              k3s server install, and the server URL in ./kubeconfig. Working
+              from the instance itself masks this (the local kubeconfig points
+              at 127.0.0.1), so it surfaces only when driving the cluster
+              remotely or rejoining a worker.
+    Fix:      Attach an Elastic IP, or document the post-restart fixup
+              (re-run cluster-up.sh to refresh the SAN + kubeconfig).
+    Status:   OPEN
+
+[INFRA-2] MEDIUM | AWS security groups | Node-to-node rules are pinned to a
+        stale private IP, and SSH from the operator is not permitted
+    Found:    2026-10-04, trying to reach the instance.
+    Detail:   launch-wizard-4 (control plane) allows 22, 6443, 10250 and 51820
+              only from 172.31.24.106/32 - a hardcoded private IP that matches
+              no current instance. There is no rule permitting SSH from the
+              operator's own address, so connecting requires adding one each
+              time the operator's IP changes. Separately, the SG opens port 80
+              but NOT 30080/30443, which is what Kong actually listens on per
+              INSTALL_GUIDE.md's firewall table - so the platform is not
+              reachable in a browser as configured.
+    Fix:      Replace the pinned /32 rules with a self-referencing security
+              group (the architecture's own recommendation for node-to-node),
+              open 30080/30443, and add an operator SSH rule.
+    Status:   OPEN
+
+[INFRA-3] LOW | control plane | systemd reports the k3s unit file changed on
+        disk since it was loaded
+    Found:    2026-10-04, `systemctl status k3s`.
+    Detail:   "The unit file, source configuration file or drop-ins of
+              k3s.service changed on disk. Run 'systemctl daemon-reload'."
+              Something rewrote /etc/systemd/system/k3s.service after the
+              running instance was loaded - most likely a cluster-up.sh re-run.
+              The live process is therefore running flags that may differ from
+              what the unit file now says, which would only surface on the next
+              restart.
+    Fix:      `sudo systemctl daemon-reload`, and check which --tls-san /
+              --node-external-ip the unit file now carries (see INFRA-1).
+    Status:   OPEN
+
+-------------------------------------------------------------------------------
+UNVERIFIED CLAIMS
+-------------------------------------------------------------------------------
+
+[UNVER-1] MEDIUM | multi-node | Phase 7's cross-node requirement cannot be
+        proven on the current single-node cluster
+    Found:    2026-10-04.
+    Detail:   Phase 7's definition of done requires pods on BOTH nodes to appear
+              in the dashboard. The cluster is single-node since the worker was
+              lost, so that criterion is unprovable as things stand - as is
+              AVAIL-1's fix. Do not tag phase-7-complete on one node.
+    Fix:      Rejoin a worker (scripts/node-join.sh), remembering that security
+              groups need rules in BOTH directions - see the 2026-09-12 session
+              notes in architecture.txt, item 8.
+    Status:   OPEN
