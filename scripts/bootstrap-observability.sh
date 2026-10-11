@@ -47,7 +47,19 @@ kubectl -n observability create secret generic grafana-admin \
 ok "secret/grafana-admin"
 
 # ---------------------------------------------------------------------------
-# 2. Prometheus
+# 2. kube-state-metrics
+# ---------------------------------------------------------------------------
+# Applied BEFORE Prometheus so the metrics exist by the time rules evaluate.
+# Without it every `kube_*` alert rule is silently dead - it evaluates to
+# nothing rather than erroring, which is indistinguishable from "all clear".
+# That is how PodCrashLooping went un-fireable since Phase 5B and how a backup
+# CronJob sat Pending for a week (issues.txt P7-7). No template rendering
+# needed - it carries no .env values.
+log "Applying kube-state-metrics..."
+kubectl apply -f "$OBS_DIR/kube-state-metrics/deployment.yaml"
+
+# ---------------------------------------------------------------------------
+# 3. Prometheus
 # ---------------------------------------------------------------------------
 log "Applying Prometheus..."
 kubectl apply -f "$OBS_DIR/prometheus/rbac.yaml"
@@ -162,6 +174,7 @@ kubectl apply -f "$RENDER_DIR/grafana-deployment.yaml"
 # 6. Wait for everything.
 # ---------------------------------------------------------------------------
 log "Waiting for rollouts..."
+kubectl -n observability rollout status deployment/kube-state-metrics --timeout=120s
 kubectl -n observability rollout status deployment/prometheus   --timeout=180s
 kubectl -n observability rollout status deployment/alertmanager --timeout=120s
 kubectl -n observability rollout status statefulset/loki        --timeout=240s

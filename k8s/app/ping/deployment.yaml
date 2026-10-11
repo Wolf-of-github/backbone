@@ -26,6 +26,24 @@ spec:
       labels:
         app: ping
     spec:
+      # Spread replicas across NODES (added 2026-10-04, issues.txt AVAIL-1).
+      # Without this the scheduler may put every replica on one machine, and
+      # did: when a worker vanished on 2026-10-04, 10 pods went Terminating at
+      # once. The platform survived only because each service happened to also
+      # have a copy on the other node - luck, not design. A replica count of 2
+      # meant "survives a pod crash", never "survives losing a machine".
+      #
+      # ScheduleAnyway, NOT DoNotSchedule: this cluster is sometimes a single
+      # node, and the strict version would leave the second replica Pending
+      # forever there. Soft means "prefer different nodes, but run anyway" -
+      # the right trade when the alternative is not running at all.
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: ping
       containers:
       - name: ping
         image: ${REGISTRY_URL}/backbone-ping:latest
@@ -48,6 +66,15 @@ spec:
             port: 3000
           initialDelaySeconds: 10
           periodSeconds: 15
+        volumeMounts:
+        # REQUIRED. services/common/authContext.js reads the JWT public key
+        # from here and REFUSES TO START without it. Before 2026-10-04 this
+        # mount was absent and the module silently fell back to accepting
+        # unverified tokens - see issues.txt SEC-1. Only the public key is
+        # projected; this service has no business holding the private one.
+        - name: jwt-keys
+          mountPath: /secrets/jwt
+          readOnly: true
         resources:
           requests:
             cpu: "50m"
@@ -55,3 +82,10 @@ spec:
           limits:
             cpu: "200m"
             memory: "128Mi"
+      volumes:
+      - name: jwt-keys
+        secret:
+          secretName: jwt-keypair
+          items:
+          - key: public-key
+            path: public-key

@@ -42,10 +42,13 @@ MAINT=$(kubectl -n platform get configmap maintenance-state -o jsonpath='{.data.
 
 # --- build ------------------------------------------------------------------
 require_vars REGISTRY_URL
-log "Building and pushing dashboard-api..."
-# build-push.sh already knows the repo-root build context (dashboard-api copies
-# services/common) and uses --no-cache for the stale-layer bug in BUILD-1.
-"$REPO_ROOT/scripts/build-push.sh" dashboard-api
+# The FRONTEND is built too, and that is not incidental: the dashboard UI lives
+# in the existing frontend service (services/frontend/src/components/cluster/),
+# so shipping only the API gives you a fully working backend behind a stale
+# bundle with no dashboard in it - every gate check passes and the feature is
+# invisible. That is exactly how this phase first shipped (issues.txt P7-5).
+log "Building and pushing dashboard-api + frontend..."
+"$REPO_ROOT/scripts/build-push.sh" dashboard-api frontend
 
 # --- RBAC -------------------------------------------------------------------
 # Applied before the Deployment: a pod that starts without its ServiceAccount
@@ -56,7 +59,7 @@ kubectl apply -f k8s/app/dashboard-api/rbac.yaml
 
 # --- workload ---------------------------------------------------------------
 log "Applying manifests..."
-"$REPO_ROOT/scripts/apply-app-manifests.sh" dashboard-api
+"$REPO_ROOT/scripts/apply-app-manifests.sh" dashboard-api frontend
 
 # --- Kong route -------------------------------------------------------------
 log "Adding the /api/cluster route to Kong..."

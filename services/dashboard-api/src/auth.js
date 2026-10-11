@@ -2,22 +2,20 @@
 // Purpose: Admin-only JWT gate for every dashboard route. FAILS CLOSED.
 // depends_on: [k8s secret jwt-keypair mounted at /secrets/jwt/public-key]
 //
-// WHY THIS DOES NOT USE services/common/authContext.js
-// The shared module falls back to `jwt.decode()` - which parses a token
-// WITHOUT verifying its signature - whenever it cannot find a public key. It
-// looks for that key at `../jwt-public-key.pem` relative to itself, a path
-// nothing in this repo mounts, so the unverified path is the only path it ever
-// takes (see issues.txt SEC-1). For /api/ping that is a tolerable bug. Here it
-// is not: a forged token claiming roles:['admin'] would be enough to delete
-// pods and scale deployments to zero.
+// WHY THIS EXISTS ALONGSIDE services/common/authContext.js
+// Originally this file duplicated the shared module's job because that module
+// fell back to unverified `jwt.decode()` (issues.txt SEC-1), which was
+// unacceptable for a service that can delete pods. That fallback has since
+// been removed - authContext.js now reads the same key path and fails closed
+// too - so the duplication is gone: this file is a thin wrapper that adds the
+// one thing the dashboard needs beyond requireRole('admin'), namely logging
+// which admin did what, and a boot-time assertion that is deliberately
+// repeated here rather than inherited.
 //
-// So this service verifies locally, with the real key, and REFUSES TO START if
-// the key is missing. A dashboard that cannot authenticate must not serve - a
-// crash-looping pod is a loud, correct failure; an open admin API is a silent,
-// catastrophic one.
-//
-// The key path matches services/auth/src/passport.js (/secrets/jwt/public-key,
-// from the `jwt-keypair` secret) rather than authContext.js's broken path.
+// The boot assertion stays explicit because it is the single most important
+// property of this service: if it cannot verify tokens, it must not serve. A
+// crash-looping pod is a loud, correct failure; an open admin API that can
+// scale deployments to zero is a silent, catastrophic one.
 
 const fs = require('fs');
 const jwt = require('jsonwebtoken');

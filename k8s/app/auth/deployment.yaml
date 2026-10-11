@@ -22,6 +22,24 @@ spec:
       labels:
         app: auth
     spec:
+      # Spread replicas across NODES (added 2026-10-04, issues.txt AVAIL-1).
+      # Without this the scheduler may put every replica on one machine, and
+      # did: when a worker vanished on 2026-10-04, 10 pods went Terminating at
+      # once. The platform survived only because each service happened to also
+      # have a copy on the other node - luck, not design. A replica count of 2
+      # meant "survives a pod crash", never "survives losing a machine".
+      #
+      # ScheduleAnyway, NOT DoNotSchedule: this cluster is sometimes a single
+      # node, and the strict version would leave the second replica Pending
+      # forever there. Soft means "prefer different nodes, but run anyway" -
+      # the right trade when the alternative is not running at all.
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: auth
       # Phase 6B: the maintenance off-endpoint calls the Kubernetes API with
       # this ServiceAccount's token. Its permissions are in k8s/app/auth/rbac.yaml
       # and are limited to two named ConfigMaps plus restarting Kong.

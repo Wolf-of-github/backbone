@@ -67,6 +67,28 @@ log "Rollouts (images are :latest with imagePullPolicy Always, so a restart"
 log "is what actually pulls a rebuilt image):"
 for svc in "${SERVICES[@]}"; do
   kubectl -n app get deploy "$svc" >/dev/null 2>&1 || continue
+
+  # THE RESTART IS NOT OPTIONAL - it is what makes a rebuild take effect.
+  # Pushing a new image to the same `:latest` tag leaves the Deployment spec
+  # byte-identical, so `kubectl apply` above is a no-op: no new ReplicaSet, no
+  # pod replaced, and therefore imagePullPolicy:Always never gets the chance to
+  # pull anything. `rollout status` then reports success for a rollout that did
+  # nothing, the new image sits unused in the registry, and the old pods keep
+  # serving - which is exactly how Phase 7 shipped a working API behind a stale
+  # UI while every command printed success (issues.txt P7-6).
+  #
+  # Restarting unconditionally costs one rolling restart per apply. That is
+  # cheap and, with 2+ replicas, zero-downtime. The real fix is deploying by
+  # git SHA so the spec changes on its own - see P7-6 option (a).
+  IMAGE=$(kubectl -n app get deploy "$svc" -o jsonpath='{.spec.template.spec.containers[0].image}')
+  case "$IMAGE" in
+    *:latest)
+      log "  restarting $svc (image is :latest - apply alone would not pull)"
+      kubectl -n app rollout restart "deploy/$svc" >/dev/null \
+        || die "rollout restart failed for $svc"
+      ;;
+  esac
+
   kubectl -n app rollout status "deploy/$svc" --timeout=180s \
     || die "rollout failed for $svc.
   Inspect: kubectl -n app get pods -l app=$svc

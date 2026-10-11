@@ -62,7 +62,30 @@ SECURITY
               - the fallback's whole premise is unverified. Phase 7's
               dashboard-api asserts the key at boot and exits non-zero without
               it; verify-phase7.sh check [7] tests that specifically.
-    Status:   OPEN
+    ANSWERED: 2026-10-04. Kong does NOT verify JWTs. k8s/platform/kong/
+              kong-configmap.yaml has no `plugins` block at all - no jwt
+              plugin, no key-auth, nothing. So the fallback's entire premise
+              was false and NOTHING in the request path verified a signature.
+              A forged token with a garbage signature and roles:['admin'] was
+              accepted by both ping and jobs-api.
+    Fixed:    2026-10-04, option (a) - the fallback is gone.
+              - authContext.js now reads /secrets/jwt/public-key (the path
+                jwt-keys.sh actually populates and passport.js has always used)
+                and THROWS at module load if it is missing or not a PEM. No
+                unverified branch remains; `algorithms: ['RS256']` is pinned.
+              - k8s/app/ping/deployment.yaml and k8s/app/jobs-api/
+                deployment.yaml now mount the jwt-keypair secret, public key
+                only. The mount is load-bearing: forgetting it crash-loops the
+                pod instead of silently disabling authentication.
+              Verified 9/9 against a real keypair: the exact forged token that
+              worked live is rejected, as are alg:none, HS256-with-the-public-
+              key, and a token signed by a different RSA key; legitimate user
+              and admin tokens still pass, and a non-admin still gets 403.
+              Fail-closed confirmed separately.
+              DEPLOY NOTE: ping and jobs-api must be rebuilt AND their
+              manifests re-applied together. Rolling out the new code without
+              the mount crash-loops them.
+    Status:   FIXED (2026-10-04) - not yet deployed to the cluster.
 
 [SEC-2] MEDIUM | Phase 7 dashboard | EventSource cannot send an Authorization
         header, so the obvious workaround leaks tokens into logs
@@ -106,7 +129,16 @@ AVAILABILITY / CORRECTNESS
               single-node cluster still schedules) to the stateless
               Deployments. Only meaningful once a second node is rejoined, so
               land it together with that.
-    Status:   OPEN
+    Fixed:    2026-10-04, now that the second node is back. Added
+              topologySpreadConstraints (maxSkew 1, topologyKey
+              kubernetes.io/hostname, whenUnsatisfiable ScheduleAnyway) to all
+              five 2-replica Deployments: ping, frontend, auth, jobs-api, kong.
+              ScheduleAnyway rather than DoNotSchedule on purpose - this
+              cluster is sometimes single-node, where the strict form would
+              leave the second replica Pending forever. Soft means "prefer
+              separate nodes, but run regardless", which is the right trade
+              when the alternative is not running.
+    Status:   FIXED (2026-10-04) - not yet deployed.
 
 [AVAIL-2] MEDIUM | Phase 7 dashboard | Scale-to-zero on kong or auth is a
         self-lockout
@@ -376,31 +408,55 @@ FROM THE PHASE 7 CLUSTER RUN (2026-10-04)
               served bundle actually contains the dashboard, or the dashboard
               should be its own frontend service (see P7-1 option 3) so this
               coupling disappears.
-    Status:   OPEN
+    Fixed:    2026-10-04. bootstrap-dashboard.sh now builds and applies
+              `dashboard-api frontend` together. The gate still only exercises
+              the API, so the deeper fix (asserting the served bundle contains
+              the dashboard, or splitting it into its own service) stays open.
+    Status:   FIXED (2026-10-04)
 
-[P7-6] HIGH | scripts/build-push.sh | BUILD-1 confirmed on a SECOND service -
-        a cached build reported success while shipping nothing
+[P7-6] HIGH | scripts/apply-app-manifests.sh | A rebuilt :latest image is
+        pushed but never pulled - the "rollout" is a no-op
     Found:    2026-10-04, rebuilding the frontend for the dashboard UI.
-    Detail:   `./scripts/build-push.sh frontend` printed "Layer already exists"
-              for all 10 layers and pushed a digest identical to the image
-              already there. `apply-app-manifests.sh` then reported
-              'deployment "frontend" successfully rolled out' - truthfully, as
-              the spec had not changed - and the browser kept serving the old
-              bundle. Two successful-looking commands, zero effect.
-              This is BUILD-1 (recorded 2026-09-11 against the auth image)
-              reproducing on a different service, which makes it a property of
-              the script rather than a one-off. Note bootstrap-jobs.sh already
-              hardcodes `docker build --no-cache` for exactly this reason, so
-              the workaround exists but build-push.sh never adopted it.
-    Fix:      As BUILD-1: pass --no-cache in build-push.sh, or stop tagging
-              :latest and tag by git SHA so a stale layer cannot masquerade as
-              the current build. The SHA tag is already computed in the script
-              (GIT_SHA) and pushed as a second tag - the Deployments just do
-              not use it.
-    Workaround: docker build --no-cache -t <registry>/backbone-frontend:latest \
-                  services/frontend && docker push ... && kubectl -n app \
-                  rollout restart deploy/frontend
-    Status:   OPEN
+    CORRECTED 2026-10-04: the first version of this entry blamed Docker layer
+        caching in build-push.sh and cited BUILD-1. That diagnosis was WRONG
+        and is retracted - build-push.sh already passes --no-cache, and
+        services/frontend/.dockerignore already excludes dist/. The push
+        output even shows the correct digest being tagged with the git SHA
+        (8211191), so the BUILD half worked fine.
+    Detail:   The real cause is the DEPLOY half. Deployments pin
+              `image: <registry>/backbone-<svc>:latest`. Pushing a new image to
+              the same `latest` tag does not change the Deployment spec, so
+              `kubectl apply` is a no-op, no new ReplicaSet is created, and no
+              pod restarts - which means imagePullPolicy:Always never gets a
+              chance to pull anything. apply-app-manifests.sh then prints
+              'deployment "frontend" successfully rolled out', truthfully, for
+              a rollout that did nothing. The new image sits in the registry
+              and the old pods keep serving.
+              The script's own comment even says "images are :latest with
+              imagePullPolicy Always, so a restart is what actually pulls a
+              rebuilt image" - it knows, but only runs `rollout status`, never
+              `rollout restart`.
+              Note this makes BUILD-1 itself worth re-examining: the 2026-09-11
+              auth incident was attributed to a stale layer, but this mechanism
+              would produce identical symptoms (build succeeds, deploy reports
+              success, old code keeps running) and was present all along.
+    Fix:      Two options, in order of preference:
+              (a) Deploy by SHA. build-push.sh already builds and pushes
+                  `:${GIT_SHA}`; substitute that tag into the manifests instead
+                  of `latest`, the way REGISTRY_URL is already substituted. The
+                  spec then changes on every build, so Kubernetes rolls out
+                  properly and `kubectl rollout undo` becomes meaningful.
+              (b) Minimum fix: have apply-app-manifests.sh run
+                  `kubectl rollout restart` before `rollout status` for any
+                  service whose image tag is `latest`.
+    Workaround: kubectl -n app rollout restart deploy/<service>
+    Fixed:    2026-10-04, option (b). apply-app-manifests.sh now reads each
+              Deployment's image tag and runs `kubectl rollout restart` before
+              `rollout status` whenever it ends in `:latest`. Option (a) -
+              deploying by git SHA, which makes the spec change on its own and
+              makes `kubectl rollout undo` meaningful - remains the better fix
+              and is still open.
+    Status:   FIXED (2026-10-04) - mitigated; deploy-by-SHA still wanted.
 
 [P7-7] HIGH | k8s/app/ping | DRIFT-2 had a real consequence: ping's extra
         replicas starved the backup CronJob
@@ -418,7 +474,22 @@ FROM THE PHASE 7 CLUSTER RUN (2026-10-04)
               never schedules. An Alertmanager rule on
               kube_pod_status_phase{phase="Pending"} older than ~10m would have
               caught this in minutes rather than a week.
-    Status:   OPEN (immediate cause cleared; the missing alert is the real fix)
+    Fixed:    2026-10-04. Two alert rules added to
+              k8s/observability/prometheus/alert-rules.yaml:
+                PodPendingTooLong    - any pod Pending for 15m (warning)
+                BackupNotSucceeding  - a *-backup CronJob with no success in
+                                       26h (critical)
+              WHICH UNCOVERED A BIGGER PROBLEM, also fixed: kube-state-metrics
+              was NEVER DEPLOYED. Every `kube_*` metric was absent, so the
+              pre-existing PodCrashLooping alert (shipped in Phase 5B) has
+              never been able to fire either - a rule referencing a missing
+              metric does not error, it evaluates to nothing forever, which is
+              indistinguishable from "all clear". Added
+              k8s/observability/kube-state-metrics/deployment.yaml (read-only
+              RBAC, no secrets access, annotation-scraped so no scrape-config
+              change) and wired it into bootstrap-observability.sh ahead of
+              Prometheus.
+    Status:   FIXED (2026-10-04) - not yet deployed; needs `make obs`.
 
 [P7-8] LOW | cluster | FailedMount "failed to sync secret cache" on first
         schedule to a newly joined node
