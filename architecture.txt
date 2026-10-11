@@ -726,7 +726,21 @@
     - 6C Provisioned worker fleet (Terraform + cloud-init self-join, `make workers COUNT=n`) -
       NOT PLANNED. Independent of the other two; worth building when one machine stops being enough.
   - Phase 7 - Cluster dashboard  (`make phase7`; gate: verify-phase7.sh -> "PHASE 7 OK")
-    - IMPLEMENTED 2026-10-04 on branch `phase-7-dashboard`. NOT YET RUN AGAINST A CLUSTER - every
+    - VERIFIED ON CLUSTER 2026-10-04. `make phase7` -> "PHASE 7 OK" (7/7) on the two-node EC2
+      cluster (control plane ip-172-31-24-106 + worker ip-172-31-27-158), and the browser shows
+      "live, 2 nodes, 38 pods" with pods from BOTH nodes. That closes the cross-node criterion
+      and issues.txt UNVER-1, which could not be met while the cluster was single-node.
+      Incidental proof of location transparency: dashboard-api was scheduled onto the WORKER, and
+      Kong on the control plane reaches it by Service DNS with nothing wired between them.
+      Confirmed working in the UI: live status via the watch stream, per-pod CPU/memory from
+      metrics-server, restart counts, the Terminating state, the event feed, and the scale /
+      restart / delete / logs actions.
+      One real gap the run exposed, now fixed: bootstrap-dashboard.sh builds dashboard-api but
+      NOT the frontend, so `make phase7` deployed a working API behind a stale UI bundle with no
+      dashboard in it. Worse, the first `build-push.sh frontend` reused every cached layer and
+      produced an identical digest, so the rollout reported success while changing nothing -
+      BUILD-1 again, on a second service. A `docker build --no-cache` was needed.
+    - PREVIOUS STATUS, for the record - implemented 2026-10-04, before the cluster run - every
       file exists with real content, all JS passes `node --check`, the frontend passes `vite build`,
       both scripts pass shellcheck, and all manifests parse. What has actually been PROVEN is
       everything testable off-cluster, against a mock Kubernetes API server and a real RSA keypair:

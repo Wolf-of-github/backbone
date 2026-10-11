@@ -355,3 +355,97 @@ PHASE 7 FOLLOW-UPS (added 2026-10-04 during implementation)
               `git status`, one `git add -A` away from being committed.
     Fix:      FIXED 2026-10-04 - added `services/*/dist/`.
     Status:   FIXED (2026-10-04)
+
+-------------------------------------------------------------------------------
+FROM THE PHASE 7 CLUSTER RUN (2026-10-04)
+-------------------------------------------------------------------------------
+
+[P7-5] HIGH | scripts/bootstrap-dashboard.sh | Deploys the API but not the
+        frontend, so `make phase7` ships a dashboard nobody can see
+    Found:    2026-10-04, immediately after a green "PHASE 7 OK" - the gate
+              passed and the browser showed no dashboard at all.
+    Detail:   The bootstrap builds and applies dashboard-api only. The
+              dashboard UI lives in the EXISTING frontend service, so the
+              frontend image must be rebuilt for App.jsx's new ClusterView to
+              reach a browser. Nothing did that, and nothing noticed: the gate
+              only exercises the API over curl, so it is perfectly happy with a
+              stale UI. The symptom is maximally confusing - every check
+              passes, and the feature is absent.
+    Fix:      bootstrap-dashboard.sh should build and apply `frontend`
+              alongside `dashboard-api`. Longer term the gate should assert the
+              served bundle actually contains the dashboard, or the dashboard
+              should be its own frontend service (see P7-1 option 3) so this
+              coupling disappears.
+    Status:   OPEN
+
+[P7-6] HIGH | scripts/build-push.sh | BUILD-1 confirmed on a SECOND service -
+        a cached build reported success while shipping nothing
+    Found:    2026-10-04, rebuilding the frontend for the dashboard UI.
+    Detail:   `./scripts/build-push.sh frontend` printed "Layer already exists"
+              for all 10 layers and pushed a digest identical to the image
+              already there. `apply-app-manifests.sh` then reported
+              'deployment "frontend" successfully rolled out' - truthfully, as
+              the spec had not changed - and the browser kept serving the old
+              bundle. Two successful-looking commands, zero effect.
+              This is BUILD-1 (recorded 2026-09-11 against the auth image)
+              reproducing on a different service, which makes it a property of
+              the script rather than a one-off. Note bootstrap-jobs.sh already
+              hardcodes `docker build --no-cache` for exactly this reason, so
+              the workaround exists but build-push.sh never adopted it.
+    Fix:      As BUILD-1: pass --no-cache in build-push.sh, or stop tagging
+              :latest and tag by git SHA so a stale layer cannot masquerade as
+              the current build. The SHA tag is already computed in the script
+              (GIT_SHA) and pushed as a second tag - the Deployments just do
+              not use it.
+    Workaround: docker build --no-cache -t <registry>/backbone-frontend:latest \
+                  services/frontend && docker push ... && kubectl -n app \
+                  rollout restart deploy/frontend
+    Status:   OPEN
+
+[P7-7] HIGH | k8s/app/ping | DRIFT-2 had a real consequence: ping's extra
+        replicas starved the backup CronJob
+    Found:    2026-10-04, in the dashboard's own event feed.
+    Detail:   `redis-backup-29851440-9fr7n` sat Pending for ~7 days with
+              "0/2 nodes are available: 1 Insufficient cpu". ping was running 6
+              replicas against a manifest declaring 2 (DRIFT-2), consuming
+              enough of the control plane's 2 CPUs that the backup pod could
+              not be scheduled. So Phase 6A - the one track that closes a real
+              data-loss exposure - was silently not running, and nothing
+              alerted: a Pending CronJob pod looks like nothing at all unless
+              someone goes looking.
+    Fix:      Scaled ping back to 2 (2026-10-04), which frees the CPU. The
+              general problem remains: nothing alerts on a CronJob whose pod
+              never schedules. An Alertmanager rule on
+              kube_pod_status_phase{phase="Pending"} older than ~10m would have
+              caught this in minutes rather than a week.
+    Status:   OPEN (immediate cause cleared; the missing alert is the real fix)
+
+[P7-8] LOW | cluster | FailedMount "failed to sync secret cache" on first
+        schedule to a newly joined node
+    Found:    2026-10-04, on both dashboard-api and one Kong pod.
+    Detail:   "MountVolume.SetUp failed for volume jwt-keys / kong-tls: failed
+              to sync secret cache: timed out waiting for the condition" on
+              pods first scheduled to the freshly rejoined worker. Both
+              recovered on retry and started normally. Benign - the kubelet's
+              secret cache is cold on a new node - but it reads like a missing
+              secret, which is alarming for the two volumes that happen to
+              carry TLS and JWT material.
+    Fix:      Nothing to fix; document in README troubleshooting so it is not
+              mistaken for a real mount failure.
+    Status:   OPEN (documentation only)
+
+-------------------------------------------------------------------------------
+RESOLVED BY THE 2026-10-04 WORKER REJOIN
+-------------------------------------------------------------------------------
+
+[AVAIL-3] - the ghost Terminating pods and the repeating
+  'failed to find Session for client ip-172-31-27-158' 502s cleared on their
+  own when that node rejoined the cluster, without needing `kubectl delete
+  node`. Worth knowing: a node that comes BACK resolves its own ghosts; the
+  delete is only needed for a node that is gone for good.
+  The documentation item in the original entry still stands.
+
+[UNVER-1] - CLOSED 2026-10-04. Both nodes Ready, and the dashboard shows pods
+  on each, so Phase 7's cross-node criterion is genuinely met rather than
+  assumed. dashboard-api itself ran on the worker while Kong routed to it from
+  the control plane.
